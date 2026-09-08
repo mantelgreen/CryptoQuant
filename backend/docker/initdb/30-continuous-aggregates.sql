@@ -1,0 +1,9 @@
+-- Continuous Aggregates（M0 占位；M1 起按 v2 §6.4 建）
+-- 示例（M1 启用）：
+-- CREATE MATERIALIZED VIEW klines_5m WITH (timescaledb.continuous) AS
+-- SELECT symbol, time_bucket('5 minutes', open_time) AS bucket,
+--        first(open, open_time) AS open, max(high) AS high, min(low) AS low,
+--        last(close, open_time) AS close, sum(volume) AS volume
+-- FROM klines WHERE interval='1m'
+-- GROUP BY symbol, bucket
+-- WITH NO DATA;

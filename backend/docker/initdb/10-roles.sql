@@ -1,0 +1,14 @@
+-- 应用角色与基础权限
+-- M0 阶段默认用 root 全权限；M1 起拆分 readonly / writer 角色。
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'cq_app') THEN
+    CREATE ROLE cq_app LOGIN PASSWORD '123456';
+  END IF;
+END$$;
+
+GRANT CONNECT ON DATABASE cryptoquant_db TO cq_app;
+GRANT USAGE ON SCHEMA public TO cq_app;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO cq_app;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO cq_app;
