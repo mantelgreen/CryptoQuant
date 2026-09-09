@@ -26,9 +26,10 @@ const pageHelp: PageHelp = {
     { term: 'Base URL', desc: '兼容 OpenAI Chat 协议的 API 地址。如 OpenAI=https://api.openai.com/v1、DeepSeek=https://api.deepseek.com/v1、Ollama=http://localhost:11434/v1。' },
     { term: 'API Key', desc: '供应商密钥。仅保存于后端数据库；界面始终掩码显示（生产建议改用环境变量/密钥托管）。' },
     { term: '默认模型', desc: '星标供应商即默认；未指定模型时系统使用它的 model 与参数。' },
-    { term: 'temperature / max_tokens', desc: 'temperature 越低越确定（研究用 0~0.3）；max_tokens 限制单次回复长度。' },
+    { term: 'temperature / max_tokens', desc: 'temperature 越低越确定（研究用 0~0.3）；max_tokens 限制单次回复长度。思考型模型会把推理计入 max_tokens，需要更大额度。' },
+    { term: '关闭思维模式', desc: 'DeepSeek v4 / Kimi K2-Thinking / Qwen3 / R1 等思考型模型默认先输出推理，容易把 max_tokens 占满导致 Agent“JSON 解析失败/输出为空”。勾选后系统按供应商注入关闭思考的参数（DeepSeek/Moonshot 等用 thinking.type=disabled，Ollama 本地用 enable_thinking=false，Qwen 兼容用 enable_thinking=false），让模型直接出答案。OpenAI/Anthropic 官方不支持关闭。' },
   ],
-  tips: ['密钥填过一次后编辑时留空即保持原值。', '先配置至少一个“默认”供应商，Agent 调用才能生效。', '用量与成本将按此处配置的模型在「LLM 用量」统计。'],
+  tips: ['密钥填过一次后编辑时留空即保持原值。', '先配置至少一个“默认”供应商，Agent 调用才能生效。', '用量与成本将按此处配置的模型在「LLM 用量」统计。', '因子工坊/复盘失败且提示“推理/未返回 JSON/输出为空”时，多为思考模型占满输出额度：勾选“关闭思维模式”或调大 max_tokens。'],
 }
 
 const toast = useToastStore()
@@ -49,7 +50,7 @@ const busy = ref(false)
 const form = ref<ProviderInput>(emptyForm())
 
 function emptyForm(): ProviderInput {
-  return { name: '', provider: 'deepseek', base_url: PRESET_URL.deepseek, api_key: '', model: '', temperature: 0.2, max_tokens: 2000, enabled: true, is_default: false }
+  return { name: '', provider: 'deepseek', base_url: PRESET_URL.deepseek, api_key: '', model: '', temperature: 0.2, max_tokens: 2000, disable_thinking: false, enabled: true, is_default: false }
 }
 
 async function load() {
@@ -80,6 +81,7 @@ function openEdit(p: LlmProvider) {
     model: p.model,
     temperature: p.temperature,
     max_tokens: p.max_tokens,
+    disable_thinking: p.disable_thinking ?? false,
     enabled: p.enabled,
     is_default: p.is_default,
   }
@@ -187,6 +189,7 @@ onMounted(load)
             <p class="truncate">Base URL：<span class="font-mono">{{ p.base_url || '—' }}</span></p>
             <p class="truncate">Key：<span class="font-mono">{{ p.api_key || '未配置' }}</span></p>
             <p class="num">temp {{ p.temperature }} · max_tokens {{ p.max_tokens }} · {{ timeAgo(p.created_at) }}</p>
+            <p v-if="p.disable_thinking" class="text-ai-ink">已关闭思维模式（思考型模型直接输出）</p>
           </div>
           <div class="mt-4 flex gap-2 border-t border-border pt-3">
             <button class="btn btn-ghost !h-8 flex-1 text-xs" @click="openEdit(p)">编辑</button>
@@ -249,11 +252,15 @@ onMounted(load)
             <input id="lm-tok" v-model.number="form.max_tokens" type="number" min="1" class="input font-mono" />
           </div>
           <div class="field">
-            <label class="label">启用 / 默认</label>
+            <label class="label">启用 / 默认 / 关闭思维</label>
             <div class="flex h-[34px] items-center gap-4 px-1 text-xs text-muted">
               <label class="flex items-center gap-1.5"><input v-model="form.enabled" type="checkbox" class="accent-[var(--color-primary)]" />启用</label>
               <label class="flex items-center gap-1.5"><input v-model="form.is_default" type="checkbox" class="accent-[var(--color-primary)]" />设为默认</label>
+              <label class="flex items-center gap-1.5" title="思考型模型(DeepSeek v4/Kimi/Qwen/R1)勾选后直接输出，避免推理占满 max_tokens 导致解析失败">
+                <input v-model="form.disable_thinking" type="checkbox" class="accent-[var(--color-primary)]" />关闭思维模式
+              </label>
             </div>
+            <p class="px-1 text-[10px] leading-snug text-subtle">思考型模型(DeepSeek v4/Kimi/Qwen/R1 等)勾选后跳过推理直接输出，避免 AI 工坊“JSON 解析失败 / 输出为空”。OpenAI/Anthropic 官方不支持。</p>
           </div>
         </div>
       </div>

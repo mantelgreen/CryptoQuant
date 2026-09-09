@@ -1,26 +1,21 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { useRouter } from 'vue-router'
-import { Cpu, Check, LoaderCircle, RefreshCw, Sparkles } from '@lucide/vue'
+import { Check, Cpu, Info, LoaderCircle, Sparkles } from '@lucide/vue'
 import PageHeader from '@/components/ui/PageHeader.vue'
 import HelpDrawer, { type PageHelp } from '@/components/ui/HelpDrawer.vue'
 import Panel from '@/components/ui/Panel.vue'
 import StateView from '@/components/ui/StateView.vue'
-import Modal from '@/components/ui/Modal.vue'
+import FactorPicker from '@/components/ui/FactorPicker.vue'
 import { useToastStore } from '@/stores/toast'
 import {
   listFactors,
   trainMl,
   saveMl,
-  listMlModels,
-  scoreMlModel,
   type FactorMeta,
   type MlTrainResult,
   type MlTrainArgs,
-  type MlModelRow,
 } from '@/api/factor'
-import { createStrategy, createVersion, runBacktest } from '@/api/strategy'
-import { INTERVALS, MAJOR_SYMBOLS, fmtTime, timeAgo } from '@/utils/format'
+import { INTERVALS, MAJOR_SYMBOLS } from '@/utils/format'
 
 const pageHelp: PageHelp = {
   title: '模型训练（ML 工坊）',
@@ -30,17 +25,19 @@ const pageHelp: PageHelp = {
     { term: 'train IC vs OOS IC', desc: '训练集内拟合的 IC 若远高于样本外，说明在记忆噪声；两者差距=过拟合风险。' },
     { term: '相关性过滤', desc: '训练集内两两 |相关| 超阈值即剔除，防止组合里信息冗余。' },
     { term: 'Top−Bottom 价差', desc: '把测试期按预测分高低各取 20%，两组实际收益均值差；>0 表示高分组确实跑赢。' },
+    { term: '学习率 / 树参数（LightGBM）', desc: 'learning_rate 决定每棵树的贡献缩减；n_estimators 是树数量；max_depth/num_leaves 控制单棵树复杂度；subsample/colsample 是行/列采样，都可防过拟合。' },
   ],
-  tips: ['默认阈值较保守；样本<100 行的结果谨慎采纳。', '保存后可在模型库一键“建策略回测”，对比基准。', '小数据优先 Ridge；数据量大、非线性强再用 LightGBM。'],
+  tips: ['默认阈值较保守；样本<100 行的结果谨慎采纳。', '保存后可在「模型库」一键“建策略回测”、部署模拟盘。', '小数据优先 Ridge；数据量大、非线性强再用 LightGBM。'],
 }
 
-const router = useRouter()
 const toast = useToastStore()
 const factors = ref<FactorMeta[]>([])
-const codes = ref<Set<string>>(new Set())
+const codes = ref<string[]>([])
 const running = ref(false)
 const phase = ref('')
 const result = ref<MlTrainResult | null>(null)
+const args = ref<MlTrainArgs | null>(null)
+
 const cfg = ref({
   symbol: 'BTCUSDT',
   interval: '1d',
@@ -50,17 +47,19 @@ const cfg = ref({
   alpha: 1,
   maxCorr: 0.85,
   testRatio: 0.25,
+  learningRate: 0.05,
+  nEstimators: 240,
+  maxDepth: 3,
+  numLeaves: 7,
+  subsample: 0.9,
+  colsample: 0.9,
 })
 const target = ref('rank_ic>0.02')
-const args = ref<MlTrainArgs | null>(null)
 
-const models = ref<MlModelRow[]>([])
-const modelsLoading = ref(false)
-const scoreBusy = ref<string | null>(null)
-const btModel = ref<MlModelRow | null>(null)
-const btOpen = ref(false)
-const btBusy = ref(false)
-const btCfg = ref({ window: 60, days: 30 })
+const isRidge = computed(() => cfg.value.model === 'ridge')
+
+const mName = ref('')
+const saving = ref(false)
 
 const checkedList = computed(() => {
   const r = result.value
@@ -79,15 +78,8 @@ const checkedList = computed(() => {
   ]
 })
 
-function toggle(code: string) {
-  const s = new Set(codes.value)
-  if (s.has(code)) s.delete(code)
-  else if (s.size < 8) s.add(code)
-  codes.value = s
-}
-
 async function run() {
-  if (running.value || codes.value.size < 2) return
+  if (running.value || codes.value.length < 2) return
   running.value = true
   result.value = null
   args.value = null
@@ -105,6 +97,12 @@ async function run() {
     alpha: cfg.value.alpha,
     max_corr: cfg.value.maxCorr,
     model: cfg.value.model,
+    learning_rate: cfg.value.learningRate,
+    n_estimators: cfg.value.nEstimators,
+    max_depth: cfg.value.maxDepth,
+    num_leaves: cfg.value.numLeaves,
+    subsample: cfg.value.subsample,
+    colsample_bytree: cfg.value.colsample,
   }
   args.value = a
   phase.value = '特征标准化 + 去冗余 + 训练中…'
@@ -125,84 +123,21 @@ async function run() {
   }
 }
 
-const mName = ref('')
-const saving = ref(false)
 async function saveModel() {
   if (!args.value || !result.value?.found || saving.value || !mName.value.trim()) return
+  if (cfg.value.model !== 'ridge') {
+    toast.error('暂不支持保存', '当前仅 Ridge 线性模型可落库打分/回测；LightGBM 可研究但暂不能保存')
+    return
+  }
   saving.value = true
   try {
     const saved = await saveMl({ ...args.value, name: mName.value.trim() })
     mName.value = ''
     toast.success('模型已保存到模型库', `${saved.name}`)
-    await openModels()
   } catch (e: unknown) {
     toast.error('保存失败', (e as { message?: string }).message)
   } finally {
     saving.value = false
-  }
-}
-
-async function loadModels() {
-  modelsLoading.value = true
-  try {
-    models.value = await listMlModels()
-  } catch {
-    models.value = []
-  } finally {
-    modelsLoading.value = false
-  }
-}
-async function openModels() {
-  await loadModels()
-}
-
-async function scoreModel(m: MlModelRow) {
-  scoreBusy.value = m.id
-  const days = m.interval.endsWith('d') ? 30 : m.interval.endsWith('h') ? 14 : 3
-  const end = new Date()
-  const start = new Date(end.getTime() - days * 24 * 3600 * 1000)
-  try {
-    const sym = m.symbols?.[0] ?? 'BTCUSDT'
-    const res = await scoreMlModel(m.id, { symbol: sym, start: start.toISOString(), end: end.toISOString() })
-    toast.info('打分完成', `${sym} 最近 ${res.n} bar · 最新分 ${res.last_score ?? '—'}`)
-  } catch (e: unknown) {
-    toast.error('打分失败', (e as { message?: string }).message)
-  } finally {
-    scoreBusy.value = null
-  }
-}
-
-function openBt(m: MlModelRow) {
-  btModel.value = m
-  btCfg.value = { window: 60, days: m.interval.endsWith('d') ? 300 : m.interval.endsWith('h') ? 30 : 7 }
-  btOpen.value = true
-}
-async function runBt() {
-  const m = btModel.value
-  if (!m || btBusy.value) return
-  btBusy.value = true
-  const end = new Date()
-  const start = new Date(end.getTime() - btCfg.value.days * 24 * 3600 * 1000)
-  const features = (m.features ?? []).map((f) => ({ code: f.code, coef: f.coef, mean: f.mean, std: f.std }))
-  const params: Record<string, unknown> = {
-    template_id: 'ml_score',
-    features,
-    window: btCfg.value.window,
-    enter_q: 0.8,
-    exit_q: 0.2,
-  }
-  try {
-    const sym = m.symbols?.[0] ?? 'BTCUSDT'
-    const str = await createStrategy({ name: `${m.name}-bt`, description: `ML 模型「${m.name}」驱动的择时策略。`, tags: ['ML'] })
-    const ver = await createVersion(str.strategy_id, { template_id: 'ml_score', params })
-    await runBacktest({ strategy_id: str.strategy_id, version_id: ver.version_id, symbol: sym, interval: m.interval, start: start.toISOString(), end: end.toISOString(), params })
-    btOpen.value = false
-    toast.success('策略已创建并开始回测', '请到策略研究查看')
-    router.push(`/strategy/${str.strategy_id}`)
-  } catch (e: unknown) {
-    toast.error('建策略失败', (e as { message?: string }).message)
-  } finally {
-    btBusy.value = false
   }
 }
 
@@ -216,8 +151,7 @@ onMounted(async () => {
   } catch {
     factors.value = []
   }
-  codes.value = new Set(factors.value.slice(0, 4).map((f) => f.code))
-  await loadModels()
+  codes.value = factors.value.slice(0, 4).map((f) => f.code)
 })
 </script>
 
@@ -230,78 +164,111 @@ onMounted(async () => {
     >
       <template #actions>
         <HelpDrawer :help="pageHelp" />
-        <button class="btn btn-ghost" :disabled="modelsLoading" @click="openModels"><RefreshCw :size="15" :class="{ 'animate-spin-slow': modelsLoading }" />模型库</button>
+        <router-link to="/models" class="btn btn-ghost">模型库</router-link>
         <router-link to="/factor/ai-lab" class="btn btn-soft"><Sparkles :size="15" />AI 因子工坊</router-link>
       </template>
     </PageHeader>
 
     <div class="grid grid-cols-1 gap-6 xl:grid-cols-3">
       <!-- 训练配置 -->
-      <Panel title="训练配置" sub="数据 + 特征 + 模型 + 正则 + 目标">
+      <div>
+        <Panel title="训练配置" sub="数据 + 特征 + 模型 + 正则 + 目标">
         <div class="space-y-4">
           <div class="grid grid-cols-2 gap-3">
             <div class="field">
-              <label class="label" for="t-sym">交易对</label>
+              <label class="label" for="t-sym">交易对 <Info :size="12" class="inline text-subtle" title="训练与测试使用的 K 线标的（单标的）" /></label>
               <input id="t-sym" v-model="cfg.symbol" list="t-syms" class="input font-mono uppercase" spellcheck="false" />
               <datalist id="t-syms"><option v-for="s in MAJOR_SYMBOLS" :key="s" :value="s" /></datalist>
             </div>
             <div class="field">
-              <label class="label" for="t-int">K 线粒度</label>
+              <label class="label" for="t-int">K 线粒度 <Info :size="12" class="inline text-subtle" title="特征与标签的计算频率，越细信号越密但噪声也越大" /></label>
               <select id="t-int" v-model="cfg.interval" class="select font-mono">
                 <option v-for="i in INTERVALS.filter((x) => ['15m', '30m', '1h', '1d'].includes(x))" :key="i" :value="i">{{ i }}</option>
               </select>
             </div>
             <div class="field">
-              <label class="label" for="t-days">回看窗口</label>
+              <label class="label" for="t-days">回看窗口 <Info :size="12" class="inline text-subtle" title="样本时间跨度；越长样本越足，但可能包含过时行情" /></label>
               <select id="t-days" v-model.number="cfg.days" class="select">
                 <option :value="180">180 天</option><option :value="365">1 年</option><option :value="730">2 年</option>
               </select>
             </div>
             <div class="field">
-              <label class="label" for="t-hz">预测窗口(h)</label>
+              <label class="label" for="t-hz">预测窗口(h) <Info :size="12" class="inline text-subtle" title="用未来几根 K 线收益作标签；越大越难预测、换仓越慢" /></label>
               <select id="t-hz" v-model.number="cfg.horizon" class="select"><option :value="1">1</option><option :value="3">3</option><option :value="5">5</option></select>
             </div>
             <div class="field">
-              <label class="label" for="t-model">模型</label>
+              <label class="label" for="t-model">模型 <Info :size="12" class="inline text-subtle" title="Ridge 线性稳健、可保存复用；LightGBM 捕捉非线性但暂不可保存" /></label>
               <select id="t-model" v-model="cfg.model" class="select"><option value="ridge">Ridge 线性</option><option value="gbdt">LightGBM</option></select>
             </div>
             <div class="field">
-              <label class="label">测试集比例</label>
-              <select v-model.number="cfg.testRatio" class="select"><option :value="0.2">20%</option><option :value="0.25">25%</option><option :value="0.3">30%</option></select>
+              <label class="label" for="t-ratio">测试集比例 <Info :size="12" class="inline text-subtle" title="按时间末尾切出的样本外比例，用于无未来函数评价" /></label>
+              <select id="t-ratio" v-model.number="cfg.testRatio" class="select"><option :value="0.2">20%</option><option :value="0.25">25%</option><option :value="0.3">30%</option></select>
             </div>
             <div class="field">
-              <label class="label" :for="'t-alpha'">{{ cfg.model === 'ridge' ? '正则 α' : 'L2 叶子权重' }}</label>
+              <label class="label" :for="'t-alpha'">{{ isRidge ? '正则 α' : 'L2 叶子权重' }} <Info :size="12" class="inline text-subtle" :title="isRidge ? 'Ridge 惩罚系数，越大越强约束、越防过拟合' : 'LightGBM 叶子权重的 L2 正则项'" /></label>
               <input id="t-alpha" v-model.number="cfg.alpha" type="number" min="0" step="0.1" class="input font-mono" />
             </div>
             <div class="field">
-              <label class="label" for="t-corr">相关性过滤阈值</label>
+              <label class="label" for="t-corr">相关性过滤阈值 <Info :size="12" class="inline text-subtle" title="特征两两 |相关| 超过该值则剔除较弱者，去冗余" /></label>
               <input id="t-corr" v-model.number="cfg.maxCorr" type="number" min="0.3" max="0.99" step="0.05" class="input font-mono" />
             </div>
           </div>
 
-          <div>
-            <p class="mb-2 text-xs font-semibold uppercase tracking-wider text-subtle">特征因子（2~8，建议已通过 IC 筛选）</p>
-            <div class="flex flex-wrap gap-1.5">
-              <button v-for="f in factors" :key="f.code" class="chip" :class="{ 'is-active': codes.has(f.code) }" @click="toggle(f.code)">{{ f.name }}</button>
+          <!-- LightGBM 专属超参 -->
+          <template v-if="!isRidge">
+            <p class="text-[11px] font-semibold uppercase tracking-wider text-subtle">LightGBM 超参数</p>
+            <div class="grid grid-cols-2 gap-3">
+              <div class="field">
+                <label class="label" for="t-lr">学习率 <Info :size="12" class="inline text-subtle" title="每棵树贡献的缩减系数；越小越稳健、需更多树" /></label>
+                <input id="t-lr" v-model.number="cfg.learningRate" type="number" min="0.001" max="1" step="0.01" class="input font-mono" />
+              </div>
+              <div class="field">
+                <label class="label" for="t-ne">树数量 <Info :size="12" class="inline text-subtle" title="n_estimators：迭代的树数量，越大拟合越强、越易过拟合" /></label>
+                <input id="t-ne" v-model.number="cfg.nEstimators" type="number" min="10" max="5000" step="10" class="input font-mono" />
+              </div>
+              <div class="field">
+                <label class="label" for="t-md">最大深度 <Info :size="12" class="inline text-subtle" title="max_depth：单棵树最大深度，控制交互复杂度；-1 表示不限制" /></label>
+                <input id="t-md" v-model.number="cfg.maxDepth" type="number" min="-1" max="32" step="1" class="input font-mono" />
+              </div>
+              <div class="field">
+                <label class="label" for="t-nl">叶子数 <Info :size="12" class="inline text-subtle" title="num_leaves：每棵树叶子节点数，越大模型容量越大" /></label>
+                <input id="t-nl" v-model.number="cfg.numLeaves" type="number" min="2" max="256" step="1" class="input font-mono" />
+              </div>
+              <div class="field">
+                <label class="label" for="t-ss">行采样 <Info :size="12" class="inline text-subtle" title="subsample：每轮训练随机用多少比例样本，防过拟合" /></label>
+                <input id="t-ss" v-model.number="cfg.subsample" type="number" min="0.1" max="1" step="0.05" class="input font-mono" />
+              </div>
+              <div class="field">
+                <label class="label" for="t-cs">列采样 <Info :size="12" class="inline text-subtle" title="colsample_bytree：每棵树随机用多少比例特征，防过拟合" /></label>
+                <input id="t-cs" v-model.number="cfg.colsample" type="number" min="0.1" max="1" step="0.05" class="input font-mono" />
+              </div>
             </div>
+          </template>
+
+          <div>
+            <p class="mb-2 text-xs font-semibold uppercase tracking-wider text-subtle">
+              特征因子（已通过 IC 筛选更佳，可搜索多选）
+            </p>
+            <FactorPicker v-model:selected="codes" :factors="factors" :max="12" />
           </div>
 
           <div class="field">
-            <label class="label">目标（体检通过线）</label>
-            <select v-model="target" class="select">
+            <label class="label" for="t-target">目标（体检通过线） <Info :size="12" class="inline text-subtle" title="用于提示本轮结果是否达到期望，不影响训练本身" /></label>
+            <select id="t-target" v-model="target" class="select">
               <option value="rank_ic>0.02">OOS RankIC &gt; 0.02 且方向一致</option>
               <option value="spread>0">Top−Bottom 价差 &gt; 0</option>
               <option value="hit>0.52">命中率 &gt; 52%</option>
             </select>
           </div>
 
-          <button class="btn btn-primary w-full" :disabled="running || codes.size < 2" @click="run">
+          <button class="btn btn-primary w-full" :disabled="running || codes.length < 2" @click="run">
             <LoaderCircle v-if="running" :size="15" class="animate-spin" /><Cpu v-else :size="15" />
             {{ running ? phase || '训练中…' : '开始训练' }}
           </button>
           <p class="text-[11px] leading-relaxed text-subtle">切分规则：每标的按时间先后取后 test_ratio 为测试段，训练/测试间保留 purge（horizon 根）缓冲，禁止随机洗牌。</p>
         </div>
       </Panel>
+      </div>
 
       <!-- 结果/体检 -->
       <div class="flex flex-col gap-6 xl:col-span-2">
@@ -361,49 +328,15 @@ onMounted(async () => {
             <p class="mt-1.5 text-[11px] text-subtle">引擎：{{ result.engine }} · 保留 {{ result.n_features_kept }} 个特征 · 样本 train {{ result.n_train }} / test {{ result.n_test }}</p>
           </Panel>
 
-          <Panel title="保存与下一步" sub="把体检通过的模型落库，去“模型库”一键转策略回测">
+          <Panel title="保存与下一步" sub="把体检通过的模型落库，去「模型库」一键转策略回测 / 部署模拟盘">
             <div class="flex gap-2">
-              <input v-model="mName" class="input h-9 flex-1 font-mono text-xs" placeholder="模型名称，如 btc-1d-lgb" maxlength="120" />
+              <input v-model="mName" class="input h-9 flex-1 font-mono text-xs" placeholder="模型名称，如 btc-1d-ridge" maxlength="120" />
               <button class="btn btn-primary !h-9" :disabled="saving || !mName.trim()" @click="saveModel"><LoaderCircle v-if="saving" :size="14" class="animate-spin" />保存模型</button>
             </div>
+            <p v-if="!isRidge" class="mt-2 text-[11px] text-warn">LightGBM 模型暂不可保存/打分/回测，仅用于研究对比；如需落库请切换 Ridge。</p>
           </Panel>
         </template>
       </div>
     </div>
-
-    <!-- 模型库 -->
-    <Panel title="模型库" sub="已保存的 Ridge 模型（可打分、一键转策略回测）">
-      <div v-if="modelsLoading" class="py-6"><StateView busy title="读取模型…" /></div>
-      <StateView v-else-if="!models.length" icon="empty" title="还没有模型" desc="训练通过后填写名称即可保存到库。" />
-      <div v-else class="grid grid-cols-1 gap-2 lg:grid-cols-2">
-        <div v-for="m in models" :key="m.id" class="flex flex-wrap items-center gap-3 rounded-xl border border-border bg-surface-2/40 px-3.5 py-2.5">
-          <div class="min-w-0 flex-1">
-            <p class="text-sm font-semibold text-fg">{{ m.name }}</p>
-            <p class="num mt-0.5 text-[11px] text-subtle">{{ m.interval }} · h{{ m.horizon }} · train {{ m.n_train }} · {{ timeAgo(m.created_at) }}</p>
-            <p class="num mt-0.5 text-[11px] text-muted">OOS IC {{ m.metrics?.oos_ic ?? '—' }} · RankIC {{ m.metrics?.oos_rank_ic ?? '—' }}</p>
-          </div>
-          <div class="flex shrink-0 items-center gap-2">
-            <button class="btn btn-ghost !h-8 text-xs" :disabled="scoreBusy === m.id" @click="scoreModel(m)">打分</button>
-            <button class="btn btn-primary !h-8 text-xs" @click="openBt(m)">建策略回测</button>
-          </div>
-        </div>
-      </div>
-    </Panel>
-
-    <Modal :open="btOpen" :title="`用模型建策略 · ${btModel?.name ?? ''}`" :sub="`${btModel?.interval} · 因果滚动分位择时`" width="480px" @close="btOpen = false">
-      <div class="space-y-4">
-        <div class="grid grid-cols-2 gap-3">
-          <div class="field"><label class="label" for="bb-window">滚动窗口</label><input id="bb-window" v-model.number="btCfg.window" type="number" min="20" class="input" /></div>
-          <div class="field"><label class="label" for="bb-days">回看天数</label><input id="bb-days" v-model.number="btCfg.days" type="number" min="30" class="input" /></div>
-        </div>
-        <p class="text-xs text-subtle">策略跑在 {{ btModel?.symbols?.[0] ?? 'BTCUSDT' }} · {{ btModel?.interval }}，评分高于滚动 q80 做多、低于 q20 平仓。</p>
-      </div>
-      <template #footer>
-        <div class="flex justify-end gap-2">
-          <button class="btn btn-ghost" @click="btOpen = false">取消</button>
-          <button class="btn btn-primary" :disabled="btBusy" @click="runBt"><LoaderCircle v-if="btBusy" :size="14" class="animate-spin" />创建并回测</button>
-        </div>
-      </template>
-    </Modal>
   </div>
 </template>

@@ -13,6 +13,7 @@ import {
   Cpu,
   SlidersHorizontal,
   Activity,
+  Library,
   Sun,
   Moon,
   Menu,
@@ -54,6 +55,7 @@ const nav: NavGroup[] = [
       { label: '因子库', to: '/factor', icon: Boxes },
       { label: 'AI 因子工坊', to: '/factor/ai-lab', icon: Sparkles },
       { label: '模型训练', to: '/train', icon: Cpu },
+      { label: '模型库', to: '/models', icon: Library },
     ],
   },
   {
@@ -120,11 +122,11 @@ function navigate(item: NavItem) {
           class="flex items-center gap-2.5"
           :title="sidebar.collapsed ? 'CryptoQuant' : undefined"
         >
-          <span
-            class="flex h-8 w-8 shrink-0 items-center justify-center rounded-[10px] bg-gradient-to-br from-[#0e7490] to-[#134e5e] font-display text-[13px] font-bold text-white dark:from-[#4fd0f0] dark:to-[#1f6d85] dark:text-[#06262f]"
-          >
-            CQ
-          </span>
+          <img
+            src="/logo.png"
+            alt="CryptoQuant"
+            class="h-8 w-8 shrink-0 rounded-lg object-contain"
+          />
           <span v-if="!sidebar.collapsed" class="flex flex-col leading-none">
             <span class="font-display text-[15px] font-bold tracking-tight text-fg">CryptoQuant</span>
             <span class="mt-1 text-[10px] tracking-[0.14em] text-subtle">数字币量化研究</span>
@@ -208,11 +210,11 @@ function navigate(item: NavItem) {
         <aside v-if="drawerOpen" class="fixed inset-y-0 left-0 z-[71] flex w-[262px] flex-col bg-surface shadow-pop lg:hidden">
           <div class="flex items-center justify-between border-b border-border pr-2 pl-5">
             <router-link to="/dashboard" class="flex items-center gap-2.5 py-4">
-              <span
-                class="flex h-8 w-8 items-center justify-center rounded-[10px] bg-gradient-to-br from-[#0e7490] to-[#134e5e] font-display text-[13px] font-bold text-white dark:from-[#4fd0f0] dark:to-[#1f6d85] dark:text-[#06262f]"
-              >
-                CQ
-              </span>
+              <img
+                src="/logo.png"
+                alt="CryptoQuant"
+                class="h-8 w-8 rounded-lg object-contain"
+              />
               <span class="font-display text-[15px] font-bold tracking-tight text-fg">CryptoQuant</span>
             </router-link>
             <button class="btn btn-icon text-muted" aria-label="关闭菜单" @click="drawerOpen = false">
@@ -298,7 +300,7 @@ function navigate(item: NavItem) {
       </header>
 
       <main class="min-h-0 flex-1 overflow-y-auto">
-        <div class="mx-auto w-full max-w-[1500px] px-4 py-6 sm:px-6 lg:px-8 lg:py-8">
+        <div class="mx-auto flex min-h-full w-full max-w-[1500px] flex-col px-4 py-6 sm:px-6 lg:px-8 lg:py-8">
           <router-view v-slot="{ Component }">
             <transition name="page" mode="out-in">
               <component :is="Component" />

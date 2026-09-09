@@ -38,6 +38,8 @@ def _rank(s: np.ndarray) -> np.ndarray:
 
 
 def _spearman(a: np.ndarray, b: np.ndarray) -> float:
+    if a.std() == 0 or b.std() == 0 or not np.isfinite(a).all() or not np.isfinite(b).all():
+        return float("nan")
     return float(np.corrcoef(_rank(a), _rank(b))[0, 1])
 
 
@@ -61,7 +63,9 @@ def _filter_high_corr(
     if threshold is None or threshold >= 1.0 or names and X.shape[1] <= 2:
         return list(range(X.shape[1])), []
     n_feat = X.shape[1]
-    corr = np.abs(np.corrcoef(X.T))
+    with np.errstate(invalid="ignore", divide="ignore"):
+        corr = np.abs(np.corrcoef(X.T))
+    # 常数列/全 NaN 列参与相关会得到 NaN，统一视为“与其它因子无关”
     corr[np.isnan(corr)] = 0.0
     univ = np.array([abs(_pearson_arr(X[:, i], y)) if X[:, i].std() > 0 else 0.0 for i in range(n_feat)])
     univ[np.isnan(univ)] = 0.0
@@ -113,6 +117,12 @@ async def run_ml_research(
     alpha: float = 1.0,
     max_corr: float | None = 0.85,
     model: str = "ridge",
+    learning_rate: float = 0.05,
+    n_estimators: int = 240,
+    max_depth: int = 3,
+    num_leaves: int = 7,
+    subsample: float = 0.9,
+    colsample_bytree: float = 0.9,
     extras: dict[str, dict] | None = None,
     return_artifact: bool = False,
 ) -> dict[str, Any]:
@@ -191,8 +201,13 @@ async def run_ml_research(
         except ImportError as exc:  # pragma: no cover
             return {"found": False, "message": "未安装 lightgbm（pip install lightgbm）"}
         booster = LGBMRegressor(
-            n_estimators=240, learning_rate=0.05, max_depth=3, num_leaves=7,
-            subsample=0.9, colsample_bytree=0.9, random_state=7,
+            n_estimators=max(10, int(n_estimators)),
+            learning_rate=float(learning_rate),
+            max_depth=max(-1, int(max_depth)),
+            num_leaves=max(2, int(num_leaves)),
+            subsample=min(1.0, max(0.1, float(subsample))),
+            colsample_bytree=min(1.0, max(0.1, float(colsample_bytree))),
+            random_state=7,
         ).fit(Xtr_z, ytr)
         w = booster.feature_importances_.astype(float)
         s = w.sum()
@@ -257,6 +272,15 @@ async def run_ml_research(
         "interval": interval,
         "horizon": horizon,
         "alpha": alpha,
+        "max_corr": max_corr,
+        "hyperparams": {
+            "learning_rate": learning_rate,
+            "n_estimators": n_estimators,
+            "max_depth": max_depth,
+            "num_leaves": num_leaves,
+            "subsample": subsample,
+            "colsample_bytree": colsample_bytree,
+        },
         "features": [
             {
                 **{"code": code, "coef": float(w[i]), "mean": float(mu[i]), "std": float(sd[i])},

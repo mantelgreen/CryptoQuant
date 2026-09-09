@@ -35,13 +35,14 @@ class LlmProviderRepository:
         max_tokens: int,
         enabled: bool,
         is_default: bool,
+        disable_thinking: bool = False,
     ) -> dict[str, Any]:
         pid = uuid4()
         await self.db.execute(
             self._t.insert().values(
                 id=pid, name=name, provider=provider, base_url=base_url, api_key=api_key,
                 model=model, temperature=temperature, max_tokens=max_tokens,
-                enabled=enabled, is_default=is_default,
+                enabled=enabled, is_default=is_default, disable_thinking=disable_thinking,
             )
         )
         if is_default:
@@ -70,7 +71,7 @@ class LlmProviderRepository:
         if current is None:
             return None
         values: dict[str, Any] = {}
-        for col in ("name", "provider", "base_url", "api_key", "model", "temperature", "max_tokens", "enabled"):
+        for col in ("name", "provider", "base_url", "api_key", "model", "temperature", "max_tokens", "enabled", "disable_thinking"):
             if col not in fields:
                 continue
             v = fields[col]

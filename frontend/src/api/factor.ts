@@ -165,6 +165,14 @@ export async function trainMl(payload: {
   horizon?: number
   test_ratio?: number
   alpha?: number
+  model?: string
+  max_corr?: number | null
+  learning_rate?: number
+  n_estimators?: number
+  max_depth?: number
+  num_leaves?: number
+  subsample?: number
+  colsample_bytree?: number
 }): Promise<MlTrainResult> {
   const { data } = await http.post<{ data: MlTrainResult }>('/factors/ml/train', payload, { timeout: 180_000 })
   return data.data
@@ -190,7 +198,7 @@ export interface MlModelRow {
   interval: string
   horizon: number
   symbols: string[]
-  features: Array<{ code: string; coef: number; mean: number; std: number }>
+  features: Array<{ code: string; coef: number; mean: number; std: number; expression?: string }>
   metrics: { oos_ic?: number | null; oos_rank_ic?: number | null; hit_rate?: number | null; spread?: number | null }
   n_train: number
   n_test: number
@@ -225,6 +233,12 @@ export interface MlTrainArgs {
   alpha?: number
   model?: string
   max_corr?: number
+  learning_rate?: number
+  n_estimators?: number
+  max_depth?: number
+  num_leaves?: number
+  subsample?: number
+  colsample_bytree?: number
 }
 
 export async function researchFactors(payload: {

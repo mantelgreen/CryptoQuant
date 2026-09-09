@@ -9,6 +9,7 @@ export interface LlmProvider {
   model: string
   temperature: number
   max_tokens: number
+  disable_thinking: boolean
   enabled: boolean
   is_default: boolean
   created_at: string
@@ -23,6 +24,7 @@ export interface ProviderInput {
   model: string
   temperature?: number
   max_tokens?: number
+  disable_thinking?: boolean
   enabled?: boolean
   is_default?: boolean
 }

@@ -36,6 +36,7 @@ class ProviderReq(BaseModel):
     model: str = Field(..., min_length=1, max_length=120)
     temperature: float = Field(default=0.2, ge=0, le=2)
     max_tokens: int = Field(default=2000, ge=1, le=100_000)
+    disable_thinking: bool = False
     enabled: bool = True
     is_default: bool = False
 
@@ -48,6 +49,7 @@ class ProviderUpdate(BaseModel):
     model: str | None = Field(default=None, max_length=120)
     temperature: float | None = Field(default=None, ge=0, le=2)
     max_tokens: int | None = Field(default=None, ge=1, le=100_000)
+    disable_thinking: bool | None = None
     enabled: bool | None = None
     is_default: bool | None = None
 
@@ -71,6 +73,7 @@ async def create_provider(
         name=req.name.strip(), provider=req.provider, base_url=req.base_url,
         api_key=req.api_key or None, model=req.model.strip(),
         temperature=req.temperature, max_tokens=req.max_tokens,
+        disable_thinking=req.disable_thinking,
         enabled=req.enabled, is_default=req.is_default,
     )
     return {"code": "OK", "message": "ok", "data": _public(row)}

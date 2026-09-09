@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ...core.db import get_db
 from ...core.errors import BadRequest, NotFound
 from ...data.repository.kline_repo import KlineRepository
-from ...factor.registry import list_factor_meta
+from ...factor.registry import get_factors, list_factor_meta
 from ...factor.repo import FactorRunRepository, MlModelRepository, UserFactorRepository
 from ...factor.service import matrix_factor, research_expression, research_factor
 from ...factor.ml import run_ml_research, score_with_model
@@ -62,6 +62,29 @@ async def _factor_extras(db: AsyncSession) -> dict[str, dict[str, Any]]:
     }
 
 
+async def _extras_for_codes(db: AsyncSession, codes: list[str]) -> dict[str, dict[str, Any]]:
+    """在用户因子基础上，把列表里“非内置、非已注册”的 code 按表达式兜底。
+
+    让工坊里尚未入库的 AI 草稿（code 即原始表达式）也能直接参与
+    /research 与 /ml/train 的多因子研究，无需先 join 入库。
+    """
+    extras = await _factor_extras(db)
+    builtin = set(get_factors())
+    for code in codes:
+        c = code.strip()
+        if not c or len(c) > 2000 or code in builtin or code in extras:
+            continue
+        extras[code] = {
+            "name": f"expr:{c[:20]}",
+            "description": "",
+            "tags": ["AI"],
+            "min_bars": 0,
+            "expression": c,
+            "is_user": True,
+        }
+    return extras
+
+
 class JoinFactorReq(BaseModel):
     name: str = Field(..., min_length=1, max_length=60)
     description: str = Field(default="", max_length=300)
@@ -81,6 +104,13 @@ class MlTrainReq(BaseModel):
     alpha: float = Field(default=1.0, ge=0.0)
     max_corr: float | None = Field(default=0.85, ge=0.0, lt=1.0)
     model: str = Field(default="ridge", pattern=r"^(ridge|gbdt)$")
+    # —— LightGBM（gbdt）超参数 ——
+    learning_rate: float = Field(default=0.05, ge=0.001, le=1.0)
+    n_estimators: int = Field(default=240, ge=10, le=5000)
+    max_depth: int = Field(default=3, ge=-1, le=32)
+    num_leaves: int = Field(default=7, ge=2, le=256)
+    subsample: float = Field(default=0.9, ge=0.1, le=1.0)
+    colsample_bytree: float = Field(default=0.9, ge=0.1, le=1.0)
 
 
 class MlSaveReq(MlTrainReq):
@@ -171,7 +201,7 @@ async def factor_matrix(
     if req.end <= req.start:
         raise BadRequest("end_must_be_greater_than_start")
     repo = KlineRepository(db)
-    extras = await _factor_extras(db)
+    extras = await _extras_for_codes(db, req.codes)
     data = await matrix_factor(repo, req.codes, [s.upper() for s in req.symbols], req.interval, req.start, req.end, extras=extras)
     return {"code": "OK", "message": "ok", "data": data}
 
@@ -198,7 +228,7 @@ async def ml_train(
     if req.end <= req.start:
         raise BadRequest("end_must_be_greater_than_start")
     repo = KlineRepository(db)
-    extras = await _factor_extras(db)
+    extras = await _extras_for_codes(db, req.codes)
     data = await run_ml_research(
         repo,
         req.codes,
@@ -211,6 +241,12 @@ async def ml_train(
         alpha=req.alpha,
         max_corr=req.max_corr,
         model=req.model,
+        learning_rate=req.learning_rate,
+        n_estimators=req.n_estimators,
+        max_depth=req.max_depth,
+        num_leaves=req.num_leaves,
+        subsample=req.subsample,
+        colsample_bytree=req.colsample_bytree,
         extras=extras,
     )
     return {"code": "OK", "message": "ok", "data": data}
@@ -227,7 +263,7 @@ async def ml_save_model(
     if req.model != "ridge":
         raise BadRequest("模型落库/打分当前仅支持 ridge（线性可复用）；gbdt 可研究但不可保存打分")
     repo = KlineRepository(db)
-    extras = await _factor_extras(db)
+    extras = await _extras_for_codes(db, req.codes)
     resp = await run_ml_research(
         repo,
         req.codes,
@@ -240,6 +276,12 @@ async def ml_save_model(
         alpha=req.alpha,
         max_corr=req.max_corr,
         model=req.model,
+        learning_rate=req.learning_rate,
+        n_estimators=req.n_estimators,
+        max_depth=req.max_depth,
+        num_leaves=req.num_leaves,
+        subsample=req.subsample,
+        colsample_bytree=req.colsample_bytree,
         extras=extras,
         return_artifact=True,
     )
@@ -327,7 +369,7 @@ async def research(
     repo = KlineRepository(db)
     run_repo = FactorRunRepository(db)
     symbols = [s.upper() for s in req.symbols]
-    extras = await _factor_extras(db)
+    extras = await _extras_for_codes(db, req.codes)
     results = []
     for code in req.codes:
         result = await research_factor(repo, code, symbols, req.interval, req.start, req.end, extras=extras)

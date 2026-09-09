@@ -1,8 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { useRouter } from 'vue-router'
-import { ArrowUpRight, Boxes, Check, FlaskConical, Info, LoaderCircle, RefreshCw, Search, Sparkles } from '@lucide/vue'
-import { createStrategy, createVersion, runBacktest } from '@/api/strategy'
+import { Boxes, FlaskConical, Info, LoaderCircle, RefreshCw, Search, Sparkles } from '@lucide/vue'
 import PageHeader from '@/components/ui/PageHeader.vue'
 import HelpDrawer, { type PageHelp } from '@/components/ui/HelpDrawer.vue'
 import Panel from '@/components/ui/Panel.vue'
@@ -15,21 +13,11 @@ import {
   fetchRunsByCode,
   factorMatrix,
   researchFactors,
-  verifyExpression,
-  joinFactor,
   removeUserFactor,
-  trainMl,
-  saveMl,
-  listMlModels,
-  scoreMlModel,
   type FactorMeta,
   type FactorResearch,
   type FactorRun,
   type FactorMatrix,
-  type MlTrainResult,
-  type MlTrainArgs,
-  type MlModelRow,
-  type MlScore,
 } from '@/api/factor'
 import EquityChart from '@/components/chart/EquityChart.vue'
 import { INTERVALS, MAJOR_SYMBOLS, timeAgo, fmtTime } from '@/utils/format'
@@ -171,42 +159,15 @@ async function runResearch() {
   const start = new Date(end.getTime() - form.value.days * 24 * 3600 * 1000)
   const symbol = form.value.symbol.trim().toUpperCase()
   try {
-    let r: FactorResearch
-    if (active.value.is_user && active.value.expression) {
-      // 用户/AI 因子走表达式验证（单标的）
-      const v = await verifyExpression({
-        expression: active.value.expression,
-        symbol,
-        interval: '1d',
-        start: start.toISOString(),
-        end: end.toISOString(),
-      })
-      if (!v.ok) {
-        toast.error('校验未通过', v.errors?.[0] ?? v.message)
-        return
-      }
-      r = {
-        code: active.value.code,
-        name: active.value.name,
-        tags: [],
-        interval: '1d',
-        found: true,
-        ic: v.ic,
-        rank_ic: v.rank_ic,
-        decay: {},
-        n_total: v.n_total,
-        per_symbol: [],
-      }
-    } else {
-      const res = await researchFactors({
-        codes: [active.value.code],
-        symbols: [symbol],
-        interval: form.value.interval,
-        start: start.toISOString(),
-        end: end.toISOString(),
-      })
-      r = res[0]
-    }
+    // 统一走研究接口：内置因子与用户/AI 表达式因子都落库 IC 记录，便于「历史」回看
+    const res = await researchFactors({
+      codes: [active.value.code],
+      symbols: [symbol],
+      interval: form.value.interval,
+      start: start.toISOString(),
+      end: end.toISOString(),
+    })
+    const r = res[0]
     results.value = { ...results.value, [r.code]: r }
     if (r.found) {
       toast.success('研究完成', `${r.name} 实测 IC=${r.ic ?? '—'} · RankIC=${r.rank_ic ?? '—'}（n=${r.n_total}）`)
@@ -333,167 +294,6 @@ function heatStyle(v: number): Record<string, string> {
   return { backgroundColor: `color-mix(in srgb, ${color} ${alpha}%, transparent)` }
 }
 
-// —— ML 多因子训练 ——
-const mlOpen = ref(false)
-const mlCodes = ref<Set<string>>(new Set())
-const mlLoading = ref(false)
-const mlResult = ref<MlTrainResult | null>(null)
-const mlCfg = ref({ symbol: 'BTCUSDT', interval: '1d', days: 365, horizon: 1, alpha: 1, model: 'ridge' })
-const mlLast = ref<MlTrainArgs | null>(null)
-const mlName = ref('')
-const mlSaving = ref(false)
-
-function openMl() {
-  mlCodes.value = new Set(factors.value.slice(0, 3).map((f) => f.code))
-  mlResult.value = null
-  mlOpen.value = true
-}
-
-function toggleMl(code: string) {
-  const s = new Set(mlCodes.value)
-  if (s.has(code)) s.delete(code)
-  else if (s.size < 8) s.add(code)
-  mlCodes.value = s
-}
-
-async function runMl() {
-  if (mlLoading.value || mlCodes.value.size < 2) return
-  mlLoading.value = true
-  mlResult.value = null
-  mlLast.value = null
-  const end = new Date()
-  const start = new Date(end.getTime() - mlCfg.value.days * 24 * 3600 * 1000)
-  const args: MlTrainArgs = {
-    codes: [...mlCodes.value],
-    symbols: [mlCfg.value.symbol.trim().toUpperCase()],
-    interval: mlCfg.value.interval,
-    start: start.toISOString(),
-    end: end.toISOString(),
-    horizon: mlCfg.value.horizon,
-    test_ratio: 0.25,
-    alpha: mlCfg.value.alpha,
-    model: mlCfg.value.model,
-  }
-  try {
-    mlResult.value = await trainMl(args)
-    mlLast.value = mlResult.value.found ? args : null
-    if (!mlResult.value.found) toast.error('训练失败', mlResult.value.message)
-  } catch (e: unknown) {
-    toast.error('训练失败', (e as { message?: string }).message)
-  } finally {
-    mlLoading.value = false
-  }
-}
-
-async function saveResult() {
-  if (!mlLast.value || !mlName.value.trim() || mlSaving.value) return
-  mlSaving.value = true
-  try {
-    const saved = await saveMl({ ...mlLast.value, name: mlName.value.trim() })
-    mlName.value = ''
-    toast.success('模型已保存', `${saved.name}（${saved.interval} · ${saved.features} 个特征）`)
-  } catch (e: unknown) {
-    toast.error('保存失败', (e as { message?: string }).message)
-  } finally {
-    mlSaving.value = false
-  }
-}
-
-// —— 模型库 ——
-const modelsOpen = ref(false)
-const modelsList = ref<MlModelRow[]>([])
-const modelsLoading = ref(false)
-
-async function openModels() {
-  modelsOpen.value = true
-  modelsLoading.value = true
-  modelsList.value = []
-  try {
-    modelsList.value = await listMlModels()
-  } catch {
-    toast.error('模型库加载失败')
-  } finally {
-    modelsLoading.value = false
-  }
-}
-
-async function scoreModel(m: MlModelRow) {
-  const days = m.interval.endsWith('d') ? 30 : m.interval.endsWith('h') ? 14 : 3
-  const end = new Date()
-  const start = new Date(end.getTime() - days * 24 * 3600 * 1000)
-  try {
-    const sym = m.symbols?.[0] ?? 'BTCUSDT'
-    const res: MlScore = await scoreMlModel(m.id, { symbol: sym, start: start.toISOString(), end: end.toISOString() })
-    toast.info('打分完成', `${sym} 最近 ${res.n} bar，最新得分 ${res.last_score ?? '—'}`)
-  } catch (e: unknown) {
-    toast.error('打分失败', (e as { message?: string }).message)
-  }
-}
-
-// —— 用模型生成“策略版本 + 回测” ——
-const router = useRouter()
-const btOpen = ref(false)
-const btModel = ref<MlModelRow | null>(null)
-const btBusy = ref(false)
-const btCfg = ref({ symbol: 'BTCUSDT', days: 30, window: 60, enterQ: 0.8, exitQ: 0.2 })
-
-function openBt(m: MlModelRow) {
-  btModel.value = m
-  btCfg.value = {
-    symbol: m.symbols?.[0] ?? 'BTCUSDT',
-    days: m.interval.endsWith('d') ? 300 : m.interval.endsWith('h') ? 30 : 7,
-    window: 60,
-    enterQ: 0.8,
-    exitQ: 0.2,
-  }
-  btOpen.value = true
-}
-
-async function runBt() {
-  const m = btModel.value
-  if (!m || btBusy.value) return
-  btBusy.value = true
-  const end = new Date()
-  const start = new Date(end.getTime() - btCfg.value.days * 24 * 3600 * 1000)
-  const features = (m.features as Array<{ code: string; coef: number; mean: number; std: number }>).map((f) => ({
-    code: f.code,
-    coef: f.coef,
-    mean: f.mean,
-    std: f.std,
-  }))
-  const params: Record<string, unknown> = {
-    template_id: 'ml_score',
-    features,
-    window: btCfg.value.window,
-    enter_q: btCfg.value.enterQ,
-    exit_q: btCfg.value.exitQ,
-  }
-  try {
-    const str = await createStrategy({
-      name: `${m.name}-bt`,
-      description: `由 ML 模型「${m.name}」打分择时驱动的策略（${m.interval}）。`,
-      tags: ['ML', '量化'],
-    })
-    const ver = await createVersion(str.strategy_id, { template_id: 'ml_score', params })
-    await runBacktest({
-      strategy_id: str.strategy_id,
-      version_id: ver.version_id,
-      symbol: btCfg.value.symbol.trim().toUpperCase(),
-      interval: m.interval,
-      start: start.toISOString(),
-      end: end.toISOString(),
-      params,
-    })
-    toast.success('策略已创建并开始回测', `进入策略详情查看指标卡/资金曲线`)
-    btOpen.value = false
-    router.push(`/strategy/${str.strategy_id}`)
-  } catch (e: unknown) {
-    toast.error('创建策略失败', (e as { message?: string }).message)
-  } finally {
-    btBusy.value = false
-  }
-}
-
 onMounted(load)
 </script>
 
@@ -506,8 +306,8 @@ onMounted(load)
     >
       <template #actions>
         <HelpDrawer :help="pageHelp" />
-        <button class="btn btn-ghost" @click="openModels">模型库</button>
-        <button class="btn btn-ghost" @click="openMl">ML 训练</button>
+        <router-link to="/models" class="btn btn-ghost">模型库</router-link>
+        <router-link to="/train" class="btn btn-ghost">ML 训练</router-link>
         <button class="btn btn-ghost" @click="openMatrix">
           多因子矩阵
         </button>
@@ -616,10 +416,7 @@ onMounted(load)
             <button class="btn btn-primary !h-8 flex-1 !px-2 text-xs" @click="openResearch(f)">
               <FlaskConical :size="13" />研究 IC
             </button>
-            <button v-if="!f.is_user" class="btn btn-ghost !h-8 !px-2.5 text-xs" @click="openHistory(f)">历史</button>
-            <router-link v-if="!f.is_user" to="/factor/ai-lab" class="btn btn-ghost !h-8 !px-2.5 text-xs">
-              AI 工坊<ArrowUpRight :size="12" />
-            </router-link>
+            <button class="btn btn-ghost !h-8 !px-2.5 text-xs" @click="openHistory(f)">历史</button>
             <button v-if="f.is_user" class="btn btn-danger-ghost !h-8 flex-1 !px-2.5 text-xs" @click="removeUser(f)">删除</button>
           </div>
         </article>
@@ -776,182 +573,6 @@ onMounted(load)
         </div>
         <StateView v-else-if="mxResult && !mxResult.found" icon="search" :title="mxResult.message ?? '暂无结果'" desc="请确认本地有该窗口的 K 线数据。" />
       </div>
-    </Modal>
-
-    <!-- ML 多因子训练弹窗 -->
-    <Modal :open="mlOpen" title="ML 多因子训练" sub="因子作特征 → 按时间序列切分 → L2 Ridge 回归预测未来收益 → 样本外评价" width="720px" @close="mlOpen = false">
-      <div class="space-y-4">
-        <div>
-          <p class="mb-2 text-xs font-semibold uppercase tracking-wider text-subtle">特征（因子，2~8）</p>
-          <div class="flex flex-wrap gap-1.5">
-            <button v-for="f in factors" :key="f.code" class="chip" :class="{ 'is-active': mlCodes.has(f.code) }" @click="toggleMl(f.code)">
-              {{ f.name }}
-            </button>
-          </div>
-        </div>
-        <div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
-          <div class="field">
-            <label class="label" for="ml-symbol">交易对</label>
-            <input id="ml-symbol" v-model="mlCfg.symbol" class="input font-mono uppercase" spellcheck="false" />
-          </div>
-          <div class="field">
-            <label class="label" for="ml-interval">粒度</label>
-            <select id="ml-interval" v-model="mlCfg.interval" class="select font-mono">
-              <option v-for="i in INTERVALS.filter((x) => ['15m', '30m', '1h', '1d'].includes(x))" :key="i" :value="i">{{ i }}</option>
-            </select>
-          </div>
-          <div class="field">
-            <label class="label" for="ml-horizon">预测窗口(h)</label>
-            <select id="ml-horizon" v-model.number="mlCfg.horizon" class="select">
-              <option :value="1">1</option>
-              <option :value="3">3</option>
-              <option :value="5">5</option>
-            </select>
-          </div>
-          <div class="field">
-            <label class="label" for="ml-model">模型</label>
-            <select id="ml-model" v-model="mlCfg.model" class="select">
-              <option value="ridge">Ridge 线性</option>
-              <option value="gbdt">LightGBM</option>
-            </select>
-          </div>
-          <div class="field">
-            <label class="label" for="ml-window">样本窗口</label>
-            <select id="ml-window" v-model.number="mlCfg.days" class="select">
-              <option :value="180">180 天</option>
-              <option :value="365">1 年</option>
-              <option :value="730">2 年</option>
-            </select>
-          </div>
-        </div>
-        <button class="btn btn-primary" :disabled="mlLoading || mlCodes.size < 2" @click="runMl">
-          <LoaderCircle v-if="mlLoading" :size="14" class="animate-spin" />{{ mlLoading ? '训练中…' : '开始训练' }}
-        </button>
-
-        <div v-if="mlResult?.found" class="space-y-4">
-          <div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
-            <div class="panel px-3.5 py-3">
-              <p class="text-[11px] uppercase tracking-wider text-subtle">OOS IC</p>
-              <p class="num mt-1 text-lg font-semibold" :class="(mlResult.oos_ic ?? 0) > 0 ? 'text-up' : (mlResult.oos_ic ?? 0) < 0 ? 'text-down' : 'text-fg'">{{ mlResult.oos_ic ?? '—' }}</p>
-            </div>
-            <div class="panel px-3.5 py-3">
-              <p class="text-[11px] uppercase tracking-wider text-subtle">OOS RankIC</p>
-              <p class="num mt-1 text-lg font-semibold text-fg">{{ mlResult.oos_rank_ic ?? '—' }}</p>
-            </div>
-            <div class="panel px-3.5 py-3">
-              <p class="text-[11px] uppercase tracking-wider text-subtle">命中率</p>
-              <p class="num mt-1 text-lg font-semibold text-fg">{{ (mlResult.hit_rate * 100).toFixed(1) }}%</p>
-            </div>
-            <div class="panel px-3.5 py-3">
-              <p class="text-[11px] uppercase tracking-wider text-subtle">Top−Bottom 价差</p>
-              <p class="num mt-1 text-lg font-semibold" :class="mlResult.spread > 0 ? 'text-up' : 'text-down'">{{ mlResult.spread.toFixed(5) }}</p>
-            </div>
-          </div>
-          <p class="text-[11px] text-subtle">训练 {{ mlResult.n_train }} · 测试 {{ mlResult.n_test }} 行 · 模型 {{ mlResult.model }}（{{ mlResult.engine }}）· 未来 {{ mlResult.horizon }} 根收益为标签</p>
-          <div v-if="mlLast && mlResult?.model !== 'gbdt'" class="flex gap-2">
-            <input v-model="mlName" class="input h-8 flex-1 font-mono text-xs" placeholder="模型名称，如 btc-1h-ridge" maxlength="120" />
-            <button class="btn btn-primary !h-8 shrink-0 text-xs" :disabled="mlSaving || !mlName.trim()" @click="saveResult">
-              <LoaderCircle v-if="mlSaving" :size="13" class="animate-spin" /><Check v-else :size="13" />保存模型
-            </button>
-          </div>
-          <p class="text-[10px] text-subtle">保存后可到「模型库」对任意标的的最新 K 线打分（线性打分，不含未来）。</p>
-          <p v-if="mlResult.feature_filter?.removed?.length" class="text-[11px] text-warn">
-            已按 |相关| &gt; {{ mlResult.feature_filter.max_corr }} 剔除冗余特征：{{ mlResult.feature_filter.removed.map((r) => r.code).join('、') }}
-          </p>
-          <div class="overflow-x-auto">
-            <table class="tbl">
-              <thead>
-                <tr>
-                  <th>特征</th>
-                  <th class="text-right">系数(coef)</th>
-                  <th class="text-right">单因子 OOS IC</th>
-                  <th class="text-right">RankIC</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr v-for="f in mlResult.features" :key="f.code">
-                  <td>
-                    <span class="font-semibold text-fg">{{ f.name }}</span>
-                    <span class="ml-1 font-mono text-[10px] text-subtle">{{ f.code }}</span>
-                  </td>
-                  <td class="num tbl-num" :class="f.coef > 0 ? 'text-up' : f.coef < 0 ? 'text-down' : 'text-muted'">{{ f.coef.toFixed(5) }}</td>
-                  <td class="num tbl-num text-muted">{{ f.ic_oos ?? '—' }}</td>
-                  <td class="num tbl-num text-muted">{{ f.rank_ic_oos ?? '—' }}</td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-        </div>
-        <StateView v-else-if="mlResult && !mlResult.found" icon="search" :title="mlResult.message ?? '训练无结果'" desc="需要至少 60 根可用 K 线与 2 个因子特征。" />
-      </div>
-    </Modal>
-
-    <!-- 模型库 -->
-    <Modal :open="modelsOpen" title="模型库" sub="已保存的 Ridge 模型：可复用对最新 K 线打分" width="720px" @close="modelsOpen = false">
-      <div v-if="modelsLoading" class="py-10"><StateView busy title="读取模型…" /></div>
-      <StateView v-else-if="!modelsList.length" icon="empty" title="还没有模型" desc="在「ML 训练」里跑出结果后填写名称即可保存。" />
-      <div v-else class="space-y-2">
-        <div v-for="m in modelsList" :key="m.id" class="flex flex-wrap items-center gap-3 rounded-xl border border-border bg-surface-2/40 px-3.5 py-2.5">
-          <div class="min-w-0 flex-1">
-            <p class="text-sm font-semibold text-fg">{{ m.name }}</p>
-            <p class="mt-0.5 text-[11px] text-subtle">
-              {{ m.interval }} · 预测 {{ m.horizon }}h · {{ (m.symbols ?? []).join(', ') }} · {{ m.n_train }}tr/{{ m.n_test }}te · {{ timeAgo(m.created_at) }}
-            </p>
-            <p class="num mt-0.5 text-[11px] text-muted">
-              OOS IC {{ m.metrics?.oos_ic ?? '—' }} · RankIC {{ m.metrics?.oos_rank_ic ?? '—' }} · 命中 {{ m.metrics?.hit_rate != null ? (m.metrics.hit_rate * 100).toFixed(1) + '%' : '—' }}
-            </p>
-          </div>
-          <div class="flex shrink-0 items-center gap-2">
-            <button class="btn btn-primary !h-8 text-xs" @click="openBt(m)">建策略回测</button>
-            <button class="btn btn-ghost !h-8 text-xs" @click="scoreModel(m)">打分</button>
-          </div>
-        </div>
-      </div>
-    </Modal>
-
-    <!-- 模型 → 策略回测 -->
-    <Modal :open="btOpen" :title="`用模型建策略 · ${btModel?.name ?? ''}`" sub="以该模型打分作择时信号，走标准回测通道（含 SSE 实时进度）" width="520px" @close="btOpen = false">
-      <div class="space-y-4">
-        <div class="grid grid-cols-2 gap-4">
-          <div class="field">
-            <label class="label" for="bt-sym">交易对</label>
-            <input id="bt-sym" v-model="btCfg.symbol" class="input font-mono uppercase" spellcheck="false" />
-          </div>
-          <div class="field">
-            <label class="label">颗粒度</label>
-            <div class="flex h-[34px] items-center rounded-[9px] border border-border bg-surface px-3 font-mono text-sm text-fg">{{ btModel?.interval }}</div>
-          </div>
-        </div>
-        <div class="grid grid-cols-3 gap-3">
-          <div class="field">
-            <label class="label" for="bt-days">回看天数</label>
-            <input id="bt-days" v-model.number="btCfg.days" type="number" min="30" class="input" />
-          </div>
-          <div class="field">
-            <label class="label" for="bt-window">滚动窗口</label>
-            <input id="bt-window" v-model.number="btCfg.window" type="number" min="20" class="input" />
-          </div>
-          <div class="field">
-            <label class="label">q80 / q20 入场离场</label>
-            <div class="flex h-[34px] items-center gap-1 rounded-[9px] border border-border bg-surface px-2 font-mono text-xs text-muted">
-              <input v-model.number="btCfg.enterQ" type="number" step="0.05" min="0.5" max="0.99" class="w-full bg-transparent outline-none" />
-              <span>/</span>
-              <input v-model.number="btCfg.exitQ" type="number" step="0.05" min="0.01" max="0.5" class="w-full bg-transparent outline-none" />
-            </div>
-          </div>
-        </div>
-        <p class="text-xs leading-relaxed text-subtle">
-          打分高于滚动 {{ btCfg.enterQ }} 分位 → 满仓做多；低于 {{ btCfg.exitQ }} 分位 → 清仓。只用 ≤t 信息，无未来函数。可直接与「买入持有」基准对比。
-        </p>
-      </div>
-      <template #footer>
-        <div class="flex items-center justify-end gap-2">
-          <button class="btn btn-ghost" @click="btOpen = false">取消</button>
-          <button class="btn btn-primary" :disabled="btBusy || !btCfg.symbol.trim()" @click="runBt">
-            <LoaderCircle v-if="btBusy" :size="15" class="animate-spin" />{{ btBusy ? '创建并回测中…' : '创建策略并回测' }}
-          </button>
-        </div>
-      </template>
     </Modal>
   </div>
 </template>

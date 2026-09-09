@@ -115,6 +115,10 @@ html.dark {
   #app {
     height: 100%;
   }
+  html,
+  body {
+    overflow: hidden;
+  }
   body {
     margin: 0;
     background: var(--color-bg);

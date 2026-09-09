@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from ...factor.registry import compute_factor as _compute_factor, get_factors as _get_factors
+from ...factor.sandbox import safe_eval_expr
 
 RegistryType = dict[str, dict]
 
@@ -62,8 +63,9 @@ def register_templates() -> RegistryType:
     def ml_score(df: pd.DataFrame, params: dict) -> pd.Series:
         """隐藏模板：用已保存 ML 模型（factor + coef/mean/std）逐 bar 打分 → 滚动分位择时。
 
-        参数：features=[{code,coef,mean,std}...]，window/enter_q/exit_q（因果滚动分位数）。
+        参数：features=[{code,coef,mean,std,expression?}...]，window/enter_q/exit_q（因果滚动分位数）。
         打分用 ≤t 的信息，仓位自 t+1 起生效，无未来函数。
+        内置因子按 code 计算；用户/AI 表达式因子按 expression 走白名单沙箱求值。
         """
         feats = params.get("features") or []
         if not feats:
@@ -72,11 +74,19 @@ def register_templates() -> RegistryType:
         available = set(_get_factors().keys())
         for f in feats:
             code = f.get("code")
-            if code not in available:
-                continue
-            try:
-                val = _compute_factor(code, df)
-            except KeyError:
+            expr = (f.get("expression") or "").strip()
+            val: pd.Series | None = None
+            if code in available:
+                try:
+                    val = _compute_factor(code, df)
+                except KeyError:
+                    val = None
+            elif expr:
+                try:
+                    val = safe_eval_expr(expr, df).astype(float)
+                except Exception:  # noqa: BLE001
+                    val = None
+            if val is None:
                 continue
             mean = float(f.get("mean", 0.0) or 0.0)
             std = float(f.get("std", 1.0) or 1.0)

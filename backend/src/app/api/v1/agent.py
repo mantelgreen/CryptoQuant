@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...core.db import get_db
 from ...core.errors import BadRequest, NotFound
-from ...agent.service import generate_factor_draft, review_backtest
+from ...agent.service import generate_factor_draft, generate_factor_idea, review_backtest
 from ...strategy.engine.repo import BacktestRepository
 
 router = APIRouter(prefix="/agent", tags=["agent"])
@@ -32,6 +32,23 @@ async def factor_draft(
     except Exception as exc:  # noqa: BLE001
         raise BadRequest(str(exc)) from exc
     return {"code": "OK", "message": "ok", "data": draft}
+
+
+class IdeaReq(BaseModel):
+    model_id: str | None = None
+
+
+@router.post("/factor-idea")
+async def factor_idea(
+    req: IdeaReq = Body(...),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """随机生成一条可量化的因子研究需求（灵感），供工坊无思路时使用。"""
+    try:
+        data = await generate_factor_idea(db, model_id=req.model_id)
+    except Exception as exc:  # noqa: BLE001
+        raise BadRequest(str(exc)) from exc
+    return {"code": "OK", "message": "ok", "data": data}
 
 
 class ReviewReq(BaseModel):

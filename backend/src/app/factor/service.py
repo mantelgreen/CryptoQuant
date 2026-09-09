@@ -73,6 +73,7 @@ async def research_factor(
     agg_rank: list[float] = []
     decay_rows: dict[int, list[float | None]] = {h: [] for h in HORIZONS}
     total_n = 0
+    compute_error: str | None = None
 
     for sym in symbols:
         df = await _load_frame(repo, sym, interval, start, end)
@@ -80,7 +81,9 @@ async def research_factor(
             continue
         try:
             factor = compute_series(code, df, extras)
-        except (KeyError, SandboxError, ValueError):
+        except (KeyError, SandboxError, ValueError) as exc:
+            if compute_error is None:
+                compute_error = str(exc)
             continue
         close = df["close"]
         ic = _single_metrics(factor, close)
@@ -115,7 +118,7 @@ async def research_factor(
             "interval": interval,
             "symbols": symbols,
             "found": False,
-            "message": "窗口内无足够数据（请先下载 K 线）",
+            "message": compute_error or "窗口内无足够数据（请先下载 K 线）",
             "per_symbol": [],
         }
 
@@ -259,6 +262,13 @@ async def research_expression(
     p_ic = float(fac.corr(ret)) if ret.std() > 0 else float("nan")
     r_ic = _spearman(fac, ret)
     decay = {f"h_{h}": metrics.get(f"ic_{h}") for h in HORIZONS}
+    message = None
+    if math.isnan(r_ic):
+        uniq = int(fac.nunique())
+        message = (
+            f"RankIC 未计算：因子只有 {uniq} 个不同取值（二值/低离散信号），"
+            "秩相关无法区分排序。建议改用连续取值（如动量幅度、乖离率、量比）以获得有意义的 RankIC。"
+        )
     return {
         "found": True,
         "expression": expression,
@@ -269,4 +279,5 @@ async def research_expression(
         "rank_ic": round(r_ic, 5) if not math.isnan(r_ic) else None,
         "decay": decay,
         "n_total": int(len(pair)),
+        "message": message,
     }
