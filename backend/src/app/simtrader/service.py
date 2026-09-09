@@ -369,7 +369,7 @@ async def run_auto_tick(db: AsyncSession, account: dict[str, Any]) -> dict[str, 
         days = 400 if interval.endswith("d") else 40 if interval.endswith("h") else 7
     start = end - timedelta(days=days)
     scored = await score_with_model(
-        KlineRepository(db), model["features"], interval, symbol, start, end
+        KlineRepository(db), model, interval, symbol, start, end
     )
     last = scored.get("last_score")
     if last is None:

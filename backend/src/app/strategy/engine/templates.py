@@ -18,6 +18,72 @@ def _sma(df: pd.DataFrame, n: int) -> pd.Series:
     return df["close"].rolling(window=n, min_periods=n).mean()
 
 
+def _ml_linear_score(df: pd.DataFrame, feats: list[dict]) -> pd.Series:
+    score = pd.Series(0.0, index=df.index)
+    available = set(_get_factors().keys())
+    for f in feats:
+        code = f.get("code")
+        expr = (f.get("expression") or "").strip()
+        val: pd.Series | None = None
+        if code in available:
+            try:
+                val = _compute_factor(code, df)
+            except KeyError:
+                val = None
+        elif expr:
+            try:
+                val = safe_eval_expr(expr, df).astype(float)
+            except Exception:  # noqa: BLE001
+                val = None
+        if val is None:
+            continue
+        mean = float(f.get("mean", 0.0) or 0.0)
+        std = float(f.get("std", 1.0) or 1.0)
+        if std == 0:
+            std = 1.0
+        score += float(f.get("coef", 0.0) or 0.0) * (val - mean) / std
+    return score
+
+
+def _ml_tree_score(df: pd.DataFrame, feats: list[dict], booster) -> pd.Series:
+    """LightGBM：特征按训练顺序标准化 → booster.predict。任一特征缺失则整行无分。"""
+    available = set(_get_factors().keys())
+    series: dict[str, pd.Series] = {}
+    for f in feats:
+        code = f.get("code")
+        expr = (f.get("expression") or "").strip()
+        try:
+            if code in available:
+                val = _compute_factor(code, df)
+            elif expr:
+                val = safe_eval_expr(expr, df).astype(float)
+            else:
+                val = None
+        except Exception:  # noqa: BLE001
+            val = None
+        if val is not None:
+            series[code] = val
+    if not series:
+        return pd.Series(0.0, index=df.index)
+    fdf = pd.DataFrame(series)
+    cols = [f["code"] for f in feats if f["code"] in fdf.columns]
+    if len(cols) < len(feats):
+        # 有特征完全算不出来，树模型无法打分（与线性容忍缺失不同）
+        return pd.Series(0.0, index=df.index)
+    z = fdf[cols].copy()
+    for f in feats:
+        std = float(f.get("std", 1.0) or 1.0)
+        if std == 0:
+            std = 1.0
+        z[f["code"]] = (z[f["code"]] - float(f.get("mean", 0.0) or 0.0)) / std
+    sub = z.dropna()
+    score = pd.Series(np.nan, index=df.index)
+    if sub.empty:
+        return pd.Series(0.0, index=df.index)
+    score.loc[sub.index] = booster.predict(sub.to_numpy(dtype=float))
+    return score.fillna(0.0)
+
+
 def register_templates() -> RegistryType:
     templates: RegistryType = {}
 
@@ -61,38 +127,18 @@ def register_templates() -> RegistryType:
         return pd.Series(1.0, index=df.index)
 
     def ml_score(df: pd.DataFrame, params: dict) -> pd.Series:
-        """隐藏模板：用已保存 ML 模型（factor + coef/mean/std）逐 bar 打分 → 滚动分位择时。
+        """隐藏模板：用已保存 ML 模型逐 bar 打分 → 滚动分位择时。
 
         参数：features=[{code,coef,mean,std,expression?}...]，window/enter_q/exit_q（因果滚动分位数）。
+        ridge → score=Σ(coef·标准化因子)；gbdt（由回测 job 注入 _booster）→ 树模型 predict。
         打分用 ≤t 的信息，仓位自 t+1 起生效，无未来函数。
         内置因子按 code 计算；用户/AI 表达式因子按 expression 走白名单沙箱求值。
         """
         feats = params.get("features") or []
         if not feats:
             return pd.Series(0.0, index=df.index)
-        score = pd.Series(0.0, index=df.index)
-        available = set(_get_factors().keys())
-        for f in feats:
-            code = f.get("code")
-            expr = (f.get("expression") or "").strip()
-            val: pd.Series | None = None
-            if code in available:
-                try:
-                    val = _compute_factor(code, df)
-                except KeyError:
-                    val = None
-            elif expr:
-                try:
-                    val = safe_eval_expr(expr, df).astype(float)
-                except Exception:  # noqa: BLE001
-                    val = None
-            if val is None:
-                continue
-            mean = float(f.get("mean", 0.0) or 0.0)
-            std = float(f.get("std", 1.0) or 1.0)
-            if std == 0:
-                std = 1.0
-            score += float(f.get("coef", 0.0) or 0.0) * (val - mean) / std
+        booster = params.get("_booster")
+        score = _ml_tree_score(df, feats, booster) if booster is not None else _ml_linear_score(df, feats)
 
         window = int(params.get("window", 60) or 60)
         enter_q = float(params.get("enter_q", 0.8) or 0.8)

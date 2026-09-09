@@ -1,4 +1,4 @@
-"""/api/v1/factors 因子库与研究。"""
+"""/api/v1/factors 因子库与研究 —— 薄 API：只做参数解析与 HTTP 错误映射，业务全部在 factor.service。"""
 from __future__ import annotations
 
 from datetime import datetime
@@ -10,12 +10,24 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...core.db import get_db
-from ...core.errors import BadRequest, NotFound
-from ...data.repository.kline_repo import KlineRepository
-from ...factor.registry import get_factors, list_factor_meta
-from ...factor.repo import FactorRunRepository, MlModelRepository, UserFactorRepository
-from ...factor.service import matrix_factor, research_expression, research_factor
-from ...factor.ml import run_ml_research, score_with_model
+from ...core.errors import BadRequest, Conflict, NotFound
+from ...factor.service import (
+    check_model_usage,
+    check_user_factor_usage,
+    delete_saved_model,
+    delete_user_factor,
+    factor_run_history,
+    join_user_factor,
+    latest_factor_runs,
+    list_factor_catalog,
+    list_saved_models,
+    persist_trained_model,
+    run_factor_matrix,
+    run_factor_research_batch,
+    score_saved_model,
+    train_factor_model,
+    verify_factor_expression,
+)
 
 router = APIRouter(prefix="/factors", tags=["factors"])
 
@@ -23,7 +35,7 @@ _INTERVALS = {"1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d
 
 
 class ResearchReq(BaseModel):
-    codes: list[str] = Field(default_factory=lambda: [m["code"] for m in list_factor_meta()])
+    codes: list[str] = Field(..., min_length=1, max_length=12)
     symbols: list[str] = Field(..., min_length=1, max_length=20)
     interval: str = Field(..., pattern=r"^(1m|3m|5m|15m|30m|1h|2h|4h|6h|12h|1d|3d|1w)$")
     start: datetime
@@ -46,45 +58,6 @@ class VerifyReq(BaseModel):
     end: datetime
 
 
-async def _factor_extras(db: AsyncSession) -> dict[str, dict[str, Any]]:
-    """用户/AI 表达式因子：code(id) -> {name, description, tags, min_bars, expression}。"""
-    rows = await UserFactorRepository(db).list()
-    return {
-        str(r["id"]): {
-            "name": r["name"],
-            "description": r.get("description") or "",
-            "tags": r.get("tags") if isinstance(r.get("tags"), list) else ["AI"],
-            "min_bars": 0,
-            "expression": r.get("expression"),
-            "is_user": True,
-        }
-        for r in rows
-    }
-
-
-async def _extras_for_codes(db: AsyncSession, codes: list[str]) -> dict[str, dict[str, Any]]:
-    """在用户因子基础上，把列表里“非内置、非已注册”的 code 按表达式兜底。
-
-    让工坊里尚未入库的 AI 草稿（code 即原始表达式）也能直接参与
-    /research 与 /ml/train 的多因子研究，无需先 join 入库。
-    """
-    extras = await _factor_extras(db)
-    builtin = set(get_factors())
-    for code in codes:
-        c = code.strip()
-        if not c or len(c) > 2000 or code in builtin or code in extras:
-            continue
-        extras[code] = {
-            "name": f"expr:{c[:20]}",
-            "description": "",
-            "tags": ["AI"],
-            "min_bars": 0,
-            "expression": c,
-            "is_user": True,
-        }
-    return extras
-
-
 class JoinFactorReq(BaseModel):
     name: str = Field(..., min_length=1, max_length=60)
     description: str = Field(default="", max_length=300)
@@ -104,7 +77,6 @@ class MlTrainReq(BaseModel):
     alpha: float = Field(default=1.0, ge=0.0)
     max_corr: float | None = Field(default=0.85, ge=0.0, lt=1.0)
     model: str = Field(default="ridge", pattern=r"^(ridge|gbdt)$")
-    # —— LightGBM（gbdt）超参数 ——
     learning_rate: float = Field(default=0.05, ge=0.001, le=1.0)
     n_estimators: int = Field(default=240, ge=10, le=5000)
     max_depth: int = Field(default=3, ge=-1, le=32)
@@ -123,28 +95,16 @@ class ScoreReq(BaseModel):
     end: datetime
 
 
+def _check_window(start: datetime, end: datetime) -> None:
+    if end <= start:
+        raise BadRequest("end_must_be_greater_than_start")
+
+
 @router.get("")
 async def list_factors(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
-    """内置因子 + 用户/AI 生成因子（表达式因子，带 is_user/expression）。"""
-    builtins = list_factor_meta()
-    user_repo = UserFactorRepository(db)
-    rows = await user_repo.list()
-    user_items = []
-    for r in rows:
-        tags = r.get("tags") or ["AI"]
-        user_items.append(
-            {
-                "code": str(r["id"]),
-                "name": r["name"],
-                "description": r.get("description") or "",
-                "tags": tags if isinstance(tags, list) else ["AI"],
-                "expression": r.get("expression"),
-                "source_model": r.get("source_model"),
-                "is_user": True,
-                "created_at": r.get("created_at"),
-            }
-        )
-    return {"code": "OK", "message": "ok", "data": [*builtins, *user_items]}
+    """内置因子 + 用户/AI 生成因子。"""
+    data = await list_factor_catalog(db)
+    return {"code": "OK", "message": "ok", "data": data}
 
 
 @router.post("/join")
@@ -152,31 +112,42 @@ async def join_factor(
     req: JoinFactorReq = Body(...),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    """把草稿（AI/手动）正式加入因子库（draft 状态，可在库中查看与实测）。"""
-    repo = UserFactorRepository(db)
-    fid = await repo.create(
-        name=req.name.strip(),
-        description=req.description.strip(),
-        expression=req.expression.strip(),
+    """把草稿（AI/手动）正式加入因子库。"""
+    fid = await join_user_factor(
+        db,
+        name=req.name,
+        description=req.description,
+        expression=req.expression,
         source_model=req.source_model,
         tags=req.tags,
     )
-    return {"code": "OK", "message": "ok", "data": {"factor_id": str(fid)}}
+    return {"code": "OK", "message": "ok", "data": {"factor_id": fid}}
+
+
+@router.get("/join/{factor_id}/usage")
+async def user_factor_usage(factor_id: UUID, db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    """查询用户因子被引用情况。"""
+    usage = await check_user_factor_usage(db, factor_id)
+    return {"code": "OK", "message": "ok", "data": {"bound": bool(usage["models"] or usage["strategies"]), **usage}}
 
 
 @router.delete("/join/{factor_id}")
 async def remove_user_factor(factor_id: UUID, db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
-    await UserFactorRepository(db).delete(factor_id)
-    return {"code": "OK", "message": "ok", "data": {"deleted": True}}
+    """删除用户/AI 因子（被模型/策略引用时拒绝）。"""
+    usage = await check_user_factor_usage(db, factor_id)
+    if usage["models"] or usage["strategies"]:
+        raise Conflict(
+            "该因子正被已保存的模型或策略版本引用，不能删除；请先移除引用它的模型特征 / 策略后再试。",
+            detail=usage,
+        )
+    deleted = await delete_user_factor(db, factor_id)
+    return {"code": "OK", "message": "ok", "data": {"deleted": deleted}}
 
 
 @router.get("/runs/latest")
-async def latest_runs(
-    db: AsyncSession = Depends(get_db),
-) -> dict[str, Any]:
-    """各因子最近的 IC 研究记录（按创建倒序，前端去重回看）。"""
-    repo = FactorRunRepository(db)
-    rows = await repo.latest(limit=200)
+async def latest_runs(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    """各因子最近的 IC 研究记录。"""
+    rows = await latest_factor_runs(db, limit=200)
     return {"code": "OK", "message": "ok", "data": rows}
 
 
@@ -187,8 +158,7 @@ async def factor_runs(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     """某因子历史研究记录（IC 演进/回看）。"""
-    repo = FactorRunRepository(db)
-    rows = await repo.by_code(code, limit=limit)
+    rows = await factor_run_history(db, code, limit=limit)
     return {"code": "OK", "message": "ok", "data": rows}
 
 
@@ -197,12 +167,16 @@ async def factor_matrix(
     req: MatrixReq = Body(...),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    """多因子相关矩阵（各标的因子序列对齐后平均）。"""
-    if req.end <= req.start:
-        raise BadRequest("end_must_be_greater_than_start")
-    repo = KlineRepository(db)
-    extras = await _extras_for_codes(db, req.codes)
-    data = await matrix_factor(repo, req.codes, [s.upper() for s in req.symbols], req.interval, req.start, req.end, extras=extras)
+    """多因子相关矩阵。"""
+    _check_window(req.start, req.end)
+    data = await run_factor_matrix(
+        db,
+        codes=req.codes,
+        symbols=[s.upper() for s in req.symbols],
+        interval=req.interval,
+        start=req.start,
+        end=req.end,
+    )
     return {"code": "OK", "message": "ok", "data": data}
 
 
@@ -212,11 +186,34 @@ async def verify_expression(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     """AI/手写因子表达式：AST 白名单校验后实测 IC（不落库）。"""
-    if req.end <= req.start:
-        raise BadRequest("end_must_be_greater_than_start")
-    repo = KlineRepository(db)
-    data = await research_expression(repo, req.expression, req.symbol.upper(), req.interval, req.start, req.end)
+    _check_window(req.start, req.end)
+    data = await verify_factor_expression(
+        db,
+        expression=req.expression,
+        symbol=req.symbol.upper(),
+        interval=req.interval,
+        start=req.start,
+        end=req.end,
+    )
     return {"code": "OK", "message": "ok", "data": data}
+
+
+@router.post("/research")
+async def research(
+    req: ResearchReq = Body(...),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """批量对因子做 IC/RankIC 研究（结果落库，可回看历史）。"""
+    _check_window(req.start, req.end)
+    results = await run_factor_research_batch(
+        db,
+        codes=req.codes,
+        symbols=[s.upper() for s in req.symbols],
+        interval=req.interval,
+        start=req.start,
+        end=req.end,
+    )
+    return {"code": "OK", "message": "ok", "data": results}
 
 
 @router.post("/ml/train")
@@ -224,18 +221,15 @@ async def ml_train(
     req: MlTrainReq = Body(...),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    """ML 多因子训练：因子特征 → 时序切分 → Ridge 回归 → 样本外评价。"""
-    if req.end <= req.start:
-        raise BadRequest("end_must_be_greater_than_start")
-    repo = KlineRepository(db)
-    extras = await _extras_for_codes(db, req.codes)
-    data = await run_ml_research(
-        repo,
-        req.codes,
-        [s.upper() for s in req.symbols],
-        req.interval,
-        req.start,
-        req.end,
+    """ML 多因子训练 → 样本外评价。"""
+    _check_window(req.start, req.end)
+    data = await train_factor_model(
+        db,
+        codes=req.codes,
+        symbols=[s.upper() for s in req.symbols],
+        interval=req.interval,
+        start=req.start,
+        end=req.end,
         horizon=req.horizon,
         test_ratio=req.test_ratio,
         alpha=req.alpha,
@@ -247,7 +241,6 @@ async def ml_train(
         num_leaves=req.num_leaves,
         subsample=req.subsample,
         colsample_bytree=req.colsample_bytree,
-        extras=extras,
     )
     return {"code": "OK", "message": "ok", "data": data}
 
@@ -258,77 +251,36 @@ async def ml_save_model(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     """训练并把模型 artifact 落库（供后续打分/复用）。"""
-    if req.end <= req.start:
-        raise BadRequest("end_must_be_greater_than_start")
-    if req.model != "ridge":
-        raise BadRequest("模型落库/打分当前仅支持 ridge（线性可复用）；gbdt 可研究但不可保存打分")
-    repo = KlineRepository(db)
-    extras = await _extras_for_codes(db, req.codes)
-    resp = await run_ml_research(
-        repo,
-        req.codes,
-        [s.upper() for s in req.symbols],
-        req.interval,
-        req.start,
-        req.end,
-        horizon=req.horizon,
-        test_ratio=req.test_ratio,
-        alpha=req.alpha,
-        max_corr=req.max_corr,
-        model=req.model,
-        learning_rate=req.learning_rate,
-        n_estimators=req.n_estimators,
-        max_depth=req.max_depth,
-        num_leaves=req.num_leaves,
-        subsample=req.subsample,
-        colsample_bytree=req.colsample_bytree,
-        extras=extras,
-        return_artifact=True,
-    )
-    if not resp.get("found") or "artifact" not in resp:
-        raise BadRequest(resp.get("message") or "训练失败，无法保存")
-    artifact = resp["artifact"]
-    mrepo = MlModelRepository(db)
-    mid = await mrepo.create(
-        name=req.name,
-        model_type=req.model,
-        interval=req.interval,
-        horizon=req.horizon,
-        symbols=[s.upper() for s in req.symbols],
-        features=artifact["features"],
-        metrics={
-            "oos_ic": resp.get("oos_ic"),
-            "oos_rank_ic": resp.get("oos_rank_ic"),
-            "hit_rate": resp.get("hit_rate"),
-            "spread": resp.get("spread"),
-        },
-        n_train=resp.get("n_train", 0),
-        n_test=resp.get("n_test", 0),
-    )
-    return {
-        "code": "OK",
-        "message": "ok",
-        "data": {
-            "model_id": str(mid),
-            "name": req.name,
-            "interval": req.interval,
-            "horizon": req.horizon,
-            "features": len(artifact["features"]),
-            "metrics": {
-                "oos_ic": resp.get("oos_ic"),
-                "oos_rank_ic": resp.get("oos_rank_ic"),
-                "hit_rate": resp.get("hit_rate"),
-            },
-        },
-    }
+    _check_window(req.start, req.end)
+    try:
+        data = await persist_trained_model(
+            db,
+            codes=req.codes,
+            symbols=[s.upper() for s in req.symbols],
+            interval=req.interval,
+            start=req.start,
+            end=req.end,
+            name=req.name,
+            horizon=req.horizon,
+            test_ratio=req.test_ratio,
+            alpha=req.alpha,
+            max_corr=req.max_corr,
+            model=req.model,
+            learning_rate=req.learning_rate,
+            n_estimators=req.n_estimators,
+            max_depth=req.max_depth,
+            num_leaves=req.num_leaves,
+            subsample=req.subsample,
+            colsample_bytree=req.colsample_bytree,
+        )
+    except ValueError as exc:
+        raise BadRequest(str(exc)) from exc
+    return {"code": "OK", "message": "ok", "data": data}
 
 
 @router.get("/ml/models")
-async def ml_list_models(
-    db: AsyncSession = Depends(get_db),
-) -> dict[str, Any]:
-    mrepo = MlModelRepository(db)
-    rows = await mrepo.list_recent(limit=50)
+async def ml_list_models(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    rows = await list_saved_models(db, limit=50)
     return {"code": "OK", "message": "ok", "data": rows}
 
 
@@ -338,53 +290,43 @@ async def ml_score_model(
     req: ScoreReq = Body(...),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    """用已保存模型对标的区间逐 bar 打分（标准化后线性加权）。"""
-    if req.end <= req.start:
-        raise BadRequest("end_must_be_greater_than_start")
-    mrepo = MlModelRepository(db)
-    model = await mrepo.get(model_id)
-    if not model:
+    """用已保存模型对标的区间逐 bar 打分（训练窗口自动样本排除）。"""
+    _check_window(req.start, req.end)
+    try:
+        data = await score_saved_model(db, model_id, req.symbol, req.start, req.end)
+    except ValueError as exc:
+        raise BadRequest(str(exc)) from exc
+    if data is None:
         raise NotFound("model_not_found")
-    repo = KlineRepository(db)
-    data = await score_with_model(
-        repo,
-        model["features"] or [],
-        model["interval"],
-        req.symbol.upper(),
-        req.start,
-        req.end,
-    )
     return {"code": "OK", "message": "ok", "data": data}
 
 
-@router.post("/research")
-async def research(
-    req: ResearchReq = Body(...),
+@router.get("/ml/models/{model_id}/usage")
+async def ml_model_usage(
+    model_id: UUID,
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    if req.end <= req.start:
-        raise BadRequest("end_must_be_greater_than_start")
-    if req.interval not in _INTERVALS:
-        raise BadRequest("unsupported_interval")
-    repo = KlineRepository(db)
-    run_repo = FactorRunRepository(db)
-    symbols = [s.upper() for s in req.symbols]
-    extras = await _extras_for_codes(db, req.codes)
-    results = []
-    for code in req.codes:
-        result = await research_factor(repo, code, symbols, req.interval, req.start, req.end, extras=extras)
-        if result.get("found"):
-            decay = result.get("decay") or {}
-            await run_repo.insert(
-                code=code,
-                symbol="|".join(symbols),
-                interval=req.interval,
-                start_time=req.start,
-                end_time=req.end,
-                ic=result.get("ic"),
-                rank_ic=result.get("rank_ic"),
-                decay={k: v for k, v in decay.items() if isinstance(v, (int, float))},
-                n=result.get("n_total", 0),
-            )
-        results.append(result)
-    return {"code": "OK", "message": "ok", "data": results}
+    """查询模型被引用情况（策略 / 模拟盘账户）。"""
+    usage = await check_model_usage(db, model_id)
+    if usage is None:
+        raise NotFound("model_not_found")
+    bound = bool(usage["strategies"] or usage["sim_accounts"])
+    return {"code": "OK", "message": "ok", "data": {"bound": bound, **usage}}
+
+
+@router.delete("/ml/models/{model_id}")
+async def ml_delete_model(
+    model_id: UUID,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """删除模型（行 + 磁盘 artifact）；被引用时拒绝。"""
+    usage = await check_model_usage(db, model_id)
+    if usage is None:
+        raise NotFound("model_not_found")
+    if usage["strategies"] or usage["sim_accounts"]:
+        raise Conflict(
+            "该模型正被策略或模拟盘引用，不能删除；请先删除引用它的策略/解绑模拟盘后再试。",
+            detail=usage,
+        )
+    data = await delete_saved_model(db, model_id)
+    return {"code": "OK", "message": "ok", "data": data or {"deleted": False}}

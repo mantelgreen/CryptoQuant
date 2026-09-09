@@ -104,6 +104,410 @@ def provider_id_uuid(model_id: str):
     return UUID(model_id)
 
 
+_PICK_SYSTEM = """你是量化多因子研究员，负责从一批「已经实测过 IC」的候选因子里，挑出最适合进入多因子模型的特征池。
+输入是一个 JSON 数组，每项含 code / name / tags / description / ic / rank_ic / decay(h1 h3 h5) / n_total。
+挑选原则（严格按数据，不编造）：
+1. 优先 |RankIC| 或 |IC| 更强、且方向稳定（IC 与 decay 的 h1/h3 符号一致）的因子；
+2. 控制冗余：参考 tags/description 判断思路是否同质，尽量挑风格互补、信息来源不重叠的；
+3. n_total 过小（<30）或 IC/RankIC 缺失的因子不要选；
+4. 数量不超过用户要求的 max_pick 个，按质量降序排列。
+只输出一个 JSON 对象（不要 markdown、不要代码块、不要任何解释文字）：
+{"picks":[{"code":"因子 code，必须原样来自输入列表","reason":"≤25 字中文理由"}]}
+绝不允许输出输入列表中不存在的 code，也不要重复。"""
+
+
+def _fmt_metric(v: Any) -> str:
+    return "—" if v is None else f"{float(v):+.4f}"
+
+
+def _pick_lines(factors: list[dict[str, Any]]) -> list[str]:
+    lines: list[str] = []
+    for i, f in enumerate(factors, 1):
+        decay = f.get("decay") or {}
+        tags = "、".join(f.get("tags") or []) or "—"
+        desc = (f.get("description") or "").strip() or (f.get("name") or "")
+        lines.append(
+            f"{i}. code={f.get('code')} | 名称={f.get('name')} | 思路={desc[:40]} | 标签={tags[:20]} | "
+            f"IC={_fmt_metric(f.get('ic'))} | RankIC={_fmt_metric(f.get('rank_ic'))} | "
+            f"衰减 h1={_fmt_metric(decay.get('h1', decay.get('h_1')))} h3={_fmt_metric(decay.get('h3', decay.get('h_3')))} "
+            f"h5={_fmt_metric(decay.get('h5', decay.get('h_5')))} | 样本 n={f.get('n_total') or f.get('n')}"
+        )
+    return lines
+
+
+def _heuristic_pick(factors: list[dict[str, Any]], max_pick: int) -> list[dict[str, Any]]:
+    """无 LLM / 解析失败时的规则兜底：按 |RankIC/IC| 排序 + 方向稳定加分。"""
+
+    def score(f: dict[str, Any]) -> float:
+        ic = f.get("ic")
+        rank = f.get("rank_ic")
+        base = abs(float(rank if rank is not None else ic if ic is not None else 0.0))
+        decay = f.get("decay") or {}
+        h1 = decay.get("h1", decay.get("h_1"))
+        same = 0.0
+        if ic is not None:
+            if h1 is not None and float(h1) * float(ic) > 0:
+                same += 0.01
+            if decay.get("h3", decay.get("h_3")) is not None and float(decay.get("h3", decay.get("h_3"))) * float(ic) > 0:
+                same += 0.005
+        n = f.get("n_total") or f.get("n") or 0
+        if n and n < 30:
+            same -= 0.05
+        return base + same
+
+    ranked = sorted(factors, key=lambda f: (f.get("ic") is not None, score(f)), reverse=True)
+    return [
+        {"code": f["code"], "reason": "|RankIC/IC| 靠前且方向稳定（规则兜底）"}
+        for f in ranked[:max_pick]
+    ]
+
+
+def _extract_json_object(raw: str) -> dict[str, Any]:
+    """从模型输出（可能夹带推理/代码块/前后文）里提取第一个完整、平衡的 JSON 对象。
+
+    内部扫描引号与转义，避免因 JSON 里的嵌套花括号（如 picks 数组）而误切。
+    """
+    text = raw.strip()
+    start = text.find("{")
+    while start != -1 and start < len(text):
+        depth = 0
+        in_str = False
+        esc = False
+        for j in range(start, len(text)):
+            ch = text[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    frag = text[start : j + 1]
+                    try:
+                        obj = json.loads(frag)
+                    except Exception:  # noqa: BLE001
+                        break  # 该起点不可用，换下一个 '{'
+                    if isinstance(obj, dict):
+                        return obj
+                    break
+        start = text.find("{", start + 1)
+    raise ValueError("模型未返回 JSON 对象")
+
+
+def _parse_picks(raw: str, allowed: set[str], max_pick: int) -> list[dict[str, Any]]:
+    text = raw.strip()
+    text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
+    text = re.sub(r"\s*```$", "", text).strip()
+    obj = _extract_json_object(text)
+    if not isinstance(obj.get("picks"), list):
+        raise ValueError("JSON 缺少 picks")
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in obj["picks"]:
+        if not isinstance(item, dict):
+            continue
+        code = str(item.get("code", "")).strip()
+        if code not in allowed or code in seen:
+            continue
+        seen.add(code)
+        out.append({"code": code, "reason": str(item.get("reason", ""))[:80]})
+        if len(out) >= max_pick:
+            break
+    if not out:
+        raise ValueError("模型返回的 code 均不在输入列表")
+    return out
+
+
+async def pick_factors(
+    db: AsyncSession,
+    factors: list[dict[str, Any]],
+    model_id: str | None = None,
+    max_pick: int = 8,
+) -> dict[str, Any]:
+    """LLM 依据已实测的 IC/RankIC/衰减 从候选因子中挑出最优组合（进多因子训练池）。
+
+    factors 每项需含 code/name，可带 tags/description/ic/rank_ic/decay/n_total。
+    返回 {model, provider, picks:[{code,reason}], fallback}；模型输出解析失败时用规则兜底。
+    """
+    cleaned = []
+    for f in factors:
+        code = str(f.get("code", "")).strip()
+        if code:
+            cleaned.append({**f, "code": code})
+    if len(cleaned) < 2:
+        raise ValueError("至少需要 2 个已实测的因子才能做 AI 挑选")
+    cleaned = cleaned[:40]
+    allowed = {f["code"] for f in cleaned}
+    max_pick = max(1, min(int(max_pick or 8), len(allowed)))
+
+    provider = await resolve_provider(db, model_id)
+    payload = "候选因子实测数据（请从中挑选）：\n" + "\n".join(_pick_lines(cleaned))
+    user = f"请从以下候选里挑选最多 {max_pick} 个最适合进多因子模型的特征：\n{payload}"
+    messages = [
+        {"role": "system", "content": _PICK_SYSTEM},
+        {"role": "user", "content": user[:6000]},
+    ]
+    result = await llm_chat(provider, messages, temperature=0.2, max_tokens=1200, timeout_s=240)
+    usage = result.get("usage") or {}
+    await record_usage(
+        db,
+        provider=provider.get("provider") or "openai",
+        model=result["model"],
+        caller="agent.factor_pick",
+        prompt_tokens=usage.get("prompt_tokens"),
+        completion_tokens=usage.get("completion_tokens"),
+        latency_ms=result.get("latency_ms", 0),
+    )
+    content = result["content"] or ""
+    if not content:
+        detail = "模型只输出了推理、未给出 JSON" if result.get("reasoning_content") else "输出为空"
+        raise ValueError(
+            f"模型「{result.get('model') or provider.get('model')}」未返回内容（{detail}）。"
+            "若是思考型模型，请在「模型设置」对该供应商勾选“关闭思维模式”，或改用非思考模型后重试"
+        )
+    try:
+        picks = _parse_picks(content, allowed, max_pick)
+        fallback = False
+    except ValueError:
+        picks = _heuristic_pick(cleaned, max_pick)
+        fallback = True
+    return {
+        "model": result["model"],
+        "provider": provider.get("name"),
+        "picks": picks,
+        "fallback": fallback,
+    }
+
+
+_TRAIN_REVIEW_SYSTEM = """你是量化多因子模型诊断专家。用户给你一次多因子模型训练的结果，你要：
+1) 基于样本外指标判断这轮训练效果是否理想；
+2) 效果不理想时，从“进入模型的特征”里做进一步精筛，建议下一轮应保留 / 剔除哪些因子。
+
+判断基准（严格按数据）：
+- 理想：样本外 IC/RankIC 与 train 同号或方向一致、|RankIC|≥0.02、Top−Bottom 价差>0，且过拟合差距 |train_IC−OOS_IC|<0.06；
+- 一般：方向对但强度不足（0.01≤|RankIC|<0.02），或过拟合差距偏大；
+- 不理想：价差≤0、方向反转、|RankIC|<0.01，或明显在记忆噪声（train_IC 远高 OOS_IC）。
+精筛原则：剔除样本外单因子 IC 方向与组合相反、|IC| 极弱、明显冗余或仅靠个别时点贡献的特征；不要为了剔除而剔除，特征数≤3 时除非某因子明显有害否则保留。
+
+只输出一个 JSON 对象（不要 markdown、不要代码块、不要解释文字）：
+{"grade":"ok|warn|bad","review":"≤220字，换行分段或用 1. 2. 3. 列要点","advice":"≤60字下一步建议","keep":["保留的因子 code，全部来自输入特征列表"],"drop":[{"code":"剔除的因子 code","reason":"≤25字理由"}]}
+- grade 只能是 ok/warn/bad；keep 至少 2 个、code 必须原样来自输入的特征列表；
+- keep 与 drop 不要重叠；效果理想时 drop 给空数组、keep 保留全部特征。"""
+
+
+def _fmt_metric(v: Any, digits: int = 4) -> str:
+    return "—" if v is None else f"{float(v):.{digits}f}"
+
+
+def _rule_grade(metrics: dict[str, Any]) -> str:
+    """无 LLM 可用时的规则判断。"""
+    ic = metrics.get("oos_ic")
+    rank = metrics.get("oos_rank_ic")
+    spread = metrics.get("spread")
+    gap = metrics.get("overfit_gap")
+    if ic is None and rank is None:
+        return "warn"
+    a = float(ic if ic is not None else 0.0)
+    b = float(rank if rank is not None else 0.0)
+    sign_ok = (ic is None or rank is None) or a * b >= 0
+    mag = max(abs(a), abs(b))
+    if (spread or 0) > 0 and sign_ok and mag >= 0.02 and (gap is None or abs(gap) < 0.06):
+        return "ok"
+    if (spread or 0) > 0 and sign_ok and mag >= 0.01:
+        return "warn"
+    return "bad"
+
+
+def _rule_refine(features: list[dict[str, Any]], metrics: dict[str, Any], grade: str):
+    """无 LLM 时的精筛兜底：不理想时保留方向一致且单因子 IC 较强的因子。"""
+    cur = [f["code"] for f in features]
+    if grade in ("ok", "warn") or len(cur) < 3:
+        return list(cur), []
+    ref = metrics.get("oos_rank_ic")
+    if ref is None:
+        ref = metrics.get("oos_ic")
+    sign = 1.0
+    try:
+        if ref is not None and float(ref) < 0:
+            sign = -1.0
+    except (TypeError, ValueError):
+        pass
+
+    def score(f: dict[str, Any]) -> float:
+        v = f.get("ic_oos")
+        return abs(float(v)) if v is not None else 0.0
+
+    def dir_ok(f: dict[str, Any]) -> bool:
+        v = f.get("ic_oos")
+        if v is None:
+            return True
+        try:
+            return float(v) * sign >= -1e-12
+        except (TypeError, ValueError):
+            return True
+
+    bad = [f for f in features if not dir_ok(f)]
+    good = [f for f in features if dir_ok(f)]
+    if len(good) < 2:
+        rest = sorted(bad, key=score, reverse=True)
+        good = good + rest[: 2 - len(good)]
+        bad = [f for f in bad if f not in good]
+    drops = [
+        {"code": f["code"], "reason": "样本外单因子 IC 与组合方向相反/偏弱（规则兜底）"}
+        for f in bad
+    ]
+    return [f["code"] for f in good], drops
+
+
+def _parse_training_review(raw: str, allowed: set[str]):
+    obj = _extract_json_object(raw)
+    grade = obj.get("grade")
+    if grade not in {"ok", "warn", "bad"}:
+        raise ValueError("模型返回了未知的 grade")
+    review = str(obj.get("review") or "")[:2500].strip()
+    advice = str(obj.get("advice") or "")[:200].strip()
+    keep_raw = obj.get("keep")
+    if not isinstance(keep_raw, list):
+        raise ValueError("JSON 缺少 keep 数组")
+    keep: list[str] = []
+    for c in keep_raw:
+        c = str(c).strip()
+        if c in allowed and c not in keep:
+            keep.append(c)
+    if len(keep) < 2:
+        raise ValueError("keep 不足 2 个")
+    drop: list[dict[str, Any]] = []
+    if isinstance(obj.get("drop"), list):
+        for it in obj["drop"]:
+            if not isinstance(it, dict):
+                continue
+            c = str(it.get("code", "")).strip()
+            if c in allowed and c not in keep and all(d["code"] != c for d in drop):
+                drop.append({"code": c, "reason": str(it.get("reason", ""))[:100]})
+    return grade, review, advice, keep, drop
+
+
+async def review_training(
+    db: AsyncSession,
+    payload: dict[str, Any],
+    model_id: str | None = None,
+) -> dict[str, Any]:
+    """让 LLM 对一次多因子训练结果做诊断；效果不理想时给出特征精筛建议。
+
+    payload 需含 metrics / features 等；返回
+    {model, provider, grade, review, advice, keep, drop, fallback}。
+    """
+    features = payload.get("features") or []
+    features = [f for f in features if str(f.get("code", "")).strip()]
+    if not features:
+        raise ValueError("训练结果里没有可用特征，无法做 AI 解析")
+    features = features[:30]
+    allowed = {f["code"] for f in features}
+    metrics = payload.get("metrics") or {}
+    grade_rule = _rule_grade(metrics)
+
+    def feature_line(f: dict[str, Any]) -> str:
+        return (
+            f"- {f.get('code')}（{f.get('name') or '?'}）coef={_fmt_metric(f.get('coef'))} "
+            f"OOS IC={_fmt_metric(f.get('ic_oos'))} rankIC={_fmt_metric(f.get('rank_ic_oos'))}"
+        )
+
+    checks = payload.get("checks") or []
+    checks_txt = "；".join(
+        f"「{c.get('label')}」:{('通过' if c.get('ok') is True else '未达' if c.get('ok') is False else '待跑')}"
+        for c in checks[:12]
+    )
+    removed = payload.get("removed") or []
+    removed_txt = "；".join(
+        f"{r.get('code')}({r.get('name') or '?'})"
+        for r in removed[:8]
+    ) or "无"
+    m = metrics
+    diag = payload.get("oos_charts") or {}
+    learning = payload.get("learning")
+    learn_txt = "无"
+    if learning:
+        learn_txt = (
+            f"{learning.get('rounds')} 轮，末轮 OOS loss={_fmt_metric(learning.get('oos_final'), 6)}，"
+            f"谷底 {_fmt_metric(learning.get('oos_min'), 6)} @第 {learning.get('oos_min_round')} 轮"
+        )
+
+    content = (
+        f"训练对象 {payload.get('symbol') or '?'} / {payload.get('interval') or '?'}，"
+        f"预测窗口 h={payload.get('horizon')}，模型 {payload.get('model') or '?'}（{payload.get('engine') or '?'}），"
+        f"样本 train={payload.get('n_train')} / OOS test={payload.get('n_test')}，保留特征 {len(features)} 个。\n"
+        f"指标：train_IC={_fmt_metric(m.get('train_ic'))}，OOS_IC={_fmt_metric(m.get('oos_ic'))}，"
+        f"OOS_RankIC={_fmt_metric(m.get('oos_rank_ic'))}，过拟合差距={_fmt_metric(m.get('overfit_gap'))}，"
+        f"命中率={_fmt_metric(m.get('hit_rate'))}%，Top−Bottom 价差={_fmt_metric(m.get('spread'))}。\n"
+        f"体检勾选：{checks_txt or '—'}。\n"
+        f"已因相关性剔除：{removed_txt}。\n"
+        f"特征明细（共 {len(features)} 个）：\n" + "\n".join(feature_line(f) for f in features) + "\n"
+        f"分层诊断：十分位单调相关 r={_fmt_metric(diag.get('monotonic_r'))}，"
+        f"高分组净值终点={_fmt_metric(diag.get('q5_end'))}，低分组={_fmt_metric(diag.get('q1_end'))}。\n"
+        f"LightGBM 训练曲线：{learn_txt}。\n"
+        f"请给出诊断与精筛建议（grade 与 keep/drop）。"
+    )
+
+    provider = await resolve_provider(db, model_id)
+    messages = [
+        {"role": "system", "content": _TRAIN_REVIEW_SYSTEM},
+        {"role": "user", "content": content[:9000]},
+    ]
+    result = await llm_chat(provider, messages, temperature=0.2, max_tokens=2000, timeout_s=300)
+    usage = result.get("usage") or {}
+    await record_usage(
+        db,
+        provider=provider.get("provider") or "openai",
+        model=result["model"],
+        caller="agent.train_review",
+        prompt_tokens=usage.get("prompt_tokens"),
+        completion_tokens=usage.get("completion_tokens"),
+        latency_ms=result.get("latency_ms", 0),
+    )
+    content_raw = result["content"] or ""
+    if not content_raw:
+        detail = "模型只输出了推理、未给出 JSON" if result.get("reasoning_content") else "输出为空"
+        raise ValueError(
+            f"模型「{result.get('model') or provider.get('model')}」未返回内容（{detail}）。"
+            "若是思考型模型，请在「模型设置」对该供应商勾选“关闭思维模式”，或改用非思考模型后重试"
+        )
+    try:
+        grade, review, advice, keep, drop = _parse_training_review(content_raw, allowed)
+        fallback = False
+    except ValueError:
+        fallback = True
+        grade = grade_rule
+        keep, drop = _rule_refine(features, metrics, grade)
+        review = {
+            "ok": "样本外方向一致、价差为正且过拟合差距可控，这轮信号初步可用。建议先去回测与滚动验证，而非继续加因子。",
+            "warn": "方向对但强度或过拟合差距一般，可小步调整（更多样本、更严相关性过滤、降低模型容量）后再看。",
+            "bad": "这轮样本外信号偏弱/方向不稳，已给出规则兜底的特征精筛；建议按精筛子集重训，或换窗口与更稳健因子。",
+        }[grade]
+        advice = {
+            "ok": "进入回测 / 模拟盘验证，跟踪 RankIC 是否随样本外推移衰减。",
+            "warn": "调参或扩样本后再训，用精筛结果对比。",
+            "bad": "按精筛后的特征子集重新训练并对比 OOS。",
+        }[grade]
+    return {
+        "model": result["model"],
+        "provider": provider.get("name"),
+        "grade": grade,
+        "review": review,
+        "advice": advice,
+        "keep": keep,
+        "drop": drop,
+        "fallback": fallback,
+    }
+
+
 async def review_backtest(
     db: AsyncSession,
     backtest: dict[str, Any],
@@ -305,3 +709,18 @@ def _clean_idea(raw: str | None) -> str:
     # 去形如 "1." "1、" "1)" 的编号前缀
     text = re.sub(r"^\s*\d+[\.、)）]\s*", "", text).strip()
     return text.strip()
+
+async def review_backtest_task(db, backtest_id: str) -> dict[str, Any]:
+    """加载回测并调用 LLM 复盘（服务层编排；找不到时抛 ValueError('backtest_not_found')）。"""
+    from uuid import UUID
+
+    from ..strategy.engine.repo import BacktestRepository
+
+    try:
+        uid = UUID(str(backtest_id))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("backtest_not_found") from exc
+    row = await BacktestRepository(db).get(uid)
+    if row is None:
+        raise ValueError("backtest_not_found")
+    return await review_backtest(db, row)

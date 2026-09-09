@@ -68,6 +68,16 @@ export async function removeUserFactor(id: string) {
   await http.delete(`/factors/join/${id}`)
 }
 
+export interface FactorUsage {
+  bound: boolean
+  models: Array<{ id: string; name: string }>
+  strategies: Array<{ id: string; name: string }>
+}
+export async function getFactorUsage(id: string): Promise<FactorUsage> {
+  const { data } = await http.get<{ data: FactorUsage }>(`/factors/join/${id}/usage`)
+  return data.data
+}
+
 export async function fetchLatestRuns(): Promise<FactorRun[]> {
   const { data } = await http.get<{ data: FactorRun[] }>('/factors/runs/latest')
   return data.data ?? []
@@ -131,10 +141,24 @@ export interface MlFeature {
   ic_oos: number | null
   rank_ic_oos: number | null
 }
+
 export interface MlFeatureFilter {
   max_corr: number | null
   removed: Array<{ code: string; name: string; dropped_because: string }>
 }
+
+export interface MlOosCharts {
+  scatter: Array<{ ts: string; pred: number; actual: number }>
+  deciles: Array<{ label: string; mean_actual: number; mean_pred: number; n: number }>
+  nav: { ts: string[]; q1: number[]; q2: number[]; q3: number[]; q4: number[]; q5: number[] }
+}
+
+export interface MlLearning {
+  rounds: number[]
+  train: number[]
+  oos: number[]
+}
+
 export interface MlTrainResult {
   found: boolean
   model: string
@@ -154,6 +178,8 @@ export interface MlTrainResult {
   spread: number
   features: MlFeature[]
   feature_filter?: MlFeatureFilter
+  oos_charts?: MlOosCharts
+  learning?: MlLearning
   message?: string
 }
 export async function trainMl(payload: {
@@ -198,15 +224,42 @@ export interface MlModelRow {
   interval: string
   horizon: number
   symbols: string[]
-  features: Array<{ code: string; coef: number; mean: number; std: number; expression?: string }>
+  features: Array<{ code: string; name?: string; coef: number; mean: number; std: number; expression?: string }>
   metrics: { oos_ic?: number | null; oos_rank_ic?: number | null; hit_rate?: number | null; spread?: number | null }
   n_train: number
   n_test: number
+  model_path?: string | null
+  train_start?: string | null
+  train_end?: string | null
+  dataset?: {
+    symbols?: string[]
+    interval?: string
+    start?: string
+    end?: string
+    test_ratio?: number
+    n_train?: number
+    n_test?: number
+    test_windows?: Array<{ symbol: string; interval: string; start: string; end: string; bars: number }>
+  } | null
   created_at: string
 }
 export async function listMlModels(): Promise<MlModelRow[]> {
   const { data } = await http.get<{ data: MlModelRow[] }>('/factors/ml/models')
   return data.data ?? []
+}
+
+export interface MlUsage {
+  bound: boolean
+  strategies: Array<{ id: string; name: string }>
+  sim_accounts: Array<{ id: string; name: string }>
+}
+export async function getMlUsage(id: string): Promise<MlUsage> {
+  const { data } = await http.get<{ data: MlUsage }>(`/factors/ml/models/${id}/usage`)
+  return data.data
+}
+export async function deleteMlModel(id: string): Promise<{ deleted: boolean; name?: string }> {
+  const { data } = await http.delete<{ data: { deleted: boolean; name?: string } }>(`/factors/ml/models/${id}`)
+  return data.data
 }
 
 export interface MlScore {
@@ -216,6 +269,8 @@ export interface MlScore {
   n: number
   last_score: number | null
   points: Array<{ ts: string; score: number }>
+  message?: string
+  train_window_excluded_to?: string | null
 }
 export async function scoreMlModel(id: string, payload: { symbol: string; start: string; end: string }): Promise<MlScore> {
   const { data } = await http.post<{ data: MlScore }>(`/factors/ml/models/${id}/score`, payload)

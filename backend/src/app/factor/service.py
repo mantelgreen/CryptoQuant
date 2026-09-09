@@ -17,7 +17,6 @@ from ..data.repository.kline_repo import KlineRepository
 from .registry import compute_factor, get_factors
 from .compute import compute_series, meta_or_extra
 from .sandbox import SandboxError, safe_eval_expr
-
 HORIZONS = (1, 3, 5)
 
 
@@ -281,3 +280,455 @@ async def research_expression(
         "n_total": int(len(pair)),
         "message": message,
     }
+
+# =============================================================================
+# 目录 / 用户因子 / 研究落库 / ML 模型 —— 面向“服务层可打包”的持久化编排服务
+# API 层只做参数解析与 HTTP 错误映射，业务与 SQL 都收敛在下面这些函数里。
+# =============================================================================
+
+async def build_factor_extras(db) -> dict[str, dict[str, Any]]:
+    """用户/AI 表达式因子：code(id) -> {name, description, tags, min_bars, expression}。"""
+    from .repo import UserFactorRepository
+
+    rows = await UserFactorRepository(db).list()
+    return {
+        str(r["id"]): {
+            "name": r["name"],
+            "description": r.get("description") or "",
+            "tags": r.get("tags") if isinstance(r.get("tags"), list) else ["AI"],
+            "min_bars": 0,
+            "expression": r.get("expression"),
+            "is_user": True,
+        }
+        for r in rows
+    }
+
+
+async def build_extras_for_codes(db, codes: list[str]) -> dict[str, dict[str, Any]]:
+    """在用户因子基础上，把列表里“非内置、非已注册”的 code 按表达式兜底，
+    让尚未入库的 AI 草稿（code 即原始表达式）也能参与研究/训练。"""
+    extras = await build_factor_extras(db)
+    builtin = set(get_factors())
+    for code in codes:
+        c = code.strip()
+        if not c or len(c) > 2000 or code in builtin or code in extras:
+            continue
+        extras[code] = {
+            "name": f"expr:{c[:20]}",
+            "description": "",
+            "tags": ["AI"],
+            "min_bars": 0,
+            "expression": c,
+            "is_user": True,
+        }
+    return extras
+
+
+async def build_factor_name_map(db) -> dict[str, str]:
+    """code → 可读因子名（内置 + 用户/AI 因子）。"""
+    from .repo import UserFactorRepository
+
+    names = {code: meta.get("name", code) for code, meta in get_factors().items()}
+    for r in await UserFactorRepository(db).list():
+        names[str(r["id"])] = r["name"]
+    return names
+
+
+async def list_factor_catalog(db) -> list[dict[str, Any]]:
+    """内置因子 + 用户/AI 生成因子（表达式因子，带 is_user/expression）。"""
+    from .repo import UserFactorRepository
+
+    builtins = [{k: v for k, v in meta.items() if k != "fn"} for meta in get_factors().values()]
+    user_items = []
+    for r in await UserFactorRepository(db).list():
+        tags = r.get("tags") or ["AI"]
+        user_items.append(
+            {
+                "code": str(r["id"]),
+                "name": r["name"],
+                "description": r.get("description") or "",
+                "tags": tags if isinstance(tags, list) else ["AI"],
+                "expression": r.get("expression"),
+                "source_model": r.get("source_model"),
+                "is_user": True,
+                "created_at": r.get("created_at"),
+            }
+        )
+    return [*builtins, *user_items]
+
+
+async def join_user_factor(
+    db,
+    *,
+    name: str,
+    description: str,
+    expression: str,
+    source_model: str | None = None,
+    tags: list[str] | None = None,
+) -> str:
+    """把草稿（AI/手动）正式加入因子库（draft 状态）。"""
+    from .repo import UserFactorRepository
+
+    fid = await UserFactorRepository(db).create(
+        name=name.strip(),
+        description=description.strip(),
+        expression=expression.strip(),
+        source_model=source_model,
+        tags=tags or ["AI"],
+    )
+    return str(fid)
+
+
+async def check_user_factor_usage(db, factor_id) -> dict[str, Any]:
+    """用户因子被谁引用（删除前置检查）：保存过的模型 / 策略版本。"""
+    from sqlalchemy import select
+
+    from ..data.models.orm import ml_models_table, strategies_table, strategy_versions_table
+
+    uid = str(factor_id)
+    ml, sv, st = ml_models_table(), strategy_versions_table(), strategies_table()
+
+    mres = await db.execute(select(ml.c.id, ml.c.name).where(ml.c.features.contains([{"code": uid}])))
+    models = [{"id": str(i), "name": n} for i, n in mres]
+
+    vres = await db.execute(select(sv.c.strategy_id).where(sv.c.params.contains({"features": [{"code": uid}]})))
+    strategy_ids = {r[0] for r in vres}
+    strategies: list[dict[str, Any]] = []
+    if strategy_ids:
+        sres = await db.execute(select(st.c.id, st.c.name).where(st.c.id.in_(strategy_ids)))
+        strategies = [{"id": str(i), "name": n} for i, n in sres]
+    return {"models": models, "strategies": strategies}
+
+
+async def delete_user_factor(db, factor_id) -> bool:
+    from .repo import UserFactorRepository
+
+    return await UserFactorRepository(db).delete(factor_id)
+
+
+async def run_factor_matrix(
+    db,
+    *,
+    codes: list[str],
+    symbols: list[str],
+    interval: str,
+    start: datetime,
+    end: datetime,
+) -> dict[str, Any]:
+    repo = KlineRepository(db)
+    extras = await build_extras_for_codes(db, codes)
+    return await matrix_factor(repo, codes, symbols, interval, start, end, extras=extras)
+
+
+async def verify_factor_expression(
+    db,
+    *,
+    expression: str,
+    symbol: str,
+    interval: str,
+    start: datetime,
+    end: datetime,
+) -> dict[str, Any]:
+    repo = KlineRepository(db)
+    return await research_expression(repo, expression, symbol, interval, start, end)
+
+
+async def run_factor_research_batch(
+    db,
+    *,
+    codes: list[str],
+    symbols: list[str],
+    interval: str,
+    start: datetime,
+    end: datetime,
+) -> list[dict[str, Any]]:
+    """批量研究并对“有结果”的因子写 IC 记录（供历史回看）。"""
+    from .repo import FactorRunRepository
+
+    repo = KlineRepository(db)
+    run_repo = FactorRunRepository(db)
+    extras = await build_extras_for_codes(db, codes)
+    results = []
+    for code in codes:
+        result = await research_factor(repo, code, symbols, interval, start, end, extras=extras)
+        if result.get("found"):
+            decay = result.get("decay") or {}
+            await run_repo.insert(
+                code=code,
+                symbol="|".join(symbols),
+                interval=interval,
+                start_time=start,
+                end_time=end,
+                ic=result.get("ic"),
+                rank_ic=result.get("rank_ic"),
+                decay={k: v for k, v in decay.items() if isinstance(v, (int, float))},
+                n=result.get("n_total", 0),
+            )
+        results.append(result)
+    return results
+
+
+async def train_factor_model(
+    db,
+    *,
+    codes: list[str],
+    symbols: list[str],
+    interval: str,
+    start: datetime,
+    end: datetime,
+    horizon: int = 1,
+    test_ratio: float = 0.25,
+    alpha: float = 1.0,
+    model: str = "ridge",
+    max_corr: float | None = 0.85,
+    learning_rate: float = 0.05,
+    n_estimators: int = 240,
+    max_depth: int = 3,
+    num_leaves: int = 7,
+    subsample: float = 0.9,
+    colsample_bytree: float = 0.9,
+) -> dict[str, Any]:
+    from .ml import run_ml_research
+
+    repo = KlineRepository(db)
+    extras = await build_extras_for_codes(db, codes)
+    return await run_ml_research(
+        repo,
+        codes,
+        symbols,
+        interval,
+        start,
+        end,
+        horizon=horizon,
+        test_ratio=test_ratio,
+        alpha=alpha,
+        max_corr=max_corr,
+        model=model,
+        learning_rate=learning_rate,
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        num_leaves=num_leaves,
+        subsample=subsample,
+        colsample_bytree=colsample_bytree,
+        extras=extras,
+    )
+
+
+async def persist_trained_model(
+    db,
+    *,
+    codes: list[str],
+    symbols: list[str],
+    interval: str,
+    start: datetime,
+    end: datetime,
+    name: str,
+    horizon: int = 1,
+    test_ratio: float = 0.25,
+    alpha: float = 1.0,
+    model: str = "ridge",
+    max_corr: float | None = 0.85,
+    learning_rate: float = 0.05,
+    n_estimators: int = 240,
+    max_depth: int = 3,
+    num_leaves: int = 7,
+    subsample: float = 0.9,
+    colsample_bytree: float = 0.9,
+) -> dict[str, Any]:
+    """训练并把模型 artifact 落库：ridge 落线性权重；gbdt 序列化到磁盘，DB 记 model_path。"""
+    from uuid import uuid4
+
+    from .ml import run_ml_research, save_model_pickle
+
+    from .repo import MlModelRepository
+
+    repo = KlineRepository(db)
+    extras = await build_extras_for_codes(db, codes)
+    resp = await run_ml_research(
+        repo,
+        codes,
+        symbols,
+        interval,
+        start,
+        end,
+        horizon=horizon,
+        test_ratio=test_ratio,
+        alpha=alpha,
+        max_corr=max_corr,
+        model=model,
+        learning_rate=learning_rate,
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        num_leaves=num_leaves,
+        subsample=subsample,
+        colsample_bytree=colsample_bytree,
+        extras=extras,
+        return_artifact=True,
+    )
+    if not resp.get("found") or "artifact" not in resp:
+        raise ValueError(resp.get("message") or "训练失败，无法保存")
+    artifact = resp["artifact"]
+    mid = None
+    model_path = None
+    if artifact.get("model") == "gbdt":
+        booster = artifact.get("booster")
+        if booster is None:
+            raise ValueError("LightGBM 训练产物缺失，无法保存")
+        mid = uuid4()
+        model_path = save_model_pickle(mid, booster)
+    mrepo = MlModelRepository(db)
+    saved_id = await mrepo.create(
+        name=name,
+        model_type=model,
+        interval=interval,
+        horizon=horizon,
+        symbols=symbols,
+        features=artifact["features"],
+        metrics={
+            "oos_ic": resp.get("oos_ic"),
+            "oos_rank_ic": resp.get("oos_rank_ic"),
+            "hit_rate": resp.get("hit_rate"),
+            "spread": resp.get("spread"),
+        },
+        n_train=resp.get("n_train", 0),
+        n_test=resp.get("n_test", 0),
+        mid=mid,
+        model_path=model_path,
+        train_start=start,
+        train_end=end,
+        dataset={
+            "symbols": resp.get("symbols") or symbols,
+            "interval": interval,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "test_ratio": test_ratio,
+            "horizon": horizon,
+            "n_train": resp.get("n_train", 0),
+            "n_test": resp.get("n_test", 0),
+            "test_windows": resp.get("test_windows") or [],
+        },
+    )
+    return {
+        "model_id": str(saved_id),
+        "name": name,
+        "model_type": model,
+        "interval": interval,
+        "horizon": horizon,
+        "features": len(artifact["features"]),
+        "metrics": {
+            "oos_ic": resp.get("oos_ic"),
+            "oos_rank_ic": resp.get("oos_rank_ic"),
+            "hit_rate": resp.get("hit_rate"),
+        },
+    }
+
+
+async def list_saved_models(db, limit: int = 50) -> list[dict[str, Any]]:
+    from .repo import MlModelRepository
+
+    rows = await MlModelRepository(db).list_recent(limit=limit)
+    names = await build_factor_name_map(db)
+    for row in rows:
+        for f in row.get("features") or []:
+            code = f.get("code")
+            if not code:
+                continue
+            name = names.get(code)
+            f["name"] = name or (f"expr:{(f.get('expression') or '')[:18]}" if f.get("expression") else code)
+    return rows
+
+
+def _trained_on(model: dict[str, Any], symbol: str) -> bool:
+    return symbol in (model.get("symbols") or [])
+
+
+def _excluded_score_start(model: dict[str, Any], symbol: str, start: datetime) -> tuple[datetime, datetime | None]:
+    """样本排除：若评估区间与模型训练窗口重叠，把起点抬到训练窗口之后。"""
+    train_end = model.get("train_end")
+    if train_end and _trained_on(model, symbol) and start < train_end:
+        return train_end, train_end
+    return start, None
+
+
+async def score_saved_model(db, model_id, symbol: str, start: datetime, end: datetime) -> dict[str, Any] | None:
+    """用已保存模型打分（含样本外排除）。模型不存在返回 None。"""
+    from .ml import score_with_model
+
+    from .repo import MlModelRepository
+
+    mrepo = MlModelRepository(db)
+    model = await mrepo.get(model_id)
+    if not model:
+        return None
+    symbol = symbol.upper()
+    start, excluded_to = _excluded_score_start(model, symbol, start)
+    if start >= end:
+        train_end = model.get("train_end")
+        raise ValueError(
+            f"评估窗口与训练数据区间重叠已被样本排除（该标的训练至 {train_end:%Y-%m-%d %H:%M}），"
+            "窗口内已无样本可打分；请选择训练结束之后的区间。"
+        )
+    repo = KlineRepository(db)
+    data = await score_with_model(repo, model, model["interval"], symbol, start, end)
+    if data.get("found") and excluded_to is not None:
+        data["train_window_excluded_to"] = excluded_to.isoformat()
+    return data
+
+
+async def check_model_usage(db, model_id) -> dict[str, Any] | None:
+    """模型被哪些策略 / 模拟盘自动账户引用（绑定检查）。模型不存在返回 None。"""
+    from sqlalchemy import select
+
+    from ..data.models.orm import sim_accounts_table, strategies_table, strategy_versions_table
+
+    from .repo import MlModelRepository
+
+    if not await MlModelRepository(db).get(model_id):
+        return None
+
+    uid = str(model_id)
+    sv, st, sa = strategy_versions_table(), strategies_table(), sim_accounts_table()
+
+    vres = await db.execute(select(sv.c.strategy_id).where(sv.c.params.contains({"model_id": uid})))
+    strategy_ids = {r[0] for r in vres}
+    strategies: list[dict[str, Any]] = []
+    if strategy_ids:
+        sres = await db.execute(select(st.c.id, st.c.name).where(st.c.id.in_(strategy_ids)))
+        strategies = [{"id": str(i), "name": n} for i, n in sres]
+
+    ares = await db.execute(select(sa.c.id, sa.c.name).where(sa.c.config.contains({"model_id": uid})))
+    sim_accounts = [{"id": str(i), "name": n} for i, n in ares]
+    return {"strategies": strategies, "sim_accounts": sim_accounts}
+
+
+async def delete_saved_model(db, model_id) -> dict[str, Any] | None:
+    """删除模型（行 + 磁盘 pickle artifact）。模型不存在返回 None。"""
+    from pathlib import Path
+
+    from .ml import model_storage_dir
+
+    from .repo import MlModelRepository
+
+    mrepo = MlModelRepository(db)
+    model = await mrepo.get(model_id)
+    if not model:
+        return None
+    deleted = await mrepo.delete(model_id)
+    mp = model.get("model_path")
+    if mp and deleted:
+        try:
+            (model_storage_dir() / Path(mp).name).unlink(missing_ok=True)
+        except Exception:  # noqa: BLE001
+            pass
+    return {"deleted": deleted, "name": model.get("name")}
+
+async def latest_factor_runs(db, limit: int = 200) -> list[dict[str, Any]]:
+    from .repo import FactorRunRepository
+
+    return await FactorRunRepository(db).latest(limit=limit)
+
+
+async def factor_run_history(db, code: str, limit: int = 30) -> list[dict[str, Any]]:
+    from .repo import FactorRunRepository
+
+    return await FactorRunRepository(db).by_code(code, limit=limit)

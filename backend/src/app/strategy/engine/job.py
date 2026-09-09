@@ -24,6 +24,48 @@ logger = get_logger(__name__)
 settings = get_settings()
 
 
+async def _materialize_ml_scorer(session, template_id: str, params: dict, model_row: dict | None = None) -> dict:
+    """ml_score + gbdt：回测需真实树模型打分。按 model_id 从磁盘加载 pickle 注入 params。
+
+    strategy_versions.params 只存 JSON（features/model_type/model_id），树对象在这里临时注入，
+    不入库、不参与任务序列化。
+    """
+    if template_id != "ml_score" or str(params.get("model_type") or "").lower() != "gbdt":
+        return params
+    if model_row is None or not model_row.get("model_path"):
+        raise RuntimeError("模型不存在或未落盘 artifact（model_path 缺失）")
+    from ...factor.ml import load_model_pickle
+
+    params = dict(params)
+    params["_booster"] = load_model_pickle(model_row["model_path"])
+    params["features"] = model_row.get("features") or params.get("features") or []
+    return params
+
+
+async def _load_ml_model_row(session, template_id: str, params: dict) -> dict | None:
+    """ml_score 策略：按 params.model_id 取保存的模型行（含训练窗口 / 树 artifact 路径）。"""
+    if template_id != "ml_score" or not params.get("model_id"):
+        return None
+    from uuid import UUID as _UUID
+
+    from ...factor.repo import MlModelRepository
+
+    row = await MlModelRepository(session).get(_UUID(str(params["model_id"])))
+    return row
+
+
+def _clip_ml_start(row: dict | None, symbol: str, start: datetime) -> datetime:
+    """样本排除：回测标的若参与过该模型训练，把起点抬到训练窗口结束之后。"""
+    if not row:
+        return start
+    train_end = row.get("train_end")
+    if not train_end:
+        return start
+    if symbol not in (row.get("symbols") or []):
+        return start
+    return max(start, train_end)
+
+
 async def _publish_progress(
     backtest_id: UUID,
     *,
@@ -63,6 +105,16 @@ async def run_backtest_job(
     """执行一次回测并写库。"""
     async with SessionLocal() as session:
         repo = BacktestRepository(session)
+        # 0. ml_score 策略：取模型行，做训练期样本排除（评估起点抬到训练窗口后）
+        model_row = await _load_ml_model_row(session, template_id, params)
+        start = _clip_ml_start(model_row, symbol, start)
+        if start >= end:
+            train_end = (model_row or {}).get("train_end")
+            raise RuntimeError(
+                f"回测窗口与训练数据区间重叠已按样本排除（{symbol} 训练至 "
+                f"{train_end:%Y-%m-%d %H:%M}），窗口内已无样本可回测；"
+                "请选择训练结束之后的回测区间，或缩短训练期后再保存模型。"
+            )
         await repo.update_status(backtest_id, status="running", progress_pct=5, stage="loading_data")
         await _publish_progress(backtest_id, status="running", stage="loading_data", pct=5)
         try:
@@ -84,12 +136,13 @@ async def run_backtest_job(
             await repo.update_status(backtest_id, status="running", progress_pct=35, stage="backtesting")
             await _publish_progress(backtest_id, status="running", stage="backtesting", pct=35)
 
-            # 2. 回测
+            # 2. 回测（gbdt 需先注入树模型）
             template_meta = get_templates().get(template_id, {})
             allow_short = bool(template_meta.get("long_short", False))
             cfg = BacktestConfig(initial_cash=100_000.0, fee_rate=0.001, allow_short=allow_short)
+            bt_params = await _materialize_ml_scorer(session, template_id, params, model_row)
             result = run_backtest_vectorized(
-                ohlcv=df, template_id=template_id, params=params, cfg=cfg, interval=interval
+                ohlcv=df, template_id=template_id, params=bt_params, cfg=cfg, interval=interval
             )
             await repo.update_status(backtest_id, status="running", progress_pct=80, stage="persisting")
             await _publish_progress(backtest_id, status="running", stage="persisting", pct=80)

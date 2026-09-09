@@ -1,13 +1,11 @@
-"""/api/v1/strategy 策略与回测。"""
+"""/api/v1/strategy 策略与回测 —— 薄 API（业务在 strategy.engine.service / engine.job）。"""
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from arq import create_pool
-from arq.connections import RedisSettings
 from fastapi import APIRouter, Body, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -17,8 +15,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ...core.config import get_settings
 from ...core.db import get_db
 from ...core.errors import BadRequest, NotFound
-from ...data.repository.kline_repo import KlineRepository
 from ...strategy.engine.repo import BacktestRepository, StrategyRepository, StrategyVersionRepository
+from ...strategy.engine.service import start_backtest
 from ...strategy.engine.templates import get_templates
 
 router = APIRouter(prefix="/strategy", tags=["strategy"])
@@ -112,50 +110,23 @@ async def run_backtest(
     req: RunBacktestReq = Body(...),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    if req.end <= req.start:
-        raise BadRequest("end_must_be_after_start")
-    srepo = StrategyRepository(db)
-    strategy = await srepo.get(req.strategy_id)
-    if not strategy:
-        raise NotFound("strategy_not_found")
-    vrepo = StrategyVersionRepository(db)
-    version = await vrepo.get(req.version_id) if req.version_id else await vrepo.latest(req.strategy_id)
-    if not version:
-        raise NotFound("strategy_version_not_found")
-    template_id = (req.params or {}).get("template_id") or (version.get("params") or {}).get("template_id")
-    if not template_id:
-        # 版本 params 若未存模板 id，则查 strategies 表最近一次模板（存于 code 头注释）
-        code = version.get("code") or ""
-        raise BadRequest("template_id_required_in_params")
-
-    brepo = BacktestRepository(db)
-    bid = await brepo.create(
-        strategy_id=req.strategy_id,
-        version_id=version["id"],
-        symbols=[req.symbol],
-        interval=req.interval,
-        start_time=req.start,
-        end_time=req.end,
-        params={**req.params, "template_id": template_id},
-    )
-    redis = await create_pool(RedisSettings.from_dsn(settings.REDIS_URL))
     try:
-        await redis.enqueue_job(
-            "run_backtest_task",
-            str(bid),
-            str(req.strategy_id),
-            str(version["id"]),
-            req.symbol,
-            req.interval,
-            req.start.astimezone(timezone.utc).isoformat(),
-            req.end.astimezone(timezone.utc).isoformat(),
-            {**req.params, "template_id": template_id},
-            template_id,
-            _queue_name=settings.JOB_QUEUE_DATA,  # M2: 与下载共用 data worker
+        data = await start_backtest(
+            db,
+            strategy_id=req.strategy_id,
+            version_id=req.version_id,
+            symbol=req.symbol,
+            interval=req.interval,
+            start=req.start,
+            end=req.end,
+            params=req.params,
         )
-    finally:
-        await redis.aclose()
-    return {"code": "OK", "message": "ok", "data": {"backtest_id": str(bid), "status": "queued"}}
+    except ValueError as exc:
+        code = str(exc)
+        if code in ("strategy_not_found", "strategy_version_not_found"):
+            raise NotFound(code) from exc
+        raise BadRequest(code) from exc
+    return {"code": "OK", "message": "ok", "data": data}
 
 
 @router.get("/backtests")

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
 from typing import Optional
 
 from pydantic import Field, computed_field
@@ -64,6 +65,11 @@ class Settings(BaseSettings):
     JOB_QUEUE_SIM: str = "sim"
     JOB_QUEUE_ANALYTICS: str = "analytics"
 
+    # ===== ML 模型 artifact =====
+    # LightGBM 等不可用权重表达的模型 pickle 落盘目录。
+    # 空则用 <backend>/data/models；可填绝对路径或相对 backend 的路径。
+    MODEL_STORAGE_DIR: str = ""
+
     @computed_field  # type: ignore[prop-decorator]
     @property
     def DATABASE_URL(self) -> str:
@@ -89,6 +95,19 @@ class Settings(BaseSettings):
     @property
     def cors_origins_list(self) -> list[str]:
         return [o.strip() for o in self.APP_CORS_ORIGINS.split(",") if o.strip()]
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def model_storage_dir(self) -> Path:
+        """模型 pickle 目录：MODEL_STORAGE_DIR（绝对或相对 backend）或默认 backend/data/models。"""
+        backend_dir = Path(__file__).resolve().parents[3]
+        raw = (self.MODEL_STORAGE_DIR or "").strip()
+        if raw:
+            p = Path(raw)
+            if not p.is_absolute():
+                p = backend_dir / p
+            return p
+        return backend_dir / "data" / "models"
 
 
 @lru_cache(maxsize=1)

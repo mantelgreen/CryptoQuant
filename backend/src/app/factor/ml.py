@@ -1,6 +1,7 @@
-"""ML 多因子训练 v0：特征=研究通过的因子 → 按时间序列切分 → L2 Ridge 回归。
+"""ML 多因子训练 v0：特征=研究通过的因子 → 按时间序列切分 → Ridge / LightGBM。
 
-- 纯 NumPy 实现（无额外依赖）；若环境装了 scikit-learn，会自动用其 Ridge 求更稳的解。
+- Ridge：纯 NumPy 实现（无额外依赖）；若环境装了 scikit-learn，会自动用其求更稳的解。
+- LightGBM（gbdt）：树模型 artifact 以 pickle 落盘（config.MODEL_STORAGE_DIR），DB 只存引用。
 - 标签：未来 h 根收益 close.pct_change(h).shift(-h)。
 - 切分：每个标的内部按时间先后切 train/test（保留未来无泄漏），可设 purge 间隔。
 - 评价：样本外 IC / RankIC / 方向命中率 / 预测 top vs bottom 分组平均收益差（长空价差代理）。
@@ -8,16 +9,42 @@
 from __future__ import annotations
 
 import math
+import pickle
 from datetime import datetime
+from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import numpy as np
 import pandas as pd
 
+from ..core.config import get_settings
 from ..data.repository.kline_repo import KlineRepository
 from .registry import compute_factor, get_factors
 from .compute import compute_series, meta_or_extra
 from .sandbox import safe_eval_expr
+
+
+def model_storage_dir() -> Path:
+    """pickle 模型文件的存放目录（首次调用自动创建）。"""
+    d = get_settings().model_storage_dir
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def save_model_pickle(mid: UUID, obj: Any) -> str:
+    """把可 pickle 的模型对象写到存储目录，返回相对文件名（形如 <mid>.pkl）。"""
+    rel = f"{mid}.pkl"
+    with open(model_storage_dir() / rel, "wb") as fh:
+        pickle.dump(obj, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    return rel
+
+
+def load_model_pickle(rel: str) -> Any:
+    """按相对文件名读取模型对象（仅取文件名，防目录穿越）。"""
+    path = model_storage_dir() / Path(rel or "").name
+    with open(path, "rb") as fh:
+        return pickle.load(fh)
 
 
 async def _load_frame(repo: KlineRepository, symbol: str, interval: str, start: datetime, end: datetime) -> pd.DataFrame:
@@ -105,6 +132,90 @@ def _ridge(X: np.ndarray, y: np.ndarray, alpha: float) -> np.ndarray:
         return np.linalg.solve(a, X.T @ y)
 
 
+def _quantile_groups(pred: np.ndarray, groups: int) -> np.ndarray:
+    """按预测值从低到高等分成 groups 组，返回每个样本的组号（0 最低 ~ groups-1 最高）。
+
+    采用“秩等分”而非数值阈值，避免重复预测值导致分桶边界错位。
+    """
+    n = len(pred)
+    order = np.argsort(pred, kind="stable")
+    grp = np.empty(n, dtype=int)
+    for gi in range(groups):
+        lo = round(n * gi / groups)
+        hi = round(n * (gi + 1) / groups)
+        grp[order[lo:hi]] = gi
+    return grp
+
+
+def _downsample_idx(n: int, max_pts: int) -> np.ndarray:
+    """均匀抽稀下标（首尾包含），n<=max_pts 时原样返回。"""
+    if n <= max_pts:
+        return np.arange(n)
+    return np.unique(np.round(np.linspace(0, n - 1, max_pts)).astype(int))
+
+
+def _iso_ts(x: Any) -> str:
+    return pd.Timestamp(x).to_pydatetime().isoformat()
+
+
+def _build_oos_diag(
+    ts: np.ndarray,
+    pred: np.ndarray,
+    actual: np.ndarray,
+    max_scatter: int = 600,
+    max_nav_pts: int = 280,
+) -> dict[str, Any]:
+    """把样本外“逐样本预测/实际”整理成页面可直接绘制的诊断数据。
+
+    - scatter：预测分 vs 实际收益散点（按时间抽稀），前端叠加拟合线看 IC 斜率；
+    - deciles：按预测分等分 10 组，返回每组平均实际收益 → 单调性柱状图；
+    - nav    ：按预测分五等分，在整段样本外时间轴上累计(1+实际收益)的分层净值
+      （该组 bar 才“持仓”，其余视为空仓），q5 高分组应在 q1 低分组之上。
+    所有序列先按时间升序重排，兼容多标的拼接输入。
+    """
+    order = np.argsort(np.asarray(ts, dtype="datetime64[ns]"), kind="stable")
+    t = np.asarray(ts, dtype="datetime64[ns]")[order]
+    p = np.asarray(pred, dtype=float)[order]
+    a = np.asarray(actual, dtype=float)[order]
+    n = int(p.size)
+    out: dict[str, Any] = {"scatter": [], "deciles": [], "nav": {"ts": [], "q1": [], "q2": [], "q3": [], "q4": [], "q5": []}}
+    if n == 0:
+        return out
+
+    # 1) 散点（抽稀到 max_scatter 内）
+    for i in _downsample_idx(n, max_scatter):
+        out["scatter"].append(
+            {"ts": _iso_ts(t[i]), "pred": round(float(p[i]), 6), "actual": round(float(a[i]), 6)}
+        )
+
+    # 2) 十分位单调性：分组数随样本量自适应（10 → 5 → 2），保证每桶非空
+    g_dec = 10 if n >= 40 else 5 if n >= 20 else 2
+    g_dec = max(1, min(g_dec, n))
+    dec_grp = _quantile_groups(p, g_dec)
+    for gi in range(g_dec):
+        mask = dec_grp == gi
+        if mask.sum() == 0:
+            continue
+        out["deciles"].append(
+            {
+                "label": f"D{gi + 1}",
+                "mean_actual": round(float(a[mask].mean()), 6),
+                "mean_pred": round(float(p[mask].mean()), 6),
+                "n": int(mask.sum()),
+            }
+        )
+
+    # 3) 五等分分层净值（整段时间轴累计，非本组 bar 视为空仓）
+    g_q = min(5, n)
+    nav_grp = _quantile_groups(p, g_q)
+    keep = _downsample_idx(n, max_nav_pts)
+    for gi in range(g_q):
+        wealth = np.cumprod(1.0 + np.where(nav_grp == gi, a, 0.0))
+        out["nav"][f"q{gi + 1}"] = [round(float(v), 6) for v in wealth[keep]]
+    out["nav"]["ts"] = [_iso_ts(t[i]) for i in keep]
+    return out
+
+
 async def run_ml_research(
     repo: KlineRepository,
     codes: list[str],
@@ -135,8 +246,10 @@ async def run_ml_research(
     ytr_parts: list[np.ndarray] = []
     Xte_parts: list[np.ndarray] = []
     yte_parts: list[np.ndarray] = []
+    te_time_parts: list[np.ndarray] = []
     used_symbols: list[str] = []
     feature_cols: list[str] = []
+    test_windows: list[dict[str, Any]] = []
 
     for sym in symbols:
         df = await _load_frame(repo, sym, interval, start, end)
@@ -171,6 +284,18 @@ async def run_ml_research(
         Xtr_parts.append(X[:tr_end])
         ytr_parts.append(y[:tr_end])
         used_symbols.append(sym)
+        te_time_parts.append(np.asarray(sub.index[te_start:], dtype="datetime64[ns]"))
+        # 记录该标的本轮切出的真实测试段时间窗（末段 n_test 根），供模型库展示测试集
+        idx = sub.index
+        test_windows.append(
+            {
+                "symbol": sym,
+                "interval": interval,
+                "start": pd.Timestamp(idx[te_start]).to_pydatetime().isoformat(),
+                "end": pd.Timestamp(idx[-1]).to_pydatetime().isoformat(),
+                "bars": int(len(idx) - te_start),
+            }
+        )
         if not feature_cols:
             feature_cols = cols
 
@@ -181,6 +306,7 @@ async def run_ml_research(
     ytr = np.concatenate(ytr_parts)
     Xte = np.vstack(Xte_parts)
     yte = np.concatenate(yte_parts)
+    te_time = np.concatenate(te_time_parts) if te_time_parts else np.array([], dtype="datetime64[ns]")
 
     # —— 特征相关性去冗余（训练集内） ——
     keep_idx, removed_feats = _filter_high_corr(Xtr, ytr, feature_cols, max_corr)
@@ -195,20 +321,45 @@ async def run_ml_research(
     sd[sd == 0] = 1.0
     Xte_z = (Xte - mu) / sd
 
+    learning: dict[str, Any] | None = None
     if model_name == "gbdt":
         try:
-            from lightgbm import LGBMRegressor
+            from lightgbm import LGBMRegressor, record_evaluation
         except ImportError as exc:  # pragma: no cover
             return {"found": False, "message": "未安装 lightgbm（pip install lightgbm）"}
-        booster = LGBMRegressor(
-            n_estimators=max(10, int(n_estimators)),
-            learning_rate=float(learning_rate),
-            max_depth=max(-1, int(max_depth)),
-            num_leaves=max(2, int(num_leaves)),
-            subsample=min(1.0, max(0.1, float(subsample))),
-            colsample_bytree=min(1.0, max(0.1, float(colsample_bytree))),
-            random_state=7,
-        ).fit(Xtr_z, ytr)
+        lgb_params: dict[str, Any] = {
+            "n_estimators": max(10, int(n_estimators)),
+            "learning_rate": float(learning_rate),
+            "max_depth": max(-1, int(max_depth)),
+            "num_leaves": max(2, int(num_leaves)),
+            "subsample": min(1.0, max(0.1, float(subsample))),
+            "colsample_bytree": min(1.0, max(0.1, float(colsample_bytree))),
+            "random_state": 7,
+        }
+        booster = None
+        try:  # 记录每轮 train/oos 损失做学习曲线（仅用于展示，不参与早停）
+            evals: dict[str, Any] = {}
+            booster = LGBMRegressor(**lgb_params).fit(
+                Xtr_z,
+                ytr,
+                eval_X=(Xtr_z, Xte_z),
+                eval_y=(ytr, yte),
+                eval_names=["train", "oos"],
+                eval_metric="l2",
+                callbacks=[record_evaluation(evals)],
+            )
+            train_loss = next(iter((evals.get("train") or {}).values()), None)
+            oos_loss = next(iter((evals.get("oos") or {}).values()), None)
+            if train_loss and oos_loss and len(train_loss) == len(oos_loss):
+                learning = {
+                    "rounds": list(range(1, len(train_loss) + 1)),
+                    "train": [round(float(v), 8) for v in train_loss],
+                    "oos": [round(float(v), 8) for v in oos_loss],
+                }
+        except Exception:  # noqa: BLE001 - 记录失败不影响训练本身
+            booster = None
+        if booster is None:
+            booster = LGBMRegressor(**lgb_params).fit(Xtr_z, ytr)
         w = booster.feature_importances_.astype(float)
         s = w.sum()
         w = w / s if s > 0 else np.zeros_like(w)
@@ -267,6 +418,11 @@ async def run_ml_research(
         )
     univariate.sort(key=lambda x: abs(x["coef"]), reverse=True)
 
+    # —— 样本外诊断图表：散点 / 十分位单调性 / 分层净值（逐样本 pred·actual·时间） ——
+    oos_charts: dict[str, Any] = {}
+    if te_time.size == yte.size and yte.size > 0:
+        oos_charts = _build_oos_diag(te_time, pred, yte)
+
     artifact = {
         "model": model_name,
         "interval": interval,
@@ -288,6 +444,7 @@ async def run_ml_research(
             }
             for i, code in enumerate(feature_cols)
         ],
+        "booster": booster if model_name == "gbdt" else None,
     }
 
     resp: dict[str, Any] = {
@@ -297,6 +454,7 @@ async def run_ml_research(
         "symbols": used_symbols,
         "interval": interval,
         "horizon": horizon,
+        "test_windows": test_windows,
         "n_train": int(len(ytr)),
         "n_test": int(len(yte)),
         "feature_filter": {"max_corr": max_corr, "removed": removed_feats},
@@ -310,7 +468,10 @@ async def run_ml_research(
         "bottom_quintile_mean_ret": round(btm_mean, 6),
         "spread": round(top_mean - btm_mean, 6),
         "features": univariate,
+        "oos_charts": oos_charts,
     }
+    if learning is not None:
+        resp["learning"] = learning
     if return_artifact:
         resp["artifact"] = artifact
     return resp
@@ -318,24 +479,30 @@ async def run_ml_research(
 
 async def score_with_model(
     repo: KlineRepository,
-    features: list[dict[str, Any]],
+    model: dict[str, Any],
     interval: str,
     symbol: str,
     start: datetime,
     end: datetime,
     limit: int = 600,
 ) -> dict[str, Any]:
-    """用已保存模型对某标的区间逐 bar 打分（标准化 + 线性加权），返回最近 limit 个点。"""
+    """用已保存模型对某标的区间逐 bar 打分，返回最近 limit 个点。
+
+    ridge：按特征 mean/std 标准化后线性加权（coef）。
+    gbdt ：从磁盘加载 pickle 模型，特征按训练顺序标准化后用 booster.predict。
+    """
     df = await _load_frame(repo, symbol, interval, start, end)
     if df.empty:
         return {"found": False, "message": "区间内无数据"}
 
-    feats = [f for f in features if f.get("std") and float(f["std"]) != 0]
+    model_type = (model.get("model_type") or "ridge")
+    features = model.get("features") or []
+    feats = [f for f in features if f.get("code") and f.get("std") is not None and float(f.get("std", 0)) != 0]
     if not feats:
         return {"found": False, "message": "模型特征参数缺失"}
 
     series: dict[str, pd.Series] = {}
-    for f in feats:
+    for f in features:
         code = f["code"]
         try:
             if f.get("expression"):
@@ -348,19 +515,39 @@ async def score_with_model(
         return {"found": False, "message": "无法在标的/粒度上计算模型特征"}
 
     fdf = pd.DataFrame(series).dropna()
-    score = pd.Series(0.0, index=fdf.index)
-    for f in feats:
-        code = f["code"]
-        if code not in fdf.columns:
-            continue
-        z = (fdf[code] - float(f["mean"])) / float(f["std"])
-        score = score + float(f["coef"]) * z
+
+    if model_type == "gbdt":
+        missing = [f["code"] for f in feats if f["code"] not in fdf.columns]
+        if missing:
+            return {
+                "found": False,
+                "message": "树模型需要全部特征才能打分，以下特征无法计算：" + "、".join(missing[:5]),
+            }
+        try:
+            booster = load_model_pickle(model.get("model_path") or "")
+        except Exception as exc:  # noqa: BLE001
+            return {"found": False, "message": f"模型文件缺失或损坏：{exc}"}
+        cols = [f["code"] for f in feats]
+        z = fdf[cols].copy()
+        for f in feats:
+            z[f["code"]] = (z[f["code"]] - float(f["mean"] or 0.0)) / float(f["std"] or 1.0)
+        pred = booster.predict(z.to_numpy(dtype=float))
+        score = pd.Series(pred, index=fdf.index)
+    else:
+        score = pd.Series(0.0, index=fdf.index)
+        for f in feats:
+            code = f["code"]
+            if code not in fdf.columns:
+                continue
+            z = (fdf[code] - float(f["mean"] or 0.0)) / float(f["std"] or 1.0)
+            score = score + float(f["coef"] or 0.0) * z
 
     pts = score.iloc[-limit:]
     return {
         "found": True,
         "symbol": symbol,
         "interval": interval,
+        "model_type": model_type,
         "n": int(len(pts)),
         "last_score": round(float(pts.iloc[-1]), 6) if len(pts) else None,
         "points": [

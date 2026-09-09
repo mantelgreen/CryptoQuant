@@ -75,11 +75,18 @@ function icText(code: string): string {
     </div>
 
     <div class="mt-2 max-h-64 overflow-y-auto overscroll-contain rounded-lg border border-border">
-      <label
+      <div
         v-for="f in filtered"
         :key="f.code"
+        role="checkbox"
+        :aria-checked="selectedSet.has(f.code)"
+        tabindex="0"
         class="flex cursor-pointer items-center gap-2.5 border-b border-border px-3 py-2 transition-colors last:border-b-0 hover:bg-surface-2"
         :class="selectedSet.has(f.code) ? 'bg-surface-2/60' : ''"
+        @click="toggle(f.code)"
+        @keydown.enter.prevent="toggle(f.code)"
+        @keydown.space.prevent="toggle(f.code)"
+        @mousedown.prevent
       >
         <span
           class="flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-colors"
@@ -87,7 +94,6 @@ function icText(code: string): string {
         >
           <Check v-if="selectedSet.has(f.code)" :size="11" />
         </span>
-        <input type="checkbox" class="sr-only" :checked="selectedSet.has(f.code)" @change="toggle(f.code)" />
         <span class="min-w-0 flex-1">
           <span class="flex items-center gap-1.5">
             <span class="truncate text-[13px] font-medium text-fg">{{ f.name }}</span>
@@ -96,7 +102,7 @@ function icText(code: string): string {
           <span class="block truncate font-mono text-[10px] text-subtle">{{ f.is_user ? (f.expression ?? f.code) : f.code }}</span>
         </span>
         <span class="shrink-0 font-mono text-[10px] text-subtle">IC {{ icText(f.code) }}</span>
-      </label>
+      </div>
       <div v-if="!filtered.length" class="px-3 py-6 text-center text-xs text-subtle">没有匹配的因子</div>
     </div>
 

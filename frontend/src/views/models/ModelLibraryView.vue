@@ -1,28 +1,29 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { Activity, ArrowRight, FlaskConical, LoaderCircle, RefreshCw, Wallet } from '@lucide/vue'
+import { Activity, ArrowRight, Boxes, FlaskConical, LoaderCircle, RefreshCw, Trash2, Wallet } from '@lucide/vue'
 import PageHeader from '@/components/ui/PageHeader.vue'
 import HelpDrawer, { type PageHelp } from '@/components/ui/HelpDrawer.vue'
 import Panel from '@/components/ui/Panel.vue'
 import StateView from '@/components/ui/StateView.vue'
 import Modal from '@/components/ui/Modal.vue'
+import Tip from '@/components/ui/Tip.vue'
 import EquityChart from '@/components/chart/EquityChart.vue'
 import { useToastStore } from '@/stores/toast'
-import { listMlModels, scoreMlModel, type MlModelRow, type MlScore } from '@/api/factor'
+import { deleteMlModel, getMlUsage, listMlModels, scoreMlModel, type MlModelRow, type MlScore, type MlUsage } from '@/api/factor'
 import { createStrategy, createVersion, runBacktest } from '@/api/strategy'
 import { listAccounts, createAutoAccount, getAccount, fetchOverview, type SimAccount, type SimDetail, type SimOverviewRow } from '@/api/sim'
 import { INTERVALS, MAJOR_SYMBOLS, timeAgo } from '@/utils/format'
 
 const pageHelp: PageHelp = {
   title: '模型库',
-  intro: '训练落库的 Ridge 模型都集中在这里：可打分、一键建策略回测、部署模拟盘并查看绩效。',
+  intro: '训练落库的 ML 模型都集中在这里：可打分、一键建策略回测、部署模拟盘并查看绩效。',
   terms: [
-    { term: '打分', desc: '用模型系数 + 最新 K 线标准化因子，输出最新一 bar 的择时分数（线性加权，不含未来）。' },
+    { term: '打分', desc: 'Ridge 用系数 + 最新 K 线标准化因子线性打分；LightGBM 用已保存的树模型对标准化特征打分。均不含未来。' },
     { term: '建策略回测', desc: '以模型打分作择时信号（滚动分位），走标准向量化回测通道，可对比买入持有基准。' },
     { term: '模拟盘绩效', desc: '把模型部署为「策略自动」账户，按最新打分自动开/平仓；这里能看到账户净值曲线与累计收益。' },
   ],
-  tips: ['LightGBM 模型暂不可保存打分/回测，仅 Ridge 落库。', '回测前确认本地有对应标的/粒度的 K 线数据。'],
+  tips: ['Ridge 仅存线性权重；LightGBM 额外序列化模型文件（MODEL_STORAGE_DIR），打分/回测/模拟盘都走树模型。', '回测前确认本地有对应标的/粒度的 K 线数据。'],
 }
 
 const router = useRouter()
@@ -54,11 +55,80 @@ async function scoreModel(m: MlModelRow) {
   try {
     const sym = m.symbols?.[0] ?? 'BTCUSDT'
     const res: MlScore = await scoreMlModel(m.id, { symbol: sym, start: start.toISOString(), end: end.toISOString() })
-    toast.info('打分完成', `${sym} 最近 ${res.n} bar · 最新分 ${res.last_score ?? '—'}`)
+    if (!res.found) {
+      toast.error('无法打分', res.message ?? '所选区间无可打分样本')
+      return
+    }
+    const note = res.train_window_excluded_to ? `已样本排除训练期（自 ${fmtDay(res.train_window_excluded_to)} 起评估）` : ''
+    toast.info('打分完成', `${sym} 最近 ${res.n} bar · 最新分 ${res.last_score ?? '—'}${note ? '；' + note : ''}`)
   } catch (e: unknown) {
     toast.error('打分失败', (e as { message?: string }).message)
   } finally {
     scoreBusy.value = null
+  }
+}
+
+// —— 特征因子清单 ——
+const featOpen = ref(false)
+const featModel = ref<MlModelRow | null>(null)
+
+function openFeats(m: MlModelRow) {
+  featModel.value = m
+  featOpen.value = true
+}
+
+function fmtCoef(v: number): string {
+  const s = v >= 0 ? '+' : ''
+  return `${s}${v.toFixed(5)}`
+}
+
+// —— 删除模型 ——
+const delOpen = ref(false)
+const delChecking = ref(false)
+const delBusy = ref(false)
+const delModel = ref<MlModelRow | null>(null)
+const delUsage = ref<MlUsage | null>(null)
+const delErr = ref('')
+
+const delBlocked = computed(() => {
+  const u = delUsage.value
+  return !!u && (u.strategies.length > 0 || u.sim_accounts.length > 0)
+})
+
+async function requestDelete(m: MlModelRow) {
+  delModel.value = m
+  delUsage.value = null
+  delErr.value = ''
+  delChecking.value = true
+  delOpen.value = true
+  try {
+    delUsage.value = await getMlUsage(m.id)
+  } catch (e: unknown) {
+    delErr.value = (e as { message?: string }).message ?? '检查引用失败'
+  } finally {
+    delChecking.value = false
+  }
+}
+
+async function confirmDelete() {
+  const m = delModel.value
+  if (!m || delBusy.value || delBlocked.value) return
+  delBusy.value = true
+  delErr.value = ''
+  try {
+    await deleteMlModel(m.id)
+    delOpen.value = false
+    toast.success('模型已删除', m.name)
+    await load()
+  } catch (e: unknown) {
+    const payload = e as { code?: string; message?: string; detail?: MlUsage }
+    if (payload.code === 'CONFLICT' && payload.detail) {
+      delUsage.value = payload.detail
+    } else {
+      delErr.value = payload.message ?? '删除失败'
+    }
+  } finally {
+    delBusy.value = false
   }
 }
 
@@ -96,6 +166,7 @@ async function runBt() {
   const params: Record<string, unknown> = {
     template_id: 'ml_score',
     model_id: m.id,
+    model_type: m.model_type,
     features,
     window: btCfg.value.window,
     enter_q: btCfg.value.enterQ,
@@ -212,6 +283,72 @@ function pnlTone(v: number | null | undefined): string {
   return v > 0 ? 'text-up' : v < 0 ? 'text-down' : 'text-muted'
 }
 
+function fmtDay(v: string | null | undefined): string {
+  if (!v) return '—'
+  return String(v).slice(0, 10)
+}
+
+type TestWindow = { symbol: string; interval: string; start: string; end: string; bars: number }
+
+function shortSyms(syms: string[] | undefined): string {
+  const s = (syms ?? []).filter(Boolean)
+  return s.length ? s.join('/') : '—'
+}
+
+/** 训练数据行文本：币种 · 粒度 · 起止 · 训练根数 */
+function trainText(m: MlModelRow): string {
+  const d = m.dataset
+  const win =
+    d?.start && d?.end
+      ? `${fmtDay(d.start)} ~ ${fmtDay(d.end)}`
+      : m.train_start
+        ? `${fmtDay(m.train_start)} ~ ${fmtDay(m.train_end)}`
+        : '区间未记录'
+  return `${shortSyms(m.symbols ?? [])} · ${d?.interval ?? m.interval} · ${win} · ${m.n_train} 根`
+}
+
+/** 测试集行文本：币种 · 粒度 · 真实测试段起止 · 测试根数（样本外） */
+function testText(m: MlModelRow): string {
+  const tw = (m.dataset?.test_windows ?? []) as TestWindow[]
+  if (tw.length) {
+    const syms = [...new Set(tw.map((x) => x.symbol))]
+    const start = tw.map((x) => x.start).sort()[0]
+    const end = tw.map((x) => x.end).sort().at(-1)
+    const bars = tw.reduce((a, b) => a + (b.bars || 0), 0)
+    return `${shortSyms(syms)} · ${tw[0].interval} · ${fmtDay(start)} ~ ${fmtDay(end)} · ${bars} 根`
+  }
+  const ratio = m.dataset?.test_ratio
+  const tail = ratio != null ? `末尾 ${(ratio * 100).toFixed(0)}%` : '测试段起始未记录'
+  return `${shortSyms(m.symbols ?? [])} · ${m.dataset?.interval ?? m.interval} · ${tail} · ${m.n_test} 根`
+}
+
+/** 训练集行的解释：窗口含义 + 样本排除行为 */
+function trainTipText(m: MlModelRow): string {
+  const win =
+    (m.dataset?.start && m.dataset?.end)
+      ? `${fmtDay(m.dataset.start)} ~ ${fmtDay(m.dataset.end)}`
+      : m.train_start
+        ? `${fmtDay(m.train_start)} ~ ${fmtDay(m.train_end)}`
+        : '未记录'
+  return `保存模型时记录的样本窗口（币种 · 粒度 · ${win}）。模型拟合见过这段数据，因此在模型库对该训练标的做回测/打分时会自动样本排除：评估从训练窗口结束之后才开始，避免样本内虚高。`
+}
+
+/** 测试集行的解释：OOS 语义 + 各币测试段明细 */
+function testTipText(m: MlModelRow): string {
+  const tw = (m.dataset?.test_windows ?? []) as TestWindow[]
+  const head =
+    'OOS = Out-of-Sample（样本外）。测试集是训练时从末尾专门留出、不参与拟合的一段，OOS IC / RankIC / 命中 / 价差都在这段上测得，用来检验模型对未见数据的泛化能力。'
+  if (!tw.length) return head + '（该模型较老，未记录每个币的测试段起止时间）'
+  const lines = tw.map((x) => `${x.symbol} · ${x.interval} · ${fmtDay(x.start)} ~ ${fmtDay(x.end)} · ${x.bars} 根`)
+  return head + '\n' + lines.join('\n')
+}
+
+const btTrained = computed(() => {
+  const m = btModel.value
+  const sym = btCfg.value.symbol.trim().toUpperCase()
+  return !!m && (m.symbols ?? []).includes(sym)
+})
+
 function pnlText(a: SimAccount & { last_equity?: number | null }): string {
   const eq = a.last_equity
   if (eq == null) return '—'
@@ -264,42 +401,67 @@ onMounted(load)
       </StateView>
 
       <div v-else class="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
-        <article v-for="m in models" :key="m.id" class="panel flex flex-col p-5">
+        <article v-for="m in models" :key="m.id" class="group panel flex h-[320px] flex-col overflow-hidden p-5">
           <div class="flex items-center gap-2">
             <div class="min-w-0 flex-1">
               <h3 class="truncate text-[15px] font-semibold text-fg">{{ m.name }}</h3>
-              <p class="font-mono text-[11px] text-subtle">{{ m.model_type }} · {{ m.interval }} · 预测 {{ m.horizon }}h · {{ timeAgo(m.created_at) }}</p>
+              <p class="mt-0.5 truncate font-mono text-[11px] text-subtle">{{ m.model_type }} · {{ m.interval }} · 预测 {{ m.horizon }}h · {{ timeAgo(m.created_at) }}</p>
             </div>
-            <span class="badge tone-primary">Ridge</span>
+            <span class="badge tone-primary shrink-0">{{ m.model_type === 'gbdt' ? 'LightGBM' : 'Ridge' }}</span>
+            <button
+              class="rounded-md p-1 text-subtle opacity-0 transition-colors hover:bg-danger/10 hover:text-danger focus-visible:opacity-100 group-hover:opacity-100"
+              :aria-label="`删除模型 ${m.name}`"
+              @click="requestDelete(m)"
+            >
+              <Trash2 :size="13" />
+            </button>
           </div>
 
           <div class="mt-4 grid grid-cols-4 gap-2">
             <div>
-              <p class="text-[10px] uppercase tracking-wider text-subtle">OOS IC</p>
+              <p class="whitespace-nowrap text-[10px] uppercase tracking-wider text-subtle">OOS IC <Tip text="OOS = Out-of-Sample（样本外）。IC：样本外测试段上模型预测值与实际未来收益的 Pearson 相关；绝对值越高预测越强，0 表示无预测力" /></p>
               <p class="num mt-1 text-sm font-semibold" :class="pnlTone(m.metrics?.oos_ic ?? 0)">{{ modelMetric(m, 'oos_ic') }}</p>
             </div>
             <div>
-              <p class="text-[10px] uppercase tracking-wider text-subtle">RankIC</p>
+              <p class="whitespace-nowrap text-[10px] uppercase tracking-wider text-subtle">RankIC <Tip text="OOS = Out-of-Sample（样本外）。RankIC：样本外测试段上预测排序与实际收益排序的 Spearman 相关，衡量选股/择时排序能力，对离群值比 IC 更稳健" /></p>
               <p class="num mt-1 text-sm font-semibold" :class="pnlTone(m.metrics?.oos_rank_ic ?? 0)">{{ modelMetric(m, 'oos_rank_ic') }}</p>
             </div>
             <div>
-              <p class="text-[10px] uppercase tracking-wider text-subtle">命中</p>
+              <p class="whitespace-nowrap text-[10px] uppercase tracking-wider text-subtle">命中 <Tip text="方向命中率：预测涨/跌方向与实际方向一致的比例；>50% 说明方向判断优于抛硬币" /></p>
               <p class="num mt-1 text-sm font-semibold text-fg">{{ modelMetric(m, 'hit_rate') }}</p>
             </div>
             <div>
-              <p class="text-[10px] uppercase tracking-wider text-subtle">价差</p>
+              <p class="whitespace-nowrap text-[10px] uppercase tracking-wider text-subtle">价差 <Tip text="测试段把预测分最高的 20% 与最低的 20% 分组，两者实际平均收益之差；&gt;0 表示高分组确实跑赢低分组（多头信号有效）" /></p>
               <p class="num mt-1 text-sm font-semibold" :class="pnlTone(m.metrics?.spread ?? 0)">{{ modelMetric(m, 'spread') }}</p>
             </div>
           </div>
 
-          <div class="mt-3 flex flex-wrap gap-1.5">
-            <span v-for="f in (m.features ?? []).slice(0, 5)" :key="f.code" class="badge tone-neutral">{{ f.code }}</span>
-            <span v-if="(m.features ?? []).length > 5" class="badge tone-neutral">+{{ m.features.length - 5 }}</span>
+          <button
+            class="mt-3 inline-flex w-fit items-center gap-1.5 rounded-lg border border-border bg-surface-2/60 px-2.5 py-1.5 text-[11px] font-medium text-muted transition-colors hover:border-primary/40 hover:text-fg"
+            :aria-label="`查看 ${(m.features ?? []).length} 个特征因子`"
+            @click="openFeats(m)"
+          >
+            <Boxes :size="12" class="text-subtle" />使用 {{ (m.features ?? []).length }} 个因子
+          </button>
+
+          <div class="flex-1" />
+
+          <div class="min-w-0">
+            <div class="flex items-center gap-1.5">
+              <span class="text-[10px] font-semibold uppercase tracking-wider text-subtle">训练</span>
+              <Tip :text="trainTipText(m)" class="shrink-0 self-center" />
+            </div>
+            <p class="mt-1 truncate font-mono text-[11px] text-subtle">{{ trainText(m) }}</p>
+          </div>
+          <div class="mt-2 min-w-0">
+            <div class="flex items-center gap-1.5">
+              <span class="text-[10px] font-semibold uppercase tracking-wider text-subtle">测试</span>
+              <Tip :text="testTipText(m)" class="shrink-0 self-center" />
+            </div>
+            <p class="mt-1 truncate font-mono text-[11px] text-subtle">{{ testText(m) }}</p>
           </div>
 
-          <p class="mt-3 text-[11px] text-subtle">{{ (m.symbols ?? []).join(', ') }} · train {{ m.n_train }} / test {{ m.n_test }}</p>
-
-          <div class="mt-4 flex items-center gap-2 border-t border-border pt-3">
+          <div class="mt-3 flex items-center gap-2 border-t border-border pt-3">
             <button class="btn btn-primary !h-8 flex-1 text-xs" @click="openBt(m)"><FlaskConical :size="13" />回测</button>
             <button class="btn btn-ghost !h-8 flex-1 text-xs" @click="openPaper(m)"><Wallet :size="13" />模拟盘</button>
             <button class="btn btn-ghost !h-8 text-xs" :disabled="scoreBusy === m.id" @click="scoreModel(m)">
@@ -344,6 +506,9 @@ onMounted(load)
         </div>
         <p class="text-xs leading-relaxed text-subtle">
           打分高于滚动 {{ btCfg.enterQ }} 分位 → 满仓做多；低于 {{ btCfg.exitQ }} 分位 → 清仓。只用 ≤t 信息，无未来函数。可与「买入持有」基准对比。
+        </p>
+        <p v-if="btTrained" class="rounded-lg border border-warn/30 bg-warn/10 px-2.5 py-2 text-[11px] leading-relaxed text-warn">
+          该标的是此模型的训练标的（训练期至 {{ fmtDay(btModel?.train_end) }}）：回测会自动做样本排除，评估从训练窗口结束之后开始；若整窗均落在训练期内将无法回测。
         </p>
       </div>
       <template #footer>
@@ -426,6 +591,85 @@ onMounted(load)
           <router-link to="/sim" class="btn btn-ghost !h-8 text-xs">去模拟交易页<ArrowRight :size="13" /></router-link>
         </div>
       </div>
+    </Modal>
+
+    <!-- 特征因子清单弹窗 -->
+    <Modal
+      :open="featOpen"
+      :title="`特征因子 · ${featModel?.name ?? ''}`"
+      :sub="`${(featModel?.features ?? []).length} 个输入因子 · ${featModel?.model_type === 'gbdt' ? 'LightGBM' : 'Ridge'} · ${featModel?.interval}，右列为模型对该因子的 ${featModel?.model_type === 'gbdt' ? '重要性' : '线性系数'}（特征已标准化）`"
+      width="600px"
+      @close="featOpen = false"
+    >
+      <div v-if="!(featModel?.features ?? []).length" class="py-10 text-center text-xs text-subtle">该模型没有记录特征。</div>
+      <ul v-else class="divide-y divide-border">
+        <li v-for="f in featModel?.features ?? []" :key="f.code" class="flex items-center gap-3 py-2.5">
+          <div class="min-w-0 flex-1">
+            <p class="truncate text-[13px] font-medium text-fg">{{ f.name || f.code }}</p>
+            <p class="mt-0.5 truncate font-mono text-[10px] text-subtle">{{ f.expression ? `表达式：${f.expression}` : f.code }}</p>
+          </div>
+          <div class="shrink-0 text-right">
+            <p class="num text-xs font-semibold" :class="pnlTone(f.coef)">{{ fmtCoef(f.coef) }}</p>
+            <p class="text-[9px] uppercase tracking-wider text-subtle">{{ featModel?.model_type === 'gbdt' ? 'importance' : 'coef' }}</p>
+          </div>
+        </li>
+      </ul>
+    </Modal>
+
+    <!-- 删除模型确认 / 被引用警告 -->
+    <Modal
+      :open="delOpen"
+      :title="delBlocked ? `无法删除 · ${delModel?.name ?? ''}` : `删除模型 · ${delModel?.name ?? ''}`"
+      :sub="delBlocked
+        ? '该模型正被策略 / 模拟盘账户引用'
+        : `${delModel?.model_type === 'gbdt' ? 'LightGBM（含序列化模型文件）' : 'Ridge'} · 删除后不可恢复`"
+      width="520px"
+      @close="delOpen = false"
+    >
+      <div v-if="delChecking" class="py-10"><StateView busy title="检查引用…" /></div>
+
+      <template v-else-if="delBlocked">
+        <div class="rounded-lg border border-danger/30 bg-danger/10 px-3 py-2.5 text-xs leading-relaxed text-down">
+          该模型正在为下面的策略 / 模拟盘提供打分信号，删除会让它们失效，因此暂时不能删除。请先删除引用它的策略版本或解绑模拟盘账户，再回来删除模型。
+        </div>
+
+        <div v-if="(delUsage?.strategies ?? []).length" class="mt-4">
+          <p class="text-[10px] font-semibold uppercase tracking-wider text-subtle">引用它的策略</p>
+          <ul class="mt-1.5 space-y-1">
+            <li v-for="s in delUsage?.strategies ?? []" :key="s.id" class="flex items-center gap-2 text-xs text-fg">
+              <FlaskConical :size="13" class="shrink-0 text-subtle" />{{ s.name }}
+            </li>
+          </ul>
+        </div>
+
+        <div v-if="(delUsage?.sim_accounts ?? []).length" class="mt-4">
+          <p class="text-[10px] font-semibold uppercase tracking-wider text-subtle">引用它的模拟盘账户</p>
+          <ul class="mt-1.5 space-y-1">
+            <li v-for="a in delUsage?.sim_accounts ?? []" :key="a.id" class="flex items-center gap-2 text-xs text-fg">
+              <Wallet :size="13" class="shrink-0 text-subtle" />{{ a.name }}
+            </li>
+          </ul>
+        </div>
+      </template>
+
+      <template v-else>
+        <p v-if="delErr" class="rounded-lg border border-down/30 bg-down/10 px-3 py-2 text-xs text-down">{{ delErr }}</p>
+        <p class="text-[13px] leading-relaxed text-muted">
+          确定要删除模型“{{ delModel?.name }}”吗？模型记录{{ delModel?.model_type === 'gbdt' ? '及磁盘上的序列化模型文件' : '' }}将一并移除，且不可恢复。检查确认：该模型当前未被任何策略或模拟盘引用。
+        </p>
+      </template>
+
+      <template #footer>
+        <div v-if="delBlocked" class="flex justify-end">
+          <button class="btn btn-primary" @click="delOpen = false">知道了</button>
+        </div>
+        <div v-else class="flex items-center justify-end gap-2">
+          <button class="btn btn-ghost" :disabled="delBusy || delChecking" @click="delOpen = false">取消</button>
+          <button class="btn btn-danger-ghost" :disabled="delBusy || delChecking || !!delErr" @click="confirmDelete">
+            <LoaderCircle v-if="delBusy" :size="14" class="animate-spin" />{{ delBusy ? '删除中…' : '删除模型' }}
+          </button>
+        </div>
+      </template>
     </Modal>
   </div>
 </template>

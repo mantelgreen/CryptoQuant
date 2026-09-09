@@ -25,6 +25,9 @@ backend/*.egg-info/
 backend/build/
 backend/dist/
 
+# ML model artifacts（pickle 落盘目录）
+backend/data/
+
 # Frontend dependencies and build output
 frontend/node_modules/
 frontend/dist/

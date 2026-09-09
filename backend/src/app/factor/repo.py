@@ -80,8 +80,13 @@ class MlModelRepository:
         metrics: dict[str, Any],
         n_train: int,
         n_test: int,
+        mid: UUID | None = None,
+        model_path: str | None = None,
+        train_start: datetime | None = None,
+        train_end: datetime | None = None,
+        dataset: dict[str, Any] | None = None,
     ) -> UUID:
-        mid = uuid4()
+        mid = mid or uuid4()
         await self.db.execute(
             self._t.insert().values(
                 id=mid,
@@ -94,6 +99,10 @@ class MlModelRepository:
                 metrics=metrics,
                 n_train=n_train,
                 n_test=n_test,
+                model_path=model_path,
+                train_start=train_start,
+                train_end=train_end,
+                dataset=dataset or {},
             )
         )
         await self.db.commit()
@@ -103,6 +112,11 @@ class MlModelRepository:
         result = await self.db.execute(select(self._t).where(self._t.c.id == mid))
         row = result.first()
         return dict(row._mapping) if row else None
+
+    async def delete(self, mid: UUID) -> bool:
+        result = await self.db.execute(self._t.delete().where(self._t.c.id == mid))
+        await self.db.commit()
+        return (result.rowcount or 0) > 0
 
     async def list_recent(self, limit: int = 50) -> list[dict[str, Any]]:
         result = await self.db.execute(
