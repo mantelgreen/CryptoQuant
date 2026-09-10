@@ -442,6 +442,42 @@ async def run_factor_matrix(
     return await matrix_factor(repo, codes, symbols, interval, start, end, extras=extras)
 
 
+async def run_factor_research_cs_batch(
+    db,
+    *,
+    codes: list[str],
+    symbols: list[str],
+    interval: str,
+    start: datetime,
+    end: datetime,
+    horizon: int = 1,
+    min_names: int = 5,
+    neutralize: bool = False,
+) -> list[dict[str, Any]]:
+    """批量截面因子研究：逐因子算「同一时点跨标的」的 IC/RankIC/IR/t 值与多空价差。"""
+    from .cross_section import research_factor_cs
+
+    repo = KlineRepository(db)
+    extras = await build_extras_for_codes(db, codes)
+    results: list[dict[str, Any]] = []
+    for code in codes:
+        results.append(
+            await research_factor_cs(
+                repo,
+                code,
+                symbols,
+                interval,
+                start,
+                end,
+                horizon=horizon,
+                min_names=min_names,
+                neutralize=neutralize,
+                extras=extras,
+            )
+        )
+    return results
+
+
 async def verify_factor_expression(
     db,
     *,

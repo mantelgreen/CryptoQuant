@@ -15,6 +15,7 @@ import {
   fetchRunsByCode,
   factorMatrix,
   researchFactors,
+  researchFactorsCS,
   removeUserFactor,
   getFactorUsage,
   type FactorMeta,
@@ -22,6 +23,7 @@ import {
   type FactorRun,
   type FactorMatrix,
   type FactorUsage,
+  type CsMetrics,
 } from '@/api/factor'
 import EquityChart from '@/components/chart/EquityChart.vue'
 import { pickFactorsByAi, type FactorPickItem, type FactorPick } from '@/api/agent'
@@ -241,6 +243,75 @@ async function runResearch() {
     toast.error('研究失败', (e as { message?: string }).message)
   } finally {
     researching.value = false
+  }
+}
+
+// —— 截面研究（同一时点跨标的 IC，需多标的广度） ——
+const showCs = ref(false)
+const csRunning = ref(false)
+const csActive = ref<FactorMeta | null>(null)
+const csResult = ref<CsMetrics | null>(null)
+const csForm = ref({
+  symbols: MAJOR_SYMBOLS.join(', '),
+  interval: '1d',
+  days: 365,
+  horizon: 1,
+  minNames: 5,
+  neutralize: true,
+})
+
+function openCs(f: FactorMeta) {
+  csActive.value = f
+  csResult.value = null
+  csForm.value = {
+    symbols: MAJOR_SYMBOLS.join(', '),
+    interval: '1d',
+    days: 365,
+    horizon: 1,
+    minNames: 5,
+    neutralize: true,
+  }
+  showCs.value = true
+}
+
+function parseSymbols(text: string): string[] {
+  return Array.from(
+    new Set(text.split(/[\s,，;；]+/).map((s) => s.trim().toUpperCase()).filter(Boolean)),
+  )
+}
+
+async function runCs() {
+  if (!csActive.value || csRunning.value) return
+  const syms = parseSymbols(csForm.value.symbols)
+  if (syms.length < 2) {
+    toast.error('标的不足', '截面研究至少需要 2 个标的，建议 ≥ 20 个')
+    return
+  }
+  csRunning.value = true
+  const end = new Date()
+  const start = new Date(end.getTime() - csForm.value.days * 24 * 3600 * 1000)
+  try {
+    const res = await researchFactorsCS({
+      codes: [csActive.value.code],
+      symbols: syms,
+      interval: csForm.value.interval,
+      start: start.toISOString(),
+      end: end.toISOString(),
+      horizon: csForm.value.horizon,
+      min_names: csForm.value.minNames,
+      neutralize: csForm.value.neutralize,
+    })
+    const r = res[0] ?? null
+    csResult.value = r
+    if (r?.found) {
+      toast.success('截面研究完成', `${r.name} RankIC=${r.rank_ic ?? '—'} · IR=${r.rank_ic_ir ?? '—'}`)
+    } else {
+      toast.error('截面样本不足', r?.message ?? '请先下载更多标的的 K 线')
+    }
+  } catch (e: unknown) {
+    toast.error('截面研究失败', (e as { message?: string }).message)
+  } finally {
+    csRunning.value = false
   }
 }
 
@@ -867,6 +938,9 @@ onMounted(load)
                       <button class="btn btn-ghost !h-7 !px-2 text-[11px]" title="实测该因子 IC" @click="openResearch(f)">
                         <FlaskConical :size="12" />研究 IC
                       </button>
+                      <button class="btn btn-ghost !h-7 !px-2 text-[11px]" title="同一时点跨标的截面 IC（需多标的广度）" @click="openCs(f)">
+                        <LayoutGrid :size="12" />截面
+                      </button>
                       <button class="btn btn-ghost !h-7 !px-2 text-[11px]" title="查看研究历史" @click="openHistory(f)">历史</button>
                       <button
                         v-if="!candOpen"
@@ -946,6 +1020,74 @@ onMounted(load)
           <button class="btn btn-primary" :disabled="researching || !form.symbol.trim()" @click="runResearch">
             <LoaderCircle v-if="researching" :size="15" class="animate-spin" />
             {{ researching ? '研究中…' : '开始研究' }}
+          </button>
+        </div>
+      </template>
+    </Modal>
+
+    <!-- 截面研究弹窗 -->
+    <Modal :open="showCs" :title="`截面研究 · ${csActive?.name ?? ''}`" sub="同一时点跨标的：因子排名 vs 未来收益排名（IC/IR/t）" width="720px" @close="showCs = false">
+      <div class="space-y-4">
+        <div class="field">
+          <label class="label" for="cs-syms">标的池（逗号/空格分隔，建议 ≥ 20 个）</label>
+          <textarea id="cs-syms" v-model="csForm.symbols" rows="3" class="input resize-none font-mono text-[11px]" spellcheck="false" />
+        </div>
+        <div class="grid grid-cols-2 gap-4">
+          <div class="field">
+            <label class="label" for="cs-interval">K 线颗粒度</label>
+            <select id="cs-interval" v-model="csForm.interval" class="select font-mono">
+              <option v-for="i in INTERVALS.filter((x) => ['15m', '30m', '1h', '4h', '1d'].includes(x))" :key="i" :value="i">{{ i }}</option>
+            </select>
+          </div>
+          <div class="field">
+            <label class="label" for="cs-horizon">预测窗口 h</label>
+            <input id="cs-horizon" v-model.number="csForm.horizon" type="number" min="1" max="10" class="input font-mono" />
+          </div>
+        </div>
+        <div class="grid grid-cols-2 gap-4">
+          <div class="field">
+            <label class="label">回看窗口</label>
+            <div class="flex gap-1.5">
+              <button v-for="d in [90, 180, 365, 730]" :key="d" class="chip !h-8" :class="{ 'is-active': csForm.days === d }" @click="csForm.days = d">
+                {{ d === 365 ? '1 年' : d === 730 ? '2 年' : `${d} 天` }}
+              </button>
+            </div>
+          </div>
+          <div class="field">
+            <label class="label" for="cs-min">每期最少标的数</label>
+            <input id="cs-min" v-model.number="csForm.minNames" type="number" min="2" max="200" class="input font-mono" />
+          </div>
+        </div>
+        <label class="flex items-center gap-2 text-xs text-muted">
+          <input v-model="csForm.neutralize" type="checkbox" class="accent-[var(--color-primary)]" />
+          截面去均值（等权市场中性，仅影响 IC 口径）
+        </label>
+
+        <div v-if="csResult" class="rounded-lg border border-border bg-surface-2/40 p-3">
+          <p v-if="!csResult.found" class="text-xs text-warn">{{ csResult.message }}</p>
+          <template v-else>
+            <div class="grid grid-cols-3 gap-2 sm:grid-cols-6">
+              <div><p class="text-[10px] text-subtle">IC</p><p class="num text-sm font-semibold" :class="(csResult.ic ?? 0) >= 0 ? 'text-up' : 'text-down'">{{ csResult.ic }}</p></div>
+              <div><p class="text-[10px] text-subtle">RankIC</p><p class="num text-sm font-semibold" :class="(csResult.rank_ic ?? 0) >= 0 ? 'text-up' : 'text-down'">{{ csResult.rank_ic }}</p></div>
+              <div><p class="text-[10px] text-subtle">IC IR</p><p class="num text-sm font-semibold text-fg">{{ csResult.ic_ir ?? '—' }}</p></div>
+              <div><p class="text-[10px] text-subtle">t 值</p><p class="num text-sm font-semibold text-fg">{{ csResult.ic_t ?? '—' }}</p></div>
+              <div><p class="text-[10px] text-subtle">多空价差</p><p class="num text-sm font-semibold text-fg">{{ csResult.long_short_spread ?? '—' }}</p></div>
+              <div><p class="text-[10px] text-subtle">期数/标的</p><p class="num text-sm font-semibold text-fg">{{ csResult.n_periods }} / {{ csResult.avg_names }}</p></div>
+            </div>
+            <p class="mt-2 text-[10px] leading-snug text-subtle">IC/IR 由同一时点跨标的截面排序计算；|t|&gt;2 才较可信，广度越大越可靠（当前平均 {{ csResult.avg_names }} 个标的/期）。</p>
+          </template>
+        </div>
+        <p v-else class="text-xs leading-relaxed text-subtle">
+          截面研究需要同一时点有足够标的（默认 ≥ {{ csForm.minNames }} 个）；先在「K 线下载」批量补齐标的池后再研究。
+          时序 IC 高但截面 IC 低，说明信号只在该标的自身历史里成立，难以做成多资产组合。
+        </p>
+      </div>
+      <template #footer>
+        <div class="flex items-center justify-end gap-2">
+          <button class="btn btn-ghost" @click="showCs = false">取消</button>
+          <button class="btn btn-primary" :disabled="csRunning" @click="runCs">
+            <LoaderCircle v-if="csRunning" :size="15" class="animate-spin" />
+            {{ csRunning ? '研究中…' : '开始截面研究' }}
           </button>
         </div>
       </template>

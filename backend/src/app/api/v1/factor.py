@@ -24,6 +24,7 @@ from ...factor.service import (
     persist_trained_model,
     run_factor_matrix,
     run_factor_research_batch,
+    run_factor_research_cs_batch,
     score_saved_model,
     train_factor_model,
     verify_factor_expression,
@@ -49,6 +50,17 @@ class MatrixReq(BaseModel):
     interval: str = Field(..., pattern=r"^(3m|15m|30m|1h|2h|4h|6h|12h|1d|3d|1w)$")
     start: datetime
     end: datetime
+
+
+class ResearchCsReq(BaseModel):
+    codes: list[str] = Field(..., min_length=1, max_length=MAX_ML_FEATURES)
+    symbols: list[str] = Field(..., min_length=2, max_length=200)
+    interval: str = Field(..., pattern=r"^(3m|15m|30m|1h|2h|4h|6h|12h|1d|3d|1w)$")
+    start: datetime
+    end: datetime
+    horizon: int = Field(default=1, ge=1, le=10)
+    min_names: int = Field(default=5, ge=2, le=200)
+    neutralize: bool = False
 
 
 class VerifyReq(BaseModel):
@@ -224,6 +236,27 @@ async def research(
         end=req.end,
     )
     return {"code": "OK", "message": "ok", "data": results}
+
+
+@router.post("/research/cs")
+async def research_cross_sectional(
+    req: ResearchCsReq = Body(...),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """批量截面因子研究：同一时点跨标的 IC/RankIC/IR/t 值与多空价差（需多标的广度）。"""
+    _check_window(req.start, req.end)
+    data = await run_factor_research_cs_batch(
+        db,
+        codes=req.codes,
+        symbols=[s.upper() for s in req.symbols],
+        interval=req.interval,
+        start=req.start,
+        end=req.end,
+        horizon=req.horizon,
+        min_names=req.min_names,
+        neutralize=req.neutralize,
+    )
+    return {"code": "OK", "message": "ok", "data": data}
 
 
 @router.post("/ml/train")

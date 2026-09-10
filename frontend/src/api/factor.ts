@@ -344,3 +344,40 @@ export async function researchFactors(payload: {
   const { data } = await http.post<{ data: FactorResearch[] }>('/factors/research', payload, { timeout: 150_000 })
   return data.data ?? []
 }
+
+export interface CsMetrics {
+  code: string
+  name: string
+  mode: string
+  found: boolean
+  message?: string
+  symbols?: string[]
+  n_periods?: number
+  avg_names?: number
+  ic?: number | null
+  ic_std?: number
+  ic_ir?: number | null
+  ic_t?: number | null
+  ic_positive_ratio?: number
+  rank_ic?: number | null
+  rank_ic_std?: number
+  rank_ic_ir?: number | null
+  rank_ic_t?: number | null
+  rank_ic_positive_ratio?: number
+  long_short_spread?: number | null
+  series?: Array<{ ts: string; ic: number; rank_ic: number; spread: number; n: number }>
+}
+
+export async function researchFactorsCS(payload: {
+  codes: string[]
+  symbols: string[]
+  interval: string
+  start: string
+  end: string
+  horizon?: number
+  min_names?: number
+  neutralize?: boolean
+}): Promise<CsMetrics[]> {
+  const { data } = await http.post<{ data: CsMetrics[] }>('/factors/research/cs', payload, { timeout: 180_000 })
+  return data.data ?? []
+}
