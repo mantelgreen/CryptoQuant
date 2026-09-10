@@ -78,6 +78,7 @@ def _reflect_all() -> None:
             "agent_sessions", "agent_messages", "agent_decisions",
             "sim_accounts", "sim_orders", "sim_positions",
             "llm_usage", "llm_costs", "llm_providers", "user_factors", "audit_logs",
+            "pipeline_runs", "pipeline_rounds",
         ]
         for n in names:
             if n in insp.get_table_names():
@@ -174,6 +175,14 @@ def user_factors_table() -> Table:
     return _t("user_factors")
 
 
+def pipeline_runs_table() -> Table:
+    return _t("pipeline_runs")
+
+
+def pipeline_rounds_table() -> Table:
+    return _t("pipeline_rounds")
+
+
 __all__ = [
     "symbols_table",
     "klines_table",
@@ -192,6 +201,8 @@ __all__ = [
     "sim_positions_table",
     "llm_providers_table",
     "user_factors_table",
+    "pipeline_runs_table",
+    "pipeline_rounds_table",
     "llm_usage_table",
     "llm_costs_table",
     "audit_logs_table",

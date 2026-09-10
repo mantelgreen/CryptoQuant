@@ -60,7 +60,11 @@ async function scoreModel(m: MlModelRow) {
       return
     }
     const note = res.train_window_excluded_to ? `已样本排除训练期（自 ${fmtDay(res.train_window_excluded_to)} 起评估）` : ''
-    toast.info('打分完成', `${sym} 最近 ${res.n} bar · 最新分 ${res.last_score ?? '—'}${note ? '；' + note : ''}`)
+    const aggNote = aggInfoText(m) ? `细粒度增强（${aggInfoText(m)}）` : ''
+    toast.info(
+      '打分完成',
+      `${sym} 最近 ${res.n} bar · 最新分 ${res.last_score ?? '—'}${note ? '；' + note : ''}${aggNote ? '；' + aggNote : ''}`,
+    )
   } catch (e: unknown) {
     toast.error('打分失败', (e as { message?: string }).message)
   } finally {
@@ -153,6 +157,10 @@ function openBt(m: MlModelRow) {
 async function runBt() {
   const m = btModel.value
   if (!m || btBusy.value) return
+  if (btExcluded.value?.blocked) {
+    toast.error('暂无样本外数据', '该标的训练至最新，训练结束后没有可用于回测的数据')
+    return
+  }
   btBusy.value = true
   const end = new Date()
   const start = new Date(end.getTime() - btCfg.value.days * 24 * 3600 * 1000)
@@ -349,6 +357,24 @@ const btTrained = computed(() => {
   return !!m && (m.symbols ?? []).includes(sym)
 })
 
+const btTrainEnd = computed<Date | null>(() => {
+  const v = btModel.value?.train_end
+  if (!v) return null
+  const d = new Date(v)
+  return Number.isNaN(d.getTime()) ? null : d
+})
+
+const btExcluded = computed(() => {
+  const te = btTrainEnd.value
+  if (!btTrained.value || !te) return null
+  const end = new Date()
+  const start = new Date(end.getTime() - (btCfg.value.days || 0) * 24 * 3600 * 1000)
+  if (te >= end) return { blocked: true, remainingDays: 0 }
+  const effStart = te > start ? te : start
+  const remainingDays = Math.max(0, Math.round((end.getTime() - effStart.getTime()) / 86400000))
+  return { blocked: false, remainingDays }
+})
+
 function pnlText(a: SimAccount & { last_equity?: number | null }): string {
   const eq = a.last_equity
   if (eq == null) return '—'
@@ -366,6 +392,19 @@ function modelMetric(m: MlModelRow, key: 'oos_ic' | 'oos_rank_ic' | 'hit_rate' |
   if (v == null) return '—'
   if (key === 'hit_rate') return `${(v * 100).toFixed(1)}%`
   return v.toFixed(key === 'spread' ? 5 : 4)
+}
+
+const AGG_LABELS: Record<string, string> = {
+  'agg:rv': '已实现波动率',
+  'agg:vol_imb': '量能不平衡',
+  'agg:taker_ratio': '主动买占比',
+}
+function aggInfoText(m: MlModelRow): string {
+  const fine = m.dataset?.fine_interval
+  if (!fine) return ''
+  const codes = m.dataset?.agg_features ?? []
+  const labels = codes.map((c) => AGG_LABELS[c] ?? c.replace('agg:', '')).filter(Boolean)
+  return `${fine} → ${labels.length ? labels.join(' / ') : '—'}`
 }
 
 onMounted(load)
@@ -436,13 +475,22 @@ onMounted(load)
             </div>
           </div>
 
-          <button
-            class="mt-3 inline-flex w-fit items-center gap-1.5 rounded-lg border border-border bg-surface-2/60 px-2.5 py-1.5 text-[11px] font-medium text-muted transition-colors hover:border-primary/40 hover:text-fg"
-            :aria-label="`查看 ${(m.features ?? []).length} 个特征因子`"
-            @click="openFeats(m)"
-          >
-            <Boxes :size="12" class="text-subtle" />使用 {{ (m.features ?? []).length }} 个因子
-          </button>
+          <div class="mt-3 flex min-w-0 items-center gap-1.5">
+            <button
+              class="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-border bg-surface-2/60 px-2.5 py-1.5 text-[11px] font-medium text-muted transition-colors hover:border-primary/40 hover:text-fg"
+              :aria-label="`查看 ${(m.features ?? []).length} 个特征因子`"
+              @click="openFeats(m)"
+            >
+              <Boxes :size="12" class="text-subtle" />使用 {{ (m.features ?? []).length }} 个因子
+            </button>
+            <span
+              v-if="aggInfoText(m)"
+              class="min-w-0 flex-1 truncate rounded-md border border-ai/30 bg-ai/5 px-2 py-1 text-[10px] text-ai-ink"
+              :title="aggInfoText(m)"
+            >
+              细粒度增强 · <span class="font-mono">{{ aggInfoText(m) }}</span>
+            </span>
+          </div>
 
           <div class="flex-1" />
 
@@ -507,14 +555,17 @@ onMounted(load)
         <p class="text-xs leading-relaxed text-subtle">
           打分高于滚动 {{ btCfg.enterQ }} 分位 → 满仓做多；低于 {{ btCfg.exitQ }} 分位 → 清仓。只用 ≤t 信息，无未来函数。可与「买入持有」基准对比。
         </p>
-        <p v-if="btTrained" class="rounded-lg border border-warn/30 bg-warn/10 px-2.5 py-2 text-[11px] leading-relaxed text-warn">
-          该标的是此模型的训练标的（训练期至 {{ fmtDay(btModel?.train_end) }}）：回测会自动做样本排除，评估从训练窗口结束之后开始；若整窗均落在训练期内将无法回测。
+        <p v-if="btExcluded?.blocked" class="rounded-lg border border-danger/30 bg-danger/10 px-2.5 py-2 text-[11px] leading-relaxed text-danger">
+          该标的训练至 {{ fmtDay(btModel?.train_end) }}，训练结束后已无样本外数据可回测。请：① 等新数据到账；② 换一个未参与训练的标的；③ 缩短训练期后重新保存模型。
+        </p>
+        <p v-else-if="btExcluded" class="rounded-lg border border-warn/30 bg-warn/10 px-2.5 py-2 text-[11px] leading-relaxed text-warn">
+          该标的参与过训练（至 {{ fmtDay(btModel?.train_end) }}）：样本排除后实际回测窗口约 {{ btExcluded.remainingDays }} 天。若过短，请增大「回看天数」或缩短训练期后重新保存。
         </p>
       </div>
       <template #footer>
         <div class="flex items-center justify-end gap-2">
           <button class="btn btn-ghost" @click="btOpen = false">取消</button>
-          <button class="btn btn-primary" :disabled="btBusy || !btCfg.symbol.trim()" @click="runBt">
+          <button class="btn btn-primary" :disabled="btBusy || !btCfg.symbol.trim() || btExcluded?.blocked" @click="runBt">
             <LoaderCircle v-if="btBusy" :size="15" class="animate-spin" />{{ btBusy ? '创建并回测中…' : '创建策略并回测' }}
           </button>
         </div>

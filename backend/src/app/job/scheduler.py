@@ -10,7 +10,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from arq import create_pool
 from arq.connections import RedisSettings
@@ -32,7 +32,7 @@ def _floor_minute(dt: datetime) -> datetime:
 
 
 async def _dispatch_due() -> None:
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)  # DB 存 naive UTC，保持兼容
     floor = _floor_minute(now)
     dispatched = 0
     async with SessionLocal() as session:
@@ -83,11 +83,9 @@ async def _dispatch_due() -> None:
 
 async def _dispatch_sim_auto() -> None:
     """把已启用、到期的“策略自动账户”派发给 worker 执行一次自动决策。"""
-    from datetime import timezone as _tz
-
     from ..simtrader.service import SimAccountRepository
 
-    now = datetime.utcnow().replace(tzinfo=_tz.utc)
+    now = datetime.now(timezone.utc)
     due: list[dict] = []
     async with SessionLocal() as session:
         repo = SimAccountRepository(session)

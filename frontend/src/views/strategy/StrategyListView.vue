@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { FlaskConical, Plus, ArrowUpRight } from '@lucide/vue'
-import { createStrategy, listStrategies, type Strategy } from '@/api/strategy'
+import { FlaskConical, LoaderCircle, Plus, ArrowUpRight, Trash2 } from '@lucide/vue'
+import { createStrategy, deleteStrategy, listStrategies, type Strategy } from '@/api/strategy'
 import PageHeader from '@/components/ui/PageHeader.vue'
 import HelpDrawer, { type PageHelp } from '@/components/ui/HelpDrawer.vue'
 import Panel from '@/components/ui/Panel.vue'
@@ -32,6 +32,35 @@ const error = ref<string | null>(null)
 const showCreate = ref(false)
 const creating = ref(false)
 const form = ref({ name: '', description: '', tags: '' })
+
+// —— 删除策略确认弹窗（与模型库删除弹窗一致的风格） ——
+const delOpen = ref(false)
+const delStrategy = ref<Strategy | null>(null)
+const delBusy = ref(false)
+const delErr = ref('')
+
+function openDelete(s: Strategy) {
+  delStrategy.value = s
+  delErr.value = ''
+  delOpen.value = true
+}
+
+async function confirmRemoveStrategy() {
+  const s = delStrategy.value
+  if (!s || delBusy.value) return
+  delBusy.value = true
+  delErr.value = ''
+  try {
+    await deleteStrategy(s.id)
+    delOpen.value = false
+    toast.success('策略已删除', s.name)
+    await load()
+  } catch (e: unknown) {
+    delErr.value = (e as { message?: string }).message ?? '删除失败'
+  } finally {
+    delBusy.value = false
+  }
+}
 
 async function load() {
   loading.value = true
@@ -112,7 +141,17 @@ onMounted(load)
               <div class="flex h-9 w-9 items-center justify-center rounded-lg tint-primary text-primary-ink dark:text-primary">
                 <FlaskConical :size="17" />
               </div>
-              <span class="text-[11px] text-subtle">{{ timeAgo(s.created_at) }}</span>
+              <div class="flex items-center gap-2">
+                <span class="text-[11px] text-subtle">{{ timeAgo(s.created_at) }}</span>
+                <button
+                  class="rounded-md p-1 text-subtle opacity-0 transition-colors hover:bg-danger/10 hover:text-danger focus-visible:opacity-100 group-hover:opacity-100"
+                  :title="`删除策略 ${s.name}`"
+                  :aria-label="`删除策略 ${s.name}`"
+                  @click.stop.prevent="openDelete(s)"
+                >
+                  <Trash2 :size="13" />
+                </button>
+              </div>
             </div>
             <h3 class="mt-3 flex items-center gap-1 text-[15px] font-semibold text-fg">
               <span class="truncate">{{ s.name }}</span>
@@ -160,6 +199,30 @@ onMounted(load)
           <button class="btn btn-ghost" @click="showCreate = false">取消</button>
           <button class="btn btn-primary" :disabled="creating || !form.name.trim()" @click="submit">
             {{ creating ? '创建中…' : '创建并进入研究' }}
+          </button>
+        </div>
+      </template>
+    </Modal>
+
+    <!-- 删除策略确认弹窗 -->
+    <Modal
+      :open="delOpen"
+      :title="`删除策略 · ${delStrategy?.name ?? ''}`"
+      sub="策略下的全部版本与回测记录会一并删除"
+      width="520px"
+      @close="delOpen = false"
+    >
+      <div class="space-y-3">
+        <p class="text-[13px] leading-relaxed text-muted">
+          确定要删除策略“{{ delStrategy?.name }}”吗？其全部版本与回测记录将一并移除，且不可恢复。
+        </p>
+        <p v-if="delErr" class="rounded-lg border border-down/30 bg-down/10 px-3 py-2 text-xs text-down">{{ delErr }}</p>
+      </div>
+      <template #footer>
+        <div class="flex items-center justify-end gap-2">
+          <button class="btn btn-ghost" :disabled="delBusy" @click="delOpen = false">取消</button>
+          <button class="btn btn-danger-ghost" :disabled="delBusy || !!delErr" @click="confirmRemoveStrategy">
+            <LoaderCircle v-if="delBusy" :size="14" class="animate-spin" />{{ delBusy ? '删除中…' : '删除策略' }}
           </button>
         </div>
       </template>

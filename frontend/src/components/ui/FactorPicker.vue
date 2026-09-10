@@ -2,6 +2,7 @@
 import { computed, ref } from 'vue'
 import { Check, Search } from '@lucide/vue'
 import type { FactorMeta } from '@/api/factor'
+import { MAX_ML_FEATURES } from '@/utils/format'
 
 const props = withDefaults(
   defineProps<{
@@ -10,7 +11,7 @@ const props = withDefaults(
     max?: number
     ic?: Record<string, number | null>
   }>(),
-  { max: 12 },
+  { max: MAX_ML_FEATURES },
 )
 
 const emit = defineEmits<{

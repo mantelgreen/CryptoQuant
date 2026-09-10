@@ -9,9 +9,11 @@ import {
   Play,
   Plus,
   RefreshCw,
+  Trash2,
 } from '@lucide/vue'
 import {
   createVersion,
+  deleteBacktest,
   getBacktest,
   getStrategy,
   listBacktests,
@@ -63,6 +65,7 @@ const activeVersionId = ref<string | null>(null)
 const detailLoading = ref(false)
 const listLoading = ref(true)
 const pageError = ref<string | null>(null)
+const removingBacktest = ref<string | null>(null)
 
 // —— 运行配置 ——
 const runSymbol = ref('BTCUSDT')
@@ -132,6 +135,24 @@ async function openDetail(id: string) {
     toast.error('回测详情加载失败', (e as { message?: string }).message)
   } finally {
     detailLoading.value = false
+  }
+}
+
+async function removeBacktest(b: Backtest) {
+  if (!window.confirm(`删除这次回测（${b.id.slice(0, 8)} · ${b.symbols[0]}/${b.interval}）？其资金曲线与成交明细会一并删除。`)) return
+  removingBacktest.value = b.id
+  try {
+    await deleteBacktest(b.id)
+    toast.success('回测已删除', `${b.symbols[0]} ${b.interval} · ${b.id.slice(0, 8)}`)
+    stopPoll()
+    closeSse()
+    await loadBacktests()
+    if (detail.value?.backtest.id === b.id) detail.value = null
+    if (backtests.value.length) await openDetail(backtests.value[0].id)
+  } catch (e: unknown) {
+    toast.error('删除失败', (e as { message?: string }).message)
+  } finally {
+    removingBacktest.value = null
   }
 }
 
@@ -305,6 +326,9 @@ const metricCards: Array<{ key: string; label: string; fmt: 'pct' | 'ratio' | 'c
   { key: 'num_trades', label: '交易次数', fmt: 'count' },
   { key: 'volatility', label: '年化波动', fmt: 'plainPct' },
 ]
+// 读数台结构：第一行三个“决定性问题”，其余降为仪器格
+const primaryMetrics = metricCards.filter((c) => ['total_return', 'annual_return', 'max_drawdown'].includes(c.key))
+const readoutMetrics = metricCards.filter((c) => !['total_return', 'annual_return', 'max_drawdown'].includes(c.key))
 
 function metricValue(key: string): number | undefined {
   return (detail.value?.backtest.summary?.metrics as Record<string, number> | undefined)?.[key]
@@ -422,7 +446,7 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
-      <div class="grid grid-cols-1 gap-6 xl:grid-cols-5">
+      <div class="grid grid-cols-1 gap-6 xl:grid-cols-7">
         <!-- 左列：版本 + 回测历史 -->
         <div class="flex flex-col gap-6 xl:col-span-2">
           <Panel title="策略版本" :sub="`共 ${versions.length} 个版本`" :pad="'none'" flush>
@@ -466,14 +490,26 @@ onBeforeUnmount(() => {
               <li
                 v-for="b in backtests"
                 :key="b.id"
-                class="cursor-pointer px-4 py-3 transition-colors hover:bg-surface-2"
+                class="group cursor-pointer px-4 py-3 transition-colors hover:bg-surface-2"
                 :class="detail?.backtest.id === b.id ? 'bg-surface-2' : ''"
                 @click="openDetail(b.id)"
               >
                 <div class="flex items-center gap-2">
                   <StatusBadge :status="b.status" :pulse="false" />
                   <span class="font-mono text-[11px] text-subtle">{{ b.id.slice(0, 8) }}</span>
-                  <span class="ml-auto text-xs text-subtle">{{ timeAgo(b.created_at) }}</span>
+                  <span class="ml-auto flex items-center gap-1.5">
+                    <span class="text-xs text-subtle">{{ timeAgo(b.created_at) }}</span>
+                    <button
+                      class="rounded-md p-1 text-subtle opacity-0 transition-colors hover:bg-danger/10 hover:text-danger focus-visible:opacity-100 group-hover:opacity-100"
+                      :disabled="removingBacktest === b.id"
+                      :title="`删除这次回测 ${b.id.slice(0, 8)}`"
+                      :aria-label="`删除回测 ${b.id.slice(0, 8)}`"
+                      @click.stop.prevent="removeBacktest(b)"
+                    >
+                      <LoaderCircle v-if="removingBacktest === b.id" :size="13" class="animate-spin" />
+                      <Trash2 v-else :size="13" />
+                    </button>
+                  </span>
                 </div>
                 <p class="mt-1.5 text-xs text-muted">
                   <span class="font-semibold text-fg">{{ b.symbols[0] }}</span>
@@ -491,10 +527,24 @@ onBeforeUnmount(() => {
               </li>
             </ul>
           </Panel>
+
+          <!-- AI 复盘：跟随所选回测记录 -->
+          <Panel v-if="detail?.backtest?.status === 'succeeded'" title="AI 复盘" :sub="reviewModel ? `由 ${reviewModel} 生成 · 已计入 LLM 用量` : '让大模型解读这次回测的结果、风险与改进点'">
+            <template #actions>
+              <button class="btn btn-soft !h-8 text-xs" :disabled="reviewing || !detail?.backtest.summary" @click="runReview">
+                <LoaderCircle v-if="reviewing" :size="13" class="animate-spin" />
+                {{ reviewText ? '重新复盘' : 'AI 复盘' }}
+              </button>
+            </template>
+            <p v-if="reviewText" class="whitespace-pre-wrap text-[13px] leading-relaxed text-muted">{{ reviewText }}</p>
+            <p v-else class="text-xs text-subtle">
+              点击后会结合本次回测的收益/回撤/夏普/胜率/盈亏比与样本量，给出“结果说明 → 风险 → 改进建议”三段式解读（需先在「模型设置」配置默认模型）。
+            </p>
+          </Panel>
         </div>
 
         <!-- 右列：运行台 + 结果 -->
-        <div class="flex flex-col gap-6 xl:col-span-3">
+        <div class="flex flex-col gap-6 xl:col-span-5">
           <Panel title="回测运行台" sub="策略始终使用“下一根开盘价”撮合，含 0.1% 手续费与 5bps 滑点">
             <template #head>
               <span v-if="activeVersion" class="badge tone-primary">将运行 v{{ activeVersion.version }}</span>
@@ -582,70 +632,82 @@ onBeforeUnmount(() => {
                 </span>
               </div>
 
-              <!-- 指标卡 -->
-              <section>
-                <div class="mb-2 flex items-center justify-between">
-                  <h2 class="panel-title">绩效指标</h2>
-                  <span class="badge tone-primary">参考基准：现货买入持有</span>
+              <!-- 绩效读数台：三个决定性数字打头，其余降为辅助格 -->
+              <section class="panel px-5 py-4">
+                <div class="mb-3 flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <p class="panel-title">绩效读数</p>
+                    <p class="mt-0.5 text-[11px] text-subtle">先看收益与回撤，再往下核对夏普、胜率与成交质量</p>
+                  </div>
+                  <span v-if="detail.backtest.summary?.final_equity" class="badge tone-primary">
+                    终值 ${{ Number(detail.backtest.summary.final_equity).toLocaleString('en-US', { maximumFractionDigits: 0 }) }}
+                  </span>
                 </div>
-                <div class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
-                  <div v-for="c in metricCards" :key="c.key" class="panel px-4 py-3.5">
+
+                <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                  <div
+                    v-for="c in primaryMetrics"
+                    :key="c.key"
+                    class="rounded-xl border px-4 py-3.5"
+                    :class="c.key === 'max_drawdown' ? 'border-border bg-danger/[0.05]' : 'border-border bg-surface-2/50'"
+                  >
                     <p class="text-[11px] font-medium uppercase tracking-wider text-subtle">{{ c.label }}</p>
-                    <p class="num mt-1.5 text-[20px] font-semibold leading-none" :class="metricTone(c)">{{ metricText(c) }}</p>
+                    <p class="num mt-1.5 text-[28px] font-semibold leading-none tracking-tight" :class="metricTone(c)">{{ metricText(c) }}</p>
+                  </div>
+                </div>
+
+                <div class="mt-4 grid grid-cols-2 gap-x-6 gap-y-2 border-t border-border pt-3 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-7">
+                  <div v-for="c in readoutMetrics" :key="c.key" class="flex items-baseline justify-between gap-2 py-0.5">
+                    <span class="text-[11px] text-subtle">{{ c.label }}</span>
+                    <span class="num text-sm font-semibold" :class="metricTone(c)">{{ metricText(c) }}</span>
                   </div>
                 </div>
               </section>
 
-              <!-- AI 复盘 -->
-              <Panel title="AI 复盘" :sub="reviewModel ? `由 ${reviewModel} 生成 · 已计入 LLM 用量` : '让大模型解读这次回测的结果、风险与改进点'">
-                <template #actions>
-                  <button class="btn btn-soft !h-8 text-xs" :disabled="reviewing || !detail?.backtest.summary" @click="runReview">
-                    <LoaderCircle v-if="reviewing" :size="13" class="animate-spin" />
-                    {{ reviewText ? '重新复盘' : 'AI 复盘' }}
-                  </button>
-                </template>
-                <p v-if="reviewText" class="whitespace-pre-wrap text-[13px] leading-relaxed text-muted">{{ reviewText }}</p>
-                <p v-else class="text-xs text-subtle">
-                  点击后会结合本次回测的收益/回撤/夏普/胜率/盈亏比与样本量，给出“结果说明 → 风险 → 改进建议”三段式解读（需先在「模型设置」配置默认模型）。
-                </p>
-              </Panel>
-
-              <!-- 资金曲线 -->
+              <!-- 资金曲线：证据的中心 -->
               <Panel title="资金曲线" :sub="`初始资金 $100,000 · 抽样 ≤1500 点`">
-                <EquityChart v-if="equityPoints.length" :points="equityPoints" :baseline="100000" :height="300" />
+                <EquityChart v-if="equityPoints.length" :points="equityPoints" :baseline="100000" :height="360" />
                 <StateView v-else icon="chart" title="回测没有产出净值数据" desc="可能区间内没有发生交易，或历史数据为空。" />
               </Panel>
 
-              <!-- 成交明细 -->
-              <Panel v-if="detail.trades?.length" title="成交明细" :sub="`最近 ${detail.trades.length} 笔`" :pad="'none'" flush>
-                <div class="max-h-80 overflow-auto">
+              <!-- 成交明细 / 回测日志 -->
+              <Panel v-if="detail.trades?.length" title="成交明细（回测日志）" :sub="`最近 ${detail.trades.length} 笔 · 成交单价 / 买入均价 / 已实现 PnL（摊薄成本）`" :pad="'none'" flush>
+                <div class="max-h-96 overflow-auto">
                   <table class="tbl">
                     <thead>
-                      <tr>
-                        <th>时间</th>
-                        <th class="text-right">方向</th>
-                        <th class="text-right">价格</th>
-                        <th class="text-right">数量</th>
-                        <th class="text-right">手续费</th>
-                        <th class="text-right">PnL</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      <tr v-for="t in detail.trades" :key="t.id">
-                        <td class="tbl-sub font-mono">{{ fmtTime(t.ts, true) }}</td>
-                        <td>
-                          <span class="badge" :class="t.side === 'buy' ? 'tone-up' : 'tone-down'">
-                            {{ t.side === 'buy' ? '买入' : '卖出' }}
-                          </span>
-                        </td>
-                        <td class="num tbl-num text-fg">{{ t.price.toLocaleString('en-US', { maximumFractionDigits: 4 }) }}</td>
-                        <td class="num tbl-num text-muted">{{ t.qty.toFixed(6) }}</td>
-                        <td class="num tbl-num text-subtle">{{ t.fee.toFixed(4) }}</td>
-                        <td class="num tbl-num font-semibold" :class="t.pnl >= 0 ? 'text-up' : 'text-down'">
-                          {{ t.pnl >= 0 ? '+' : '' }}{{ t.pnl.toLocaleString('en-US', { maximumFractionDigits: 2 }) }}
-                        </td>
-                      </tr>
-                    </tbody>
+                          <tr>
+                            <th>时间</th>
+                            <th>币种</th>
+                            <th>操作</th>
+                            <th class="text-right">成交单价</th>
+                            <th class="text-right">买入均价</th>
+                            <th class="text-right">数量</th>
+                            <th class="text-right">手续费</th>
+                            <th class="text-right">PnL</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <tr v-for="t in detail.trades" :key="t.id">
+                            <td class="tbl-sub font-mono">{{ fmtTime(t.ts, true) }}</td>
+                            <td class="font-mono text-[11px] font-semibold text-fg">{{ t.symbol }}</td>
+                            <td>
+                              <span class="flex items-center gap-1.5">
+                                <span class="badge" :class="t.side === 'buy' ? 'tone-up' : 'tone-down'">
+                                  {{ t.side === 'buy' ? '买入' : '卖出' }}
+                                </span>
+                                <span v-if="t.reason" class="text-[11px] text-subtle">{{ t.reason }}</span>
+                              </span>
+                              <span v-if="t.position != null" class="mt-0.5 block text-[10px] text-subtle">仓后 {{ t.position.toFixed(3) }}</span>
+                            </td>
+                            <td class="num tbl-num text-fg">{{ t.price.toLocaleString('en-US', { maximumFractionDigits: 6 }) }}</td>
+                            <td class="num tbl-num text-muted">{{ t.basis != null ? t.basis.toLocaleString('en-US', { maximumFractionDigits: 6 }) : '—' }}</td>
+                            <td class="num tbl-num text-muted">{{ t.qty.toFixed(6) }}</td>
+                            <td class="num tbl-num text-subtle">{{ t.fee.toFixed(4) }}</td>
+                            <td class="num tbl-num font-semibold" :class="t.pnl > 0 ? 'text-up' : t.pnl < 0 ? 'text-down' : 'text-muted'">
+                              {{ t.pnl > 0 ? '+' : '' }}{{ t.pnl.toLocaleString('en-US', { maximumFractionDigits: 2 }) }}
+                            </td>
+                          </tr>
+                        </tbody>
                   </table>
                 </div>
               </Panel>

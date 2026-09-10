@@ -94,6 +94,7 @@ export interface TrainReviewPayload {
     oos_min?: number | null
     oos_min_round?: number | null
   }
+  config?: Record<string, unknown>
 }
 
 export type TrainReviewGrade = 'ok' | 'warn' | 'bad'
@@ -106,6 +107,8 @@ export interface TrainReviewResult {
   advice: string
   keep: string[]
   drop: Array<{ code: string; reason: string }>
+  agg_keep?: string[]
+  params?: Record<string, number | string | null | undefined>
   fallback?: boolean
 }
 export async function reviewTraining(payload: TrainReviewPayload): Promise<TrainReviewResult> {

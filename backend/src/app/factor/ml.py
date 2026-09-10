@@ -24,6 +24,25 @@ from .registry import compute_factor, get_factors
 from .compute import compute_series, meta_or_extra
 from .sandbox import safe_eval_expr
 
+# 跨粒度聚合特征：用更细粒度 K 线在每根粗 bar 内汇总出的低噪声特征
+_AGG_TYPES = ("rv", "vol_imb", "taker_ratio")
+_AGG_NAMES = {
+    "agg:rv": "细粒度已实现波动率",
+    "agg:vol_imb": "量能买卖不平衡",
+    "agg:taker_ratio": "主动买占比",
+}
+_AGG_DESC = {
+    "rv": "每根粗 bar 内细粒度对数收益平方和开方（真实波动率，比收盘价 RV 更精确）",
+    "vol_imb": "细粒度 (主动买量 − 主动卖量) / 总成交量，衡量买方压力",
+    "taker_ratio": "细粒度主动买量 / 总成交量，taker 买盘占比",
+}
+_INTERVAL_SEC = {
+    "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
+    "1h": 3600, "2h": 7200, "4h": 14400, "6h": 21600, "12h": 43200,
+    "1d": 86400, "3d": 259200, "1w": 604800,
+}
+_FINE_LIMIT = 1_000_000
+
 
 def model_storage_dir() -> Path:
     """pickle 模型文件的存放目录（首次调用自动创建）。"""
@@ -59,15 +78,67 @@ async def _load_frame(repo: KlineRepository, symbol: str, interval: str, start: 
     return df.dropna(subset=["close"])
 
 
-def _rank(s: np.ndarray) -> np.ndarray:
-    order = np.argsort(np.argsort(s))
-    return order.astype(float)
+def _naive_utc_ns(values: Any) -> np.ndarray:
+    """把（可能是带时区的）时间序列规整为 naive-UTC 的 datetime64[ns]，便于跨粒度对齐。"""
+    idx = pd.DatetimeIndex(values)
+    if idx.tz is not None:
+        idx = idx.tz_convert("UTC").tz_localize(None)
+    return np.asarray(idx, dtype="datetime64[ns]")
+
+
+async def _load_fine_agg(
+    repo: KlineRepository,
+    symbol: str,
+    fine_interval: str,
+    start: datetime,
+    end: datetime,
+    coarse_index: pd.Index,
+) -> dict[str, pd.Series]:
+    """拉取细粒度 K 线，按粗 bar 逐根汇总出 rv / vol_imb / taker_ratio 三个低噪声特征。
+
+    返回以 coarse_index 为索引的 Series 字典（缺失桶为 NaN）。
+    """
+    rows = await repo.query_or_aggregate(symbol, fine_interval, start, end, limit=_FINE_LIMIT)
+    if not rows:
+        return {}
+    fdf = pd.DataFrame(rows)
+    if "open_time" not in fdf.columns or "close" not in fdf.columns:
+        return {}
+    close = pd.to_numeric(fdf["close"], errors="coerce")
+    volume = pd.to_numeric(fdf.get("volume"), errors="coerce")
+    tb = pd.to_numeric(fdf.get("taker_buy_base"), errors="coerce")
+    r = np.log(close / close.shift(1))
+
+    coarse_times = _naive_utc_ns(coarse_index)
+    fine_times = _naive_utc_ns(fdf["open_time"])
+    n_coarse = len(coarse_times)
+    if n_coarse == 0 or len(fine_times) == 0:
+        return {}
+
+    bucket = np.searchsorted(coarse_times, fine_times, side="right") - 1
+    valid = (bucket >= 0) & (bucket < n_coarse)
+
+    g = pd.DataFrame(
+        {"bucket": bucket[valid], "r2": (r.to_numpy(dtype=float) ** 2)[valid], "vol": volume.to_numpy(dtype=float)[valid], "tb": tb.to_numpy(dtype=float)[valid]}
+    ).groupby("bucket")
+
+    rv = np.sqrt(g["r2"].sum())
+    vol_sum = g["vol"].sum().replace(0, np.nan)
+    tb_sum = g["tb"].sum()
+    vol_imb = (2.0 * tb_sum - g["vol"].sum()) / vol_sum
+    taker_ratio = tb_sum / vol_sum
+
+    idx = pd.RangeIndex(n_coarse)
+    out: dict[str, pd.Series] = {}
+    for key, s in (("agg:rv", rv), ("agg:vol_imb", vol_imb), ("agg:taker_ratio", taker_ratio)):
+        out[key] = s.reindex(idx).set_axis(coarse_index).astype(float)
+    return out
 
 
 def _spearman(a: np.ndarray, b: np.ndarray) -> float:
     if a.std() == 0 or b.std() == 0 or not np.isfinite(a).all() or not np.isfinite(b).all():
         return float("nan")
-    return float(np.corrcoef(_rank(a), _rank(b))[0, 1])
+    return float(pd.Series(a).rank().corr(pd.Series(b)))
 
 
 def _zscore(X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -75,6 +146,20 @@ def _zscore(X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     sd = X.std(axis=0)
     sd[sd == 0] = 1.0
     return (X - mu) / sd, sd
+
+
+def _clip_bounds(a: np.ndarray, q: float) -> tuple[np.ndarray, np.ndarray]:
+    """逐列计算 Winsorize 上下界（q / 1-q 分位数，用于钳制厚尾离群值）。"""
+    lo = np.nanquantile(a, q, axis=0)
+    hi = np.nanquantile(a, 1.0 - q, axis=0)
+    return lo, hi
+
+
+def _std_feature(s: pd.Series, f: dict[str, Any]) -> pd.Series:
+    """按模型保存的 clip 上下界与 mean/std 对单列特征做稳健标准化（打分时与训练口径一致）。"""
+    if f.get("clip_low") is not None and f.get("clip_high") is not None:
+        s = s.clip(float(f["clip_low"]), float(f["clip_high"]))
+    return (s - float(f["mean"] or 0.0)) / float(f["std"] or 1.0)
 
 
 def _pearson_arr(a: np.ndarray, b: np.ndarray) -> float:
@@ -110,7 +195,7 @@ def _filter_high_corr(
             removed.append(
                 {
                     "code": names[idx],
-                    "name": get_factors().get(names[idx], {}).get("name", names[idx]),
+                    "name": get_factors().get(names[idx], {}).get("name", _AGG_NAMES.get(names[idx], names[idx])),
                     "dropped_because": f"与 {names[dup]} |相关|={corr[idx, dup]:.3f} > {threshold}",
                 }
             )
@@ -227,6 +312,10 @@ async def run_ml_research(
     test_ratio: float = 0.25,
     alpha: float = 1.0,
     max_corr: float | None = 0.85,
+    winsor: float | None = None,
+    cost_bps: float = 0.0,
+    fine_interval: str | None = None,
+    agg_features: list[str] | None = None,
     model: str = "ridge",
     learning_rate: float = 0.05,
     n_estimators: int = 240,
@@ -239,7 +328,22 @@ async def run_ml_research(
 ) -> dict[str, Any]:
     """训练多因子（内置或用户表达式因子），返回样本外评价。extras 提供用户因子 code→{expression,...}。"""
     valid = [c for c in codes if meta_or_extra(c, extras) is not None]
-    if not valid:
+
+    # 跨粒度聚合：仅当 fine_interval 确比 interval 更细且可整除时启用
+    agg_codes: list[str] = []
+    if fine_interval:
+        fi_sec = _INTERVAL_SEC.get(fine_interval)
+        it_sec = _INTERVAL_SEC.get(interval)
+        if fi_sec and it_sec and fi_sec < it_sec and it_sec % fi_sec == 0:
+            seen: set[str] = set()
+            for t in agg_features or []:
+                if t in _AGG_TYPES and t not in seen:
+                    seen.add(t)
+                    agg_codes.append(f"agg:{t}")
+        else:
+            fine_interval = None
+
+    if not valid and not agg_codes:
         return {"found": False, "message": "没有可用因子代码或表达式不可用"}
 
     Xtr_parts: list[np.ndarray] = []
@@ -264,9 +368,14 @@ async def run_ml_research(
                 frame[code] = compute_series(code, df, extras)
             except (KeyError, ValueError):
                 continue
+        agg_series: dict[str, pd.Series] = {}
+        if agg_codes and fine_interval:
+            agg_series = await _load_fine_agg(repo, sym, fine_interval, start, end, df.index)
+        for acode in agg_codes:
+            frame[acode] = agg_series.get(acode, pd.Series(np.nan, index=df.index))
         fdf = pd.DataFrame(frame)
-        fdf["label"] = fdf["close"].pct_change(periods=horizon).shift(-horizon)
-        cols = valid
+        fdf["label"] = fdf["close"].pct_change(periods=horizon, fill_method=None).shift(-horizon)
+        cols = valid + agg_codes
         sub = fdf[[*cols, "label"]].dropna()
         if len(sub) < 60:
             continue
@@ -308,11 +417,27 @@ async def run_ml_research(
     yte = np.concatenate(yte_parts)
     te_time = np.concatenate(te_time_parts) if te_time_parts else np.array([], dtype="datetime64[ns]")
 
+    # —— 稳健化：用训练集分位数对特征与标签做 Winsorize，钳制厚尾离群值 ——
+    # 特征需 train/test 同口径钳制（打分时同样用这些边界）；标签只对训练目标稳健化，
+    # 样本外评价仍用原始收益，保证 IC/价差/命中率反映真实可交易表现。
+    clip_low: np.ndarray | None = None
+    clip_high: np.ndarray | None = None
+    if winsor is not None and 0.0 < winsor < 0.5:
+        clip_low, clip_high = _clip_bounds(Xtr, winsor)
+        Xtr = np.clip(Xtr, clip_low, clip_high)
+        Xte = np.clip(Xte, clip_low, clip_high)
+        y_lo = float(np.quantile(ytr, winsor))
+        y_hi = float(np.quantile(ytr, 1.0 - winsor))
+        ytr = np.clip(ytr, y_lo, y_hi)
+
     # —— 特征相关性去冗余（训练集内） ——
     keep_idx, removed_feats = _filter_high_corr(Xtr, ytr, feature_cols, max_corr)
     feature_cols = [feature_cols[i] for i in keep_idx]
     Xtr = Xtr[:, keep_idx]
     Xte = Xte[:, keep_idx]
+    if clip_low is not None and clip_high is not None:
+        clip_low = clip_low[keep_idx]
+        clip_high = clip_high[keep_idx]
 
     model_name = model if model in ("ridge", "gbdt") else "ridge"
     Xtr_z, _ = _zscore(Xtr)
@@ -320,6 +445,12 @@ async def run_ml_research(
     sd = Xtr.std(axis=0)
     sd[sd == 0] = 1.0
     Xte_z = (Xte - mu) / sd
+
+    # LightGBM 超参先做联合约束：max_depth>0 时需满足 num_leaves <= 2^max_depth，否则训练期抛 LightGBMError
+    max_depth_v = max(-1, int(max_depth))
+    num_leaves_v = max(2, int(num_leaves))
+    if max_depth_v > 0:
+        num_leaves_v = min(num_leaves_v, 2 ** max_depth_v)
 
     learning: dict[str, Any] | None = None
     if model_name == "gbdt":
@@ -330,8 +461,10 @@ async def run_ml_research(
         lgb_params: dict[str, Any] = {
             "n_estimators": max(10, int(n_estimators)),
             "learning_rate": float(learning_rate),
-            "max_depth": max(-1, int(max_depth)),
-            "num_leaves": max(2, int(num_leaves)),
+            "max_depth": max_depth_v,
+            "num_leaves": num_leaves_v,
+            # 收益量级 ~1e-3，lambda_l2 需按此缩放到温和区间（alpha=1 → 1e-3），否则会把叶子值压向 0
+            "lambda_l2": max(0.0, float(alpha)) * 1e-3,
             "subsample": min(1.0, max(0.1, float(subsample))),
             "colsample_bytree": min(1.0, max(0.1, float(colsample_bytree))),
             "random_state": 7,
@@ -385,14 +518,28 @@ async def run_ml_research(
         pred_train = Xtr_z @ w
     else:
         pred_train = booster.predict(Xtr_z)
+
+    # —— 方向自校准：若模型整体“反向”（OOS RankIC<0），统一翻转为“高预测分=高未来收益”，
+    #    使 hit / Top−Bottom 价差 / OOS IC 与下游“高分做多”语义一致。
+    pred_flip = 1.0
+    raw_rank = _spearman(pred, yte)
+    if not math.isnan(raw_rank) and raw_rank < 0:
+        pred_flip = -1.0
+        pred = -pred
+        pred_train = -pred_train
+
     train_ic = _pearson(pred_train, ytr)
-    oos_ic_raw = _pearson(pred, yte)
-    oos_ic = oos_ic_raw
+    oos_ic = _pearson(pred, yte)
     overfit_gap = (
         abs(train_ic - oos_ic) if not math.isnan(train_ic) and not math.isnan(oos_ic) else None
     )
     oos_rank_ic = _spearman(pred, yte)
-    hit = float(np.mean(np.sign(pred) == np.sign(yte)))
+    nz = np.abs(yte) > 1e-12
+    hit = (
+        float(np.mean(np.sign(pred[nz]) == np.sign(yte[nz])))
+        if int(nz.sum()) > 0
+        else float("nan")
+    )
 
     # top/bottom 20% 平均未来收益差（长空价差代理）
     k = max(5, int(len(pred) * 0.2))
@@ -401,6 +548,13 @@ async def run_ml_research(
     top = order[-k:]
     top_mean = float(yte[top].mean())
     btm_mean = float(yte[bottom].mean())
+    spread = top_mean - btm_mean
+    net_spread = spread - float(cost_bps) / 1e4
+
+    # —— 模型退化体检：预测近似常值（唯一取值极少 / 标准差极小）意味着几乎无择时区分度 ——
+    pred_nunique = int(len(np.unique(np.round(pred, 10)))) if pred.size else 0
+    pred_std = float(np.std(pred)) if pred.size else 0.0
+    degenerate = bool(pred.size > 0 and (pred_nunique < 20 or pred_nunique < 0.05 * pred.size))
 
     univariate: list[dict[str, Any]] = []
     for i, code in enumerate(feature_cols):
@@ -410,7 +564,7 @@ async def run_ml_research(
         univariate.append(
             {
                 "code": code,
-                "name": (meta_or_extra(code, extras) or {}).get("name", code),
+                "name": _AGG_NAMES.get(code) or (meta_or_extra(code, extras) or {}).get("name", code),
                 "coef": round(float(w[i]), 5),
                 "ic_oos": round(ui, 5) if not math.isnan(ui) else None,
                 "rank_ic_oos": round(ur, 5) if not math.isnan(ur) else None,
@@ -429,21 +583,37 @@ async def run_ml_research(
         "horizon": horizon,
         "alpha": alpha,
         "max_corr": max_corr,
+        "winsor": winsor,
+        "cost_bps": cost_bps,
+        "fine_interval": fine_interval,
+        "agg_features": agg_codes,
         "hyperparams": {
             "learning_rate": learning_rate,
             "n_estimators": n_estimators,
-            "max_depth": max_depth,
-            "num_leaves": num_leaves,
+            "max_depth": max_depth_v,
+            "num_leaves": num_leaves_v,
+            "lambda_l2": max(0.0, float(alpha)) * 1e-3,
             "subsample": subsample,
             "colsample_bytree": colsample_bytree,
         },
         "features": [
             {
                 **{"code": code, "coef": float(w[i]), "mean": float(mu[i]), "std": float(sd[i])},
+                **(
+                    {"name": _AGG_NAMES.get(code), "aggregate": {"type": code.split(":", 1)[1], "fine_interval": fine_interval}}
+                    if code.startswith("agg:") and fine_interval
+                    else {}
+                ),
+                **(
+                    {"clip_low": float(clip_low[i]), "clip_high": float(clip_high[i])}
+                    if clip_low is not None and clip_high is not None
+                    else {}
+                ),
                 **({"expression": extras[code]["expression"]} if extras and code in extras else {}),
             }
             for i, code in enumerate(feature_cols)
         ],
+        "flip": pred_flip,
         "booster": booster if model_name == "gbdt" else None,
     }
 
@@ -454,6 +624,10 @@ async def run_ml_research(
         "symbols": used_symbols,
         "interval": interval,
         "horizon": horizon,
+        "winsor": winsor,
+        "cost_bps": cost_bps,
+        "fine_interval": fine_interval,
+        "agg_features": agg_codes,
         "test_windows": test_windows,
         "n_train": int(len(ytr)),
         "n_test": int(len(yte)),
@@ -463,10 +637,15 @@ async def run_ml_research(
         "train_ic": round(train_ic, 5) if not math.isnan(train_ic) else None,
         "overfit_gap": round(overfit_gap, 5) if overfit_gap is not None else None,
         "n_features_kept": len(feature_cols),
-        "hit_rate": round(hit, 5),
+        "hit_rate": round(hit, 5) if not math.isnan(hit) else None,
         "top_quintile_mean_ret": round(top_mean, 6),
         "bottom_quintile_mean_ret": round(btm_mean, 6),
-        "spread": round(top_mean - btm_mean, 6),
+        "spread": round(spread, 6),
+        "net_spread": round(net_spread, 6),
+        "pred_nunique": pred_nunique,
+        "pred_std": round(pred_std, 8),
+        "degenerate": degenerate,
+        "flip": pred_flip,
         "features": univariate,
         "oos_charts": oos_charts,
     }
@@ -502,11 +681,20 @@ async def score_with_model(
         return {"found": False, "message": "模型特征参数缺失"}
 
     series: dict[str, pd.Series] = {}
+    agg_feats = [f for f in features if f.get("aggregate")]
+    agg_series: dict[str, pd.Series] = {}
+    if agg_feats:
+        fine_interval = agg_feats[0].get("aggregate", {}).get("fine_interval")
+        if fine_interval:
+            agg_series = await _load_fine_agg(repo, symbol, str(fine_interval), start, end, df.index)
     for f in features:
         code = f["code"]
         try:
             if f.get("expression"):
                 series[code] = safe_eval_expr(str(f["expression"]), df).astype(float)
+            elif f.get("aggregate"):
+                if code in agg_series:
+                    series[code] = agg_series[code]
             elif code in get_factors():
                 series[code] = compute_factor(code, df)
         except Exception:  # noqa: BLE001
@@ -530,7 +718,7 @@ async def score_with_model(
         cols = [f["code"] for f in feats]
         z = fdf[cols].copy()
         for f in feats:
-            z[f["code"]] = (z[f["code"]] - float(f["mean"] or 0.0)) / float(f["std"] or 1.0)
+            z[f["code"]] = _std_feature(z[f["code"]], f)
         pred = booster.predict(z.to_numpy(dtype=float))
         score = pd.Series(pred, index=fdf.index)
     else:
@@ -539,8 +727,13 @@ async def score_with_model(
             code = f["code"]
             if code not in fdf.columns:
                 continue
-            z = (fdf[code] - float(f["mean"] or 0.0)) / float(f["std"] or 1.0)
+            z = _std_feature(fdf[code], f)
             score = score + float(f["coef"] or 0.0) * z
+
+    # 方向自校准：保存时若 OOS 整体反向已做 flip=-1，这里同样取反，保证“高分为多”
+    flip = float((model.get("dataset") or {}).get("flip", 1) or 1)
+    if flip < 0:
+        score = -score
 
     pts = score.iloc[-limit:]
     return {
@@ -548,6 +741,7 @@ async def score_with_model(
         "symbol": symbol,
         "interval": interval,
         "model_type": model_type,
+        "flip": flip,
         "n": int(len(pts)),
         "last_score": round(float(pts.iloc[-1]), 6) if len(pts) else None,
         "points": [

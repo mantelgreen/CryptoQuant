@@ -51,12 +51,20 @@ async def sim_auto_tick_task(ctx, account_id: str):  # noqa: ARG001
             await run_auto_tick(session, account)
 
 
+async def run_pipeline_round_task(ctx, run_id: str, round_no: int):
+    """ARQ 任务：AI 流水线执行一轮（一轮一 job，跑完自行入队下一轮）。"""
+    from ..pipeline.worker import run_pipeline_round_task as _impl
+
+    await _impl(ctx, run_id, round_no)
+
+
 class WorkerSettings:
     functions = [
         download_klines_task,
         sync_incremental_klines_task,
         run_backtest_task,
         sim_auto_tick_task,
+        run_pipeline_round_task,
     ]
     redis_settings = RedisSettings.from_dsn(settings.REDIS_URL)
     max_jobs = 3

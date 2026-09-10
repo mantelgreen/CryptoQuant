@@ -55,5 +55,39 @@ services:
       timeout: 5s
       retries: 10
 
+  worker:
+    build:
+      context: ./backend
+    container_name: cq_worker
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - ./backend/.env
+    environment:
+      DATABASE_HOST: postgres
+      REDIS_HOST: redis
+    command: ["python", "-m", "arq", "app.job.arq_app.WorkerSettings"]
+
+  scheduler:
+    build:
+      context: ./backend
+    container_name: cq_scheduler
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - ./backend/.env
+    environment:
+      DATABASE_HOST: postgres
+      REDIS_HOST: redis
+    command: ["python", "-m", "app.job.scheduler"]
+
 volumes:
   pgdata:

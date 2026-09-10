@@ -14,6 +14,7 @@ from .api.v1 import factor as factor_router
 from .api.v1 import health as health_router
 from .api.v1 import llm as llm_router
 from .api.v1 import market as market_router
+from .api.v1 import pipeline as pipeline_router
 from .api.v1 import sim as sim_router
 from .api.v1 import strategy as strategy_router
 from .core.config import get_settings
@@ -79,6 +80,7 @@ def create_app() -> FastAPI:
     app.include_router(analytics_router.router, prefix="/api/v1")
     app.include_router(sim_router.router, prefix="/api/v1")
     app.include_router(llm_router.router, prefix="/api/v1")
+    app.include_router(pipeline_router.router, prefix="/api/v1")
     app.include_router(market_ws_router)
 
     return app

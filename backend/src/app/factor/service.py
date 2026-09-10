@@ -41,14 +41,14 @@ def _spearman(a: pd.Series, b: pd.Series) -> float:
 def _single_metrics(factor: pd.Series, close: pd.Series) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for h in HORIZONS:
-        fwd = close.pct_change(periods=h).shift(-h)
+        fwd = close.pct_change(periods=h, fill_method=None).shift(-h)
         pair = pd.concat([factor, fwd], axis=1).dropna()
         if len(pair) < 30:
             out[f"ic_{h}"] = None
             continue
         fac = pair.iloc[:, 0]
         ret = pair.iloc[:, 1]
-        ic = float(fac.corr(ret)) if ret.std() > 0 else float("nan")
+        ic = float(fac.corr(ret)) if ret.std() > 0 and fac.std() > 0 else float("nan")
         out[f"ic_{h}"] = round(ic, 5) if not math.isnan(ic) else None
     return out
 
@@ -87,13 +87,14 @@ async def research_factor(
         close = df["close"]
         ic = _single_metrics(factor, close)
 
-        fwd = close.pct_change().shift(-1)
+        fwd = close.pct_change(fill_method=None).shift(-1)
         pair = pd.concat([factor, fwd], axis=1).dropna()
         sym_result: dict[str, Any] = {"symbol": sym, "n": int(len(pair))}
+        total_n += len(pair)
         if len(pair) >= 30:
             fac = pair.iloc[:, 0]
             ret = pair.iloc[:, 1]
-            if ret.std() > 0:
+            if ret.std() > 0 and fac.std() > 0:
                 p_ic = float(fac.corr(ret))
                 r_ic = _spearman(fac, ret)
                 if not math.isnan(p_ic):
@@ -102,7 +103,6 @@ async def research_factor(
                 if not math.isnan(r_ic):
                     agg_rank.append(r_ic)
                     sym_result["rank_ic"] = round(r_ic, 5)
-            total_n += len(pair)
         else:
             sym_result["note"] = "样本不足(<30)"
         for h in HORIZONS:
@@ -158,8 +158,8 @@ async def matrix_factor(
     if not valid:
         return {"found": False, "message": "没有可用的因子代码", "factors": [], "corr": []}
 
-    corr_sum: np.ndarray | None = None
-    corr_n = 0
+    corr_sum: pd.DataFrame | None = None
+    corr_cnt: pd.DataFrame | None = None
     ic_rows: dict[str, list[float]] = {c: [] for c in valid}
     rank_rows: dict[str, list[float]] = {c: [] for c in valid}
 
@@ -181,17 +181,18 @@ async def matrix_factor(
         fdf = pd.DataFrame(series).dropna()
         if len(fdf) < 30:
             continue
-        cm = fdf.corr().to_numpy()
-        corr_sum = cm if corr_sum is None else corr_sum + cm
-        corr_n += 1
+        cm = fdf.corr()
+        cm_cnt = cm.notna().astype(int)
+        corr_sum = cm if corr_sum is None else corr_sum.add(cm, fill_value=0.0)
+        corr_cnt = cm_cnt if corr_cnt is None else corr_cnt.add(cm_cnt, fill_value=0)
 
-        fwd = df["close"].pct_change().shift(-1)
+        fwd = df["close"].pct_change(fill_method=None).shift(-1)
         for code, col in series.items():
             pair = pd.concat([col, fwd], axis=1).dropna()
             if len(pair) < 30:
                 continue
             fac, ret = pair.iloc[:, 0], pair.iloc[:, 1]
-            if ret.std() > 0:
+            if ret.std() > 0 and fac.std() > 0:
                 p_ic = float(fac.corr(ret))
                 r_ic = _spearman(fac, ret)
                 if not math.isnan(p_ic):
@@ -199,10 +200,11 @@ async def matrix_factor(
                 if not math.isnan(r_ic):
                     rank_rows[code].append(r_ic)
 
-    if corr_sum is None or corr_n == 0:
+    if corr_sum is None or corr_cnt is None:
         return {"found": False, "message": "窗口内数据不足，无法计算相关矩阵", "factors": [], "corr": []}
 
-    corr = (corr_sum / corr_n).round(5).tolist()
+    corr_avg = corr_sum.div(corr_cnt.where(corr_cnt > 0)).reindex(index=valid, columns=valid)
+    corr = corr_avg.fillna(0.0).round(5).to_numpy().tolist()
     factors = [
         {
             "code": code,
@@ -233,7 +235,7 @@ async def research_expression(
         return {"found": False, "expression": expression, "ok": False, "errors": [str(exc)]}
     close = df["close"]
     metrics = _single_metrics(factor, close)
-    fwd = close.pct_change().shift(-1)
+    fwd = close.pct_change(fill_method=None).shift(-1)
     pair = pd.concat([factor, fwd], axis=1).dropna()
     if len(pair) < 30:
         return {
@@ -338,7 +340,10 @@ async def list_factor_catalog(db) -> list[dict[str, Any]]:
     """内置因子 + 用户/AI 生成因子（表达式因子，带 is_user/expression）。"""
     from .repo import UserFactorRepository
 
-    builtins = [{k: v for k, v in meta.items() if k != "fn"} for meta in get_factors().values()]
+    builtins = [
+        {"code": code, **{k: v for k, v in meta.items() if k != "fn"}}
+        for code, meta in get_factors().items()
+    ]
     user_items = []
     for r in await UserFactorRepository(db).list():
         tags = r.get("tags") or ["AI"]
@@ -377,6 +382,23 @@ async def join_user_factor(
         tags=tags or ["AI"],
     )
     return str(fid)
+
+
+async def tag_quality_factors(db, codes: list[str], tag: str = "优质") -> int:
+    """把流水线验证通过的优质因子打上标签（在因子库凸显）。返回成功打标的因子数。"""
+    from uuid import UUID
+
+    from .repo import UserFactorRepository
+
+    repo = UserFactorRepository(db)
+    done = 0
+    for code in codes:
+        try:
+            await repo.add_tag(UUID(str(code)), tag)
+            done += 1
+        except (ValueError, TypeError):
+            continue
+    return done
 
 
 async def check_user_factor_usage(db, factor_id) -> dict[str, Any]:
@@ -481,6 +503,10 @@ async def train_factor_model(
     alpha: float = 1.0,
     model: str = "ridge",
     max_corr: float | None = 0.85,
+    winsor: float | None = None,
+    cost_bps: float = 0.0,
+    fine_interval: str | None = None,
+    agg_features: list[str] | None = None,
     learning_rate: float = 0.05,
     n_estimators: int = 240,
     max_depth: int = 3,
@@ -503,6 +529,10 @@ async def train_factor_model(
         test_ratio=test_ratio,
         alpha=alpha,
         max_corr=max_corr,
+        winsor=winsor,
+        cost_bps=cost_bps,
+        fine_interval=fine_interval,
+        agg_features=agg_features,
         model=model,
         learning_rate=learning_rate,
         n_estimators=n_estimators,
@@ -514,7 +544,7 @@ async def train_factor_model(
     )
 
 
-async def persist_trained_model(
+async def train_factor_model_full(
     db,
     *,
     codes: list[str],
@@ -522,12 +552,15 @@ async def persist_trained_model(
     interval: str,
     start: datetime,
     end: datetime,
-    name: str,
     horizon: int = 1,
     test_ratio: float = 0.25,
     alpha: float = 1.0,
     model: str = "ridge",
     max_corr: float | None = 0.85,
+    winsor: float | None = None,
+    cost_bps: float = 0.0,
+    fine_interval: str | None = None,
+    agg_features: list[str] | None = None,
     learning_rate: float = 0.05,
     n_estimators: int = 240,
     max_depth: int = 3,
@@ -535,16 +568,12 @@ async def persist_trained_model(
     subsample: float = 0.9,
     colsample_bytree: float = 0.9,
 ) -> dict[str, Any]:
-    """训练并把模型 artifact 落库：ridge 落线性权重；gbdt 序列化到磁盘，DB 记 model_path。"""
-    from uuid import uuid4
-
-    from .ml import run_ml_research, save_model_pickle
-
-    from .repo import MlModelRepository
+    """训练多因子模型并返回含 artifact 的完整结果（供流水线回测/入库复用，避免二次训练）。"""
+    from .ml import run_ml_research
 
     repo = KlineRepository(db)
     extras = await build_extras_for_codes(db, codes)
-    resp = await run_ml_research(
+    return await run_ml_research(
         repo,
         codes,
         symbols,
@@ -555,6 +584,10 @@ async def persist_trained_model(
         test_ratio=test_ratio,
         alpha=alpha,
         max_corr=max_corr,
+        winsor=winsor,
+        cost_bps=cost_bps,
+        fine_interval=fine_interval,
+        agg_features=agg_features,
         model=model,
         learning_rate=learning_rate,
         n_estimators=n_estimators,
@@ -565,9 +598,31 @@ async def persist_trained_model(
         extras=extras,
         return_artifact=True,
     )
-    if not resp.get("found") or "artifact" not in resp:
-        raise ValueError(resp.get("message") or "训练失败，无法保存")
-    artifact = resp["artifact"]
+
+
+async def persist_model_artifact(
+    db,
+    *,
+    name: str,
+    model: str,
+    interval: str,
+    horizon: int,
+    symbols: list[str],
+    artifact: dict[str, Any],
+    resp: dict[str, Any],
+    start: datetime,
+    end: datetime,
+    test_ratio: float,
+    winsor: float | None,
+    cost_bps: float,
+) -> dict[str, Any]:
+    """把已训练好的 artifact 落库（不重训）。ridge 落线性权重；gbdt 序列化到磁盘，DB 记 model_path。"""
+    from uuid import uuid4
+
+    from .ml import save_model_pickle
+
+    from .repo import MlModelRepository
+
     mid = None
     model_path = None
     if artifact.get("model") == "gbdt":
@@ -603,8 +658,13 @@ async def persist_trained_model(
             "end": end.isoformat(),
             "test_ratio": test_ratio,
             "horizon": horizon,
+            "winsor": winsor,
+            "cost_bps": cost_bps,
+            "fine_interval": resp.get("fine_interval"),
+            "agg_features": resp.get("agg_features") or [],
             "n_train": resp.get("n_train", 0),
             "n_test": resp.get("n_test", 0),
+            "flip": resp.get("flip", 1.0),
             "test_windows": resp.get("test_windows") or [],
         },
     )
@@ -623,6 +683,74 @@ async def persist_trained_model(
     }
 
 
+async def persist_trained_model(
+    db,
+    *,
+    codes: list[str],
+    symbols: list[str],
+    interval: str,
+    start: datetime,
+    end: datetime,
+    name: str,
+    horizon: int = 1,
+    test_ratio: float = 0.25,
+    alpha: float = 1.0,
+    model: str = "ridge",
+    max_corr: float | None = 0.85,
+    winsor: float | None = None,
+    cost_bps: float = 0.0,
+    fine_interval: str | None = None,
+    agg_features: list[str] | None = None,
+    learning_rate: float = 0.05,
+    n_estimators: int = 240,
+    max_depth: int = 3,
+    num_leaves: int = 7,
+    subsample: float = 0.9,
+    colsample_bytree: float = 0.9,
+) -> dict[str, Any]:
+    """训练并把模型 artifact 落库：ridge 落线性权重；gbdt 序列化到磁盘，DB 记 model_path。"""
+    resp = await train_factor_model_full(
+        db,
+        codes=codes,
+        symbols=symbols,
+        interval=interval,
+        start=start,
+        end=end,
+        horizon=horizon,
+        test_ratio=test_ratio,
+        alpha=alpha,
+        max_corr=max_corr,
+        winsor=winsor,
+        cost_bps=cost_bps,
+        fine_interval=fine_interval,
+        agg_features=agg_features,
+        model=model,
+        learning_rate=learning_rate,
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        num_leaves=num_leaves,
+        subsample=subsample,
+        colsample_bytree=colsample_bytree,
+    )
+    if not resp.get("found") or "artifact" not in resp:
+        raise ValueError(resp.get("message") or "训练失败，无法保存")
+    return await persist_model_artifact(
+        db,
+        name=name,
+        model=model,
+        interval=interval,
+        horizon=horizon,
+        symbols=symbols,
+        artifact=resp["artifact"],
+        resp=resp,
+        start=start,
+        end=end,
+        test_ratio=test_ratio,
+        winsor=winsor,
+        cost_bps=cost_bps,
+    )
+
+
 async def list_saved_models(db, limit: int = 50) -> list[dict[str, Any]]:
     from .repo import MlModelRepository
 
@@ -632,6 +760,8 @@ async def list_saved_models(db, limit: int = 50) -> list[dict[str, Any]]:
         for f in row.get("features") or []:
             code = f.get("code")
             if not code:
+                continue
+            if f.get("name"):
                 continue
             name = names.get(code)
             f["name"] = name or (f"expr:{(f.get('expression') or '')[:18]}" if f.get("expression") else code)

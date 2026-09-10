@@ -77,3 +77,57 @@ async def start_backtest(
         await redis.aclose()
 
     return {"backtest_id": str(bid), "status": "queued"}
+
+
+async def delete_backtest(db: AsyncSession, backtest_id: UUID) -> bool:
+    """删除一次回测及其资金曲线 / 成交记录。返回是否存在。"""
+    from sqlalchemy import select
+
+    from ...data.models.orm import backtest_trades_table, backtests_table, equity_curves_table
+
+    bt, tr, eq = backtests_table(), backtest_trades_table(), equity_curves_table()
+
+    res = await db.execute(select(bt.c.id).where(bt.c.id == backtest_id))
+    if res.first() is None:
+        return False
+
+    await db.execute(tr.delete().where(tr.c.backtest_id == backtest_id))
+    await db.execute(eq.delete().where(eq.c.run_type == "backtest", eq.c.run_id == backtest_id))
+    await db.execute(bt.delete().where(bt.c.id == backtest_id))
+    await db.commit()
+    return True
+
+
+async def delete_strategy(db: AsyncSession, strategy_id: UUID) -> bool:
+    """删除策略及其全部版本与回测（含曲线/成交）。返回是否存在。"""
+    from sqlalchemy import select
+
+    from ...data.models.orm import (
+        backtest_trades_table,
+        backtests_table,
+        equity_curves_table,
+        strategies_table,
+        strategy_versions_table,
+    )
+
+    st, sv, bt, tr, eq = (
+        strategies_table(),
+        strategy_versions_table(),
+        backtests_table(),
+        backtest_trades_table(),
+        equity_curves_table(),
+    )
+
+    res = await db.execute(select(st.c.id).where(st.c.id == strategy_id))
+    if res.first() is None:
+        return False
+
+    bts = (await db.execute(select(bt.c.id).where(bt.c.strategy_id == strategy_id))).scalars().all()
+    for bid in bts:
+        await db.execute(tr.delete().where(tr.c.backtest_id == bid))
+        await db.execute(eq.delete().where(eq.c.run_type == "backtest", eq.c.run_id == bid))
+    await db.execute(bt.delete().where(bt.c.strategy_id == strategy_id))
+    await db.execute(sv.delete().where(sv.c.strategy_id == strategy_id))
+    await db.execute(st.delete().where(st.c.id == strategy_id))
+    await db.commit()
+    return True

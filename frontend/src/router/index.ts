@@ -43,6 +43,11 @@ const routes: RouteRecordRaw[] = [
     component: () => import('@/views/factor/AiFactorLabView.vue'),
   },
   {
+    path: '/pipeline',
+    name: 'ai-pipeline',
+    component: () => import('@/views/pipeline/PipelineView.vue'),
+  },
+  {
     path: '/train',
     name: 'ml-train',
     component: () => import('@/views/train/TrainView.vue'),

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { Check, Cpu, LoaderCircle, RefreshCw, Sparkles, X } from '@lucide/vue'
 import PageHeader from '@/components/ui/PageHeader.vue'
 import HelpDrawer, { type PageHelp } from '@/components/ui/HelpDrawer.vue'
@@ -19,7 +19,7 @@ import {
 } from '@/api/factor'
 import { reviewTraining, type TrainReviewResult, type TrainReviewPayload } from '@/api/agent'
 import { useTrainHandoffStore } from '@/stores/trainHandoff'
-import { MAJOR_SYMBOLS } from '@/utils/format'
+import { MAJOR_SYMBOLS, MAX_ML_FEATURES } from '@/utils/format'
 
 const pageHelp: PageHelp = {
   title: '模型训练（ML 工坊）',
@@ -28,6 +28,7 @@ const pageHelp: PageHelp = {
     { term: '时序切分', desc: '按时间先后切 train/test（训练段在后端前加 purge 缓冲），禁止随机洗牌，避免未来信息泄漏。' },
     { term: 'train IC vs OOS IC', desc: '训练集内拟合的 IC 若远高于样本外，说明在记忆噪声；两者差距=过拟合风险。' },
     { term: '相关性过滤', desc: '训练集内两两 |相关| 超阈值即剔除，防止组合里信息冗余。' },
+    { term: '稳健化 Winsorize', desc: '用训练集分位数把特征与训练标签的极端值钳制到 [q,1-q]，抑制加密厚尾离群对 Ridge L2 与 Pearson 相关的扰动；特征钳制边界在打分时复用（无未来泄漏），样本外指标仍用原始收益。' },
     { term: '分层净值 / 十分位（诊断图）', desc: '样本外按预测分等分（十分位柱状）与五等分（分层净值曲线），看平均实际收益是否单调、高分组净值是否跑赢低分组——比单一 IC 更直观地判断“预测真能分层”。' },
     { term: 'LightGBM 训练曲线', desc: '每 boosting 轮记录 train/OOS 的 MSE。OOS 先降后升（或与 train 拉开差距）的位置即过拟合拐点；仅为展示，不影响训练与最终预测。' },
     { term: 'Top−Bottom 价差', desc: '把测试期按预测分高低各取 20%，两组实际收益均值差；>0 表示高分组确实跑赢。' },
@@ -73,6 +74,10 @@ const cfg = ref({
   model: 'ridge',
   alpha: 1,
   maxCorr: 0.85,
+  winsor: null as number | null,
+  costBps: 0,
+  fineInterval: null as string | null,
+  aggFeatures: ['rv', 'vol_imb', 'taker_ratio'],
   testRatio: 0.25,
   learningRate: 0.05,
   nEstimators: 240,
@@ -117,6 +122,34 @@ const horizonHint = computed(() => {
   return ms ? `${cfg.value.horizon} × ${cfg.value.interval} ≈ ${fmtDur(ms)}` : ''
 })
 
+const FINE_INTERVALS = ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '12h']
+const AGG_FEATURE_OPTS = [
+  { key: 'rv', label: '已实现波动率 RV' },
+  { key: 'vol_imb', label: '量能买卖不平衡' },
+  { key: 'taker_ratio', label: '主动买占比' },
+]
+const fineOptions = computed(() => {
+  const cur = barMs(cfg.value.interval)
+  return FINE_INTERVALS.filter((i) => {
+    const ms = barMs(i)
+    return !!ms && !!cur && ms < cur && cur % ms === 0
+  })
+})
+watch(
+  () => cfg.value.interval,
+  () => {
+    if (cfg.value.fineInterval && !fineOptions.value.includes(cfg.value.fineInterval)) {
+      cfg.value.fineInterval = null
+    }
+  },
+)
+function toggleAgg(key: string) {
+  const s = new Set(cfg.value.aggFeatures)
+  if (s.has(key)) s.delete(key)
+  else s.add(key)
+  cfg.value.aggFeatures = [...s]
+}
+
 const target = ref('rank_ic>0.02')
 
 const isRidge = computed(() => cfg.value.model === 'ridge')
@@ -129,7 +162,9 @@ const checkedList = computed(() => {
   const gapOk = r ? (r.overfit_gap ?? 99) < 0.06 : null
   const signOk = r ? Math.sign(r.oos_ic ?? 0) * Math.sign(r.oos_rank_ic ?? 0) >= 0 : null
   const spreadOk = r ? r.spread > 0 : null
+  const netOk = r ? (r.net_spread ?? r.spread) > 0 : null
   const samplesOk = r ? r.n_test >= 40 : null
+  const notDegenerateOk = r ? !r.degenerate : null
   return [
     { label: 'purged 时序切分（无未来函数）', ok: Boolean(r) },
     { label: `相关性过滤（阈值 ${cfg.value.maxCorr}）`, ok: Boolean(r) },
@@ -137,6 +172,8 @@ const checkedList = computed(() => {
     { label: 'train−OOS IC 差距 < 0.06（防记忆噪声）', ok: gapOk },
     { label: 'OOS IC 与 RankIC 同号（信号方向稳定）', ok: signOk },
     { label: 'Top−Bottom 价差 > 0（高分确实跑赢）', ok: spreadOk },
+    { label: `净价差 > 0（扣 ${cfg.value.costBps} bps 往返成本）`, ok: netOk },
+    { label: `模型输出有区分度（唯一预测 ${r?.pred_nunique ?? '—'} 个，非近似常值）`, ok: notDegenerateOk },
     { label: `测试样本 ≥ 40 行（${r ? `${r.n_test} 行` : '—'}）`, ok: samplesOk },
   ]
 })
@@ -164,6 +201,10 @@ async function run() {
     test_ratio: cfg.value.testRatio,
     alpha: cfg.value.alpha,
     max_corr: cfg.value.maxCorr,
+    winsor: cfg.value.winsor,
+    cost_bps: cfg.value.costBps,
+    fine_interval: cfg.value.fineInterval,
+    agg_features: cfg.value.fineInterval ? [...cfg.value.aggFeatures] : [],
     model: cfg.value.model,
     learning_rate: cfg.value.learningRate,
     n_estimators: cfg.value.nEstimators,
@@ -214,6 +255,7 @@ const aiOpen = ref(false)
 const aiBusy = ref(false)
 const aiReview = ref<TrainReviewResult | null>(null)
 const aiFeatCount = ref(0)
+const aiCfg = ref<Record<string, unknown>>({})
 
 function factorLabel(code: string): string {
   return factors.value.find((f) => f.code === code)?.name ?? code
@@ -239,6 +281,29 @@ function last(arr?: number[]): number | null {
   return arr?.length ? arr[arr.length - 1] : null
 }
 
+function reviewConfig(): Record<string, unknown> {
+  const base: Record<string, unknown> = {
+    model: cfg.value.model,
+    alpha: cfg.value.alpha,
+    max_corr: cfg.value.maxCorr,
+    winsor: cfg.value.winsor,
+    cost_bps: cfg.value.costBps,
+    fine_interval: cfg.value.fineInterval,
+    agg_features: cfg.value.fineInterval ? [...cfg.value.aggFeatures] : [],
+    test_ratio: cfg.value.testRatio,
+    horizon: cfg.value.horizon,
+    learning_rate: cfg.value.learningRate,
+    n_estimators: cfg.value.nEstimators,
+    max_depth: cfg.value.maxDepth,
+    num_leaves: cfg.value.numLeaves,
+    subsample: cfg.value.subsample,
+    colsample_bytree: cfg.value.colsample,
+  }
+  const a = args.value
+  if (a) for (const k of Object.keys(base)) if (a[k as keyof MlTrainArgs] !== undefined) base[k] = a[k as keyof MlTrainArgs] as unknown
+  return base
+}
+
 function buildReviewPayload(r: MlTrainResult): TrainReviewPayload {
   const oc = r.oos_charts
   const dec = oc?.deciles ?? []
@@ -253,6 +318,7 @@ function buildReviewPayload(r: MlTrainResult): TrainReviewPayload {
     horizon: r.horizon,
     model: r.model,
     engine: r.engine,
+    config: reviewConfig(),
     n_train: r.n_train,
     n_test: r.n_test,
     metrics: {
@@ -262,6 +328,7 @@ function buildReviewPayload(r: MlTrainResult): TrainReviewPayload {
       overfit_gap: r.overfit_gap,
       hit_rate: r.hit_rate,
       spread: r.spread,
+      net_spread: r.net_spread ?? null,
       n_features_kept: r.n_features_kept,
     },
     checks: checkedList.value.map((c) => ({ label: c.label, ok: c.ok })),
@@ -293,6 +360,46 @@ const aiRefinable = computed(() => {
   const rev = aiReview.value
   return !!rev && rev.grade !== 'ok' && rev.keep.length >= 2 && (rev.drop?.length ?? 0) > 0
 })
+const AGG_LABELS: Record<string, string> = {
+  rv: '已实现波动率 RV',
+  vol_imb: '量能买卖不平衡',
+  taker_ratio: '主动买占比',
+}
+const aiAggChanged = computed(() => {
+  const rev = aiReview.value
+  if (!rev || !Array.isArray(rev.agg_keep)) return false
+  const cur = [...cfg.value.aggFeatures].sort()
+  const next = [...rev.agg_keep].sort()
+  return cur.join(',') !== next.join(',')
+})
+const aiAggKeepText = computed(() => {
+  const rev = aiReview.value
+  if (!rev || !Array.isArray(rev.agg_keep)) return ''
+  return rev.agg_keep.map((a) => AGG_LABELS[a] ?? a).join('、')
+})
+
+const PARAM_LABELS: Record<string, string> = {
+  model: '模型',
+  alpha: '正则 α / L2',
+  max_corr: '相关性过滤',
+  test_ratio: '测试集比例',
+  horizon: '预测窗口',
+  learning_rate: '学习率',
+  n_estimators: '树数量',
+  max_depth: '最大深度',
+  num_leaves: '叶子数',
+  subsample: '行采样',
+  colsample_bytree: '列采样',
+  winsor: '稳健化 Winsorize',
+}
+const aiParamPairs = computed(() => {
+  const sug = aiReview.value?.params ?? {}
+  return Object.entries(sug).map(([key, to]) => ({ key, label: PARAM_LABELS[key] ?? key, from: aiCfg.value[key], to }))
+})
+const aiCanApply = computed(() => {
+  const rev = aiReview.value
+  return !!rev && (aiRefinable.value || Object.keys(rev.params ?? {}).length > 0 || aiAggChanged.value)
+})
 
 async function aiAnalyze() {
   if (running.value || aiBusy.value) return
@@ -303,12 +410,19 @@ async function aiAnalyze() {
   }
   aiBusy.value = true
   aiReview.value = null
+  aiCfg.value = reviewConfig()
   try {
     aiReview.value = await reviewTraining(buildReviewPayload(r))
     aiFeatCount.value = r.features.length
     const g = aiReview.value.grade
+    const pCount = Object.keys(aiReview.value.params ?? {}).length
     const head = g === 'ok' ? 'AI 诊断：效果达标' : g === 'warn' ? 'AI 诊断：效果一般' : 'AI 诊断：效果不理想'
-    toast.ai(head, aiReview.value.fallback ? '模型未返回可用 JSON，已按规则兜底' : `特征 ${aiFeatCount.value} 个 → 建议保留 ${aiReview.value.keep.length} 个`)
+    toast.ai(
+      head,
+      aiReview.value.fallback
+        ? '模型未返回可用 JSON，已按规则兜底'
+        : `建议保留 ${aiReview.value.keep.length} 个特征${pCount ? `、调整 ${pCount} 个参数` : ''}`,
+    )
   } catch (e: unknown) {
     toast.error('AI 解析失败', (e as { message?: string }).message)
   } finally {
@@ -318,15 +432,63 @@ async function aiAnalyze() {
 
 function aiRetrain() {
   const rev = aiReview.value
-  if (!rev || !rev.keep?.length || running.value) return
-  const keep = rev.keep.filter((c) => factors.value.some((f) => f.code === c))
-  if (keep.length < 2) {
-    toast.error('精筛后因子不足 2 个', '无法按 AI 建议重训，请改用手动勾选特征')
-    return
+  if (!rev || running.value || !aiCanApply.value) return
+
+  // 1) 应用 AI 推荐参数
+  const sug = rev.params ?? {}
+  const numMap: Record<string, keyof typeof cfg.value> = {
+    alpha: 'alpha',
+    max_corr: 'maxCorr',
+    test_ratio: 'testRatio',
+    horizon: 'horizon',
+    learning_rate: 'learningRate',
+    n_estimators: 'nEstimators',
+    max_depth: 'maxDepth',
+    num_leaves: 'numLeaves',
+    subsample: 'subsample',
+    colsample_bytree: 'colsample',
   }
-  codes.value = keep
+  let changed: string[] = []
+  for (const [k, v] of Object.entries(sug)) {
+    if (k === 'model') {
+      if (v === 'ridge' || v === 'gbdt') {
+        cfg.value.model = v
+        changed.push('模型')
+      }
+      continue
+    }
+    if (k === 'winsor') {
+      if (typeof v === 'number') {
+        cfg.value.winsor = v === 0 ? null : v
+        changed.push(PARAM_LABELS.winsor)
+      }
+      continue
+    }
+    const cfgKey = numMap[k]
+    if (cfgKey && typeof v === 'number') {
+      ;(cfg.value as Record<string, unknown>)[cfgKey as string] = v
+      changed.push(PARAM_LABELS[k] ?? k)
+    }
+  }
+
+  // 2) 应用特征精筛
+  const keep = rev.keep.filter((c) => factors.value.some((f) => f.code === c))
+  if (rev.drop?.length && keep.length >= 2) {
+    codes.value = keep
+    changed.push('特征')
+  }
+
+  // 3) 应用聚合特征取舍
+  if (Array.isArray(rev.agg_keep) && cfg.value.fineInterval) {
+    const next = rev.agg_keep.filter((a) => Object.keys(AGG_LABELS).includes(a))
+    if (next.length !== cfg.value.aggFeatures.length || next.some((a) => !cfg.value.aggFeatures.includes(a))) {
+      cfg.value.aggFeatures = next
+      changed.push('聚合特征')
+    }
+  }
+
   aiOpen.value = false
-  toast.info('已套用 AI 精筛特征', `用保留的 ${keep.length} 个因子重新训练`)
+  toast.info('已套用 AI 推荐', changed.length ? `已调整：${changed.join('、')}，重新训练中` : '重新训练中')
   void run()
 }
 
@@ -342,7 +504,7 @@ onMounted(async () => {
     .map((c) => c.trim())
     .filter(Boolean)
   const known = new Set(factors.value.map((f) => f.code))
-  const valid = preset.filter((c) => known.has(c)).slice(0, 12)
+  const valid = preset.filter((c) => known.has(c)).slice(0, MAX_ML_FEATURES)
   if (valid.length) {
     codes.value = valid
     const dropped = preset.length - valid.length
@@ -413,13 +575,54 @@ onMounted(async () => {
               <select id="t-ratio" v-model.number="cfg.testRatio" class="select"><option :value="0.2">20%</option><option :value="0.25">25%</option><option :value="0.3">30%</option></select>
             </div>
             <div class="field">
-              <label class="label" :for="'t-alpha'">{{ isRidge ? '正则 α' : 'L2 叶子权重' }} <Tip :text="isRidge ? 'Ridge 惩罚系数，越大越强约束、越防过拟合' : 'LightGBM 叶子权重的 L2 正则项'" /></label>
-              <input id="t-alpha" v-model.number="cfg.alpha" type="number" min="0" step="0.1" class="input font-mono" />
+              <label class="label" :for="'t-alpha'">{{ isRidge ? '正则 α' : 'L2 叶子权重' }} <Tip :text="isRidge ? 'Ridge 惩罚系数，越大越强约束、越防过拟合' : 'LightGBM 叶子权重的 L2 正则项（实际按 α×1e-3 传入，因收益量级约 1e-3）；建议 1~10，过大会把预测压向 0'" /></label>
+              <input id="t-alpha" v-model.number="cfg.alpha" type="number" min="0" max="50" step="0.1" class="input font-mono" />
             </div>
             <div class="field">
               <label class="label" for="t-corr">相关性过滤阈值 <Tip text="特征两两 |相关| 超过该值则剔除较弱者，去冗余" /></label>
               <input id="t-corr" v-model.number="cfg.maxCorr" type="number" min="0.3" max="0.99" step="0.05" class="input font-mono" />
             </div>
+            <div class="field">
+              <label class="label" for="t-win">稳健化 Winsorize <Tip text="用训练集分位数把特征与训练标签的极端值钳制到 [q, 1-q]，抑制加密厚尾离群对 Ridge L2 与相关性过滤的扰动；打分时特征沿用同一分位数边界（无未来泄漏），样本外 IC/价差仍按原始收益评价。q 越大削得越狠" /></label>
+              <select id="t-win" v-model="cfg.winsor" class="select">
+                <option :value="null">关闭</option>
+                <option :value="0.01">1%</option>
+                <option :value="0.02">2%</option>
+                <option :value="0.05">5%</option>
+              </select>
+            </div>
+            <div class="field">
+              <label class="label" for="t-cost">往返成本 <Tip text="假设的买卖往返交易成本（bps，含手续费+点差）。用于把 Top−Bottom 毛价差折算成净价差：净价差 = 毛价差 − 成本/10000。分钟级/高频信号换手快、成本高，把这个值设成你交易所的真实水平能立刻看出信号是否还有肉" /></label>
+              <input id="t-cost" v-model.number="cfg.costBps" type="number" min="0" max="1000" step="1" class="input font-mono" />
+              <p class="mt-1 font-mono text-[10px] text-subtle">当前假设 {{ cfg.costBps }} bps（{{ (cfg.costBps / 100).toFixed(3) }}%）</p>
+            </div>
+          </div>
+
+          <!-- 细粒度增强：把更细粒度的数据聚合成低噪声特征 -->
+          <div class="rounded-lg border border-border bg-surface-2/40 p-3">
+            <div class="flex items-center gap-2">
+              <label class="label" for="t-fine">细粒度增强 <Tip text="用比当前粒度更细的 K 线（如 5m）在每根粗 bar 内汇总出低噪声特征（已实现波动率/量能不平衡/主动买占比），喂给粗粒度模型——这是把分钟数据『变废为宝』的正解：不直接预测分钟收益，而是用分钟数据的微观结构提升 1h/4h 模型的稳健性" /></label>
+              <select id="t-fine" v-model="cfg.fineInterval" class="select !w-28">
+                <option :value="null">关闭</option>
+                <option v-for="fi in fineOptions" :key="fi" :value="fi">{{ fi }}</option>
+              </select>
+            </div>
+            <p v-if="!fineOptions.length" class="mt-1.5 text-[10px] leading-snug text-warn">当前粒度 {{ cfg.interval }} 没有更细的本地数据可聚合，无法启用（可换更粗的训练粒度，如 1h/4h）。</p>
+            <template v-else-if="cfg.fineInterval">
+              <p class="mt-1.5 text-[10px] text-subtle">将用 {{ cfg.fineInterval }} 数据，按每根 {{ cfg.interval }} 汇总以下特征：</p>
+              <div class="mt-1.5 flex flex-wrap gap-1.5">
+                <button
+                  v-for="a in AGG_FEATURE_OPTS"
+                  :key="a.key"
+                  type="button"
+                  class="chip !h-6 !px-2 !text-[11px]"
+                  :class="cfg.aggFeatures.includes(a.key) ? 'is-active' : ''"
+                  @click="toggleAgg(a.key)"
+                >
+                  {{ cfg.aggFeatures.includes(a.key) ? '✓' : '＋' }} {{ a.label }}
+                </button>
+              </div>
+            </template>
           </div>
 
           <!-- LightGBM 专属超参 -->
@@ -457,7 +660,7 @@ onMounted(async () => {
             <p class="mb-2 text-xs font-semibold uppercase tracking-wider text-subtle">
               特征因子（已通过 IC 筛选更佳，可搜索多选）
             </p>
-            <FactorPicker v-model:selected="codes" :factors="factors" :max="12" />
+            <FactorPicker v-model:selected="codes" :factors="factors" :max="MAX_ML_FEATURES" />
           </div>
 
           <div class="field">
@@ -486,13 +689,16 @@ onMounted(async () => {
         </template>
         <template v-else>
           <Panel title="样本外指标" sub="样本外 = 模型从未见过的后段数据">
+            <p v-if="result.degenerate" class="mb-3 rounded-lg border border-danger/30 bg-danger/10 px-3 py-2.5 text-xs leading-relaxed text-danger">
+              模型输出近似常值（仅 {{ result.pred_nunique }} 个唯一预测、std {{ result.pred_std?.toExponential(2) }}），几乎无择时区分度——回测很可能无交易。建议重训：放宽 LightGBM 容量（learning_rate≥0.01、n_estimators≥100、max_depth≥2）或换更稳健的因子。
+            </p>
             <div class="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
               <div class="panel px-3 py-2.5"><p class="text-[10px] uppercase tracking-wider text-subtle">OOS IC <Tip text="OOS = Out-of-Sample（样本外）。IC：模型在训练时留出的样本外测试段上，预测值与实际未来收益的 Pearson 相关；绝对值越高预测越强，0 表示无预测力" /></p><p class="num mt-1 text-base font-semibold" :class="pnl(result.oos_ic ?? 0)">{{ result.oos_ic ?? '—' }}</p></div>
               <div class="panel px-3 py-2.5"><p class="text-[10px] uppercase tracking-wider text-subtle">OOS RankIC <Tip text="OOS = Out-of-Sample（样本外）。RankIC：样本外测试段上预测排序与实际收益排序的 Spearman 相关，衡量排序/择时能力，对离群值比 IC 更稳健" /></p><p class="num mt-1 text-base font-semibold" :class="pnl(result.oos_rank_ic ?? 0)">{{ result.oos_rank_ic ?? '—' }}</p></div>
               <div class="panel px-3 py-2.5"><p class="text-[10px] uppercase tracking-wider text-subtle">train IC <Tip text="模型在训练数据本身上的拟合 IC。通常高于样本外；若高出一大截，说明在“记住”训练期噪声，详见右下过拟合差距" /></p><p class="num mt-1 text-base font-semibold text-fg">{{ result.train_ic ?? '—' }}</p></div>
               <div class="panel px-3 py-2.5"><p class="text-[10px] uppercase tracking-wider text-subtle">过拟合差距 <Tip text="|train IC − OOS IC|：训练与样本外表现相差越小越好；&lt;0.06 视为可接受，≥0.06 提示模型可能在记忆噪声" /></p><p class="num mt-1 text-base font-semibold" :class="(result.overfit_gap ?? 9) < 0.06 ? 'text-up' : 'text-down'">{{ result.overfit_gap ?? '—' }}</p></div>
-              <div class="panel px-3 py-2.5"><p class="text-[10px] uppercase tracking-wider text-subtle">命中率 <Tip text="方向命中率：预测涨/跌方向与实际方向一致的比例；&gt;50% 说明方向判断优于抛硬币" /></p><p class="num mt-1 text-base font-semibold text-fg">{{ (result.hit_rate * 100).toFixed(1) }}%</p></div>
-              <div class="panel px-3 py-2.5"><p class="text-[10px] uppercase tracking-wider text-subtle">Top−Bottom <Tip text="把测试期按预测分取最高/最低各 20% 两组，比较实际平均收益；&gt;0 表示预测高分组的未来收益确实更高（多头信号有效）" /></p><p class="num mt-1 text-base font-semibold" :class="pnl(result.spread)">{{ result.spread.toFixed(5) }}</p></div>
+              <div class="panel px-3 py-2.5"><p class="text-[10px] uppercase tracking-wider text-subtle">命中率 <Tip text="方向命中率：预测涨/跌方向与实际方向一致的比例；&gt;50% 说明方向判断优于抛硬币" /></p><p class="num mt-1 text-base font-semibold text-fg">{{ result.hit_rate != null ? (result.hit_rate * 100).toFixed(1) + '%' : '—' }}</p></div>
+              <div class="panel px-3 py-2.5"><p class="text-[10px] uppercase tracking-wider text-subtle">Top−Bottom <Tip text="把测试期按预测分取最高/最低各 20% 两组，比较实际平均收益；&gt;0 表示预测高分组的未来收益确实更高（多头信号有效）" /></p><p class="num mt-1 text-base font-semibold" :class="pnl(result.spread)">{{ result.spread.toFixed(5) }}</p><p v-if="result.cost_bps" class="num mt-0.5 text-[10px]" :class="pnl(result.net_spread ?? 0)">净 {{ (result.net_spread ?? 0).toFixed(5) }}</p></div>
             </div>
 
             <!-- 切分可视化 -->
@@ -610,7 +816,30 @@ onMounted(async () => {
               <p class="mt-1 text-xs leading-relaxed text-muted">{{ aiReview.advice }}</p>
             </div>
 
-            <!-- 精筛建议 -->
+            <!-- AI 推荐参数 -->
+            <div v-if="aiParamPairs.length" class="space-y-1.5 rounded-lg border border-primary/30 bg-primary/5 px-3 py-2.5">
+              <p class="text-[10px] font-semibold uppercase tracking-wider text-primary-ink">AI 推荐参数</p>
+              <div v-for="p in aiParamPairs" :key="p.key" class="flex items-center justify-between gap-3 text-xs">
+                <span class="text-subtle">{{ p.label }}</span>
+                <span class="num">
+                  <span class="text-muted">{{ p.from != null ? String(p.from) : '—' }}</span>
+                  <span class="mx-1.5 text-subtle">→</span>
+                  <span class="font-semibold" :class="p.key === 'model' ? 'text-primary-ink' : 'text-up'">{{ String(p.to) }}</span>
+                </span>
+              </div>
+            </div>
+
+            <!-- 聚合特征取舍 -->
+            <div v-if="aiAggChanged && aiAggKeepText" class="space-y-1.5 rounded-lg border border-ai/30 bg-ai/5 px-3 py-2.5">
+              <p class="text-[10px] font-semibold uppercase tracking-wider text-ai-ink">聚合特征取舍（细粒度增强）</p>
+              <p class="text-[11px] text-muted">
+                建议保留：<span class="font-semibold text-fg">{{ aiAggKeepText }}</span>
+                <template v-if="!aiAggKeepText">（全部关闭）</template>
+              </p>
+              <p class="text-[10px] text-subtle">AI 会剔除样本外 IC 弱或与组合方向相反的聚合特征，一键套用后重训。</p>
+            </div>
+
+            <!-- 特征精筛（仅信息展示，应用按钮在下方统一给出） -->
             <div v-if="aiRefinable" class="space-y-2 rounded-lg border border-warn/30 bg-warn/5 px-3 py-2.5">
               <p class="text-[10px] font-semibold uppercase tracking-wider text-warn">特征精筛（本轮 {{ aiFeatCount }} 个 → 建议保留 {{ aiReview.keep.length }} 个）</p>
               <div>
@@ -628,16 +857,20 @@ onMounted(async () => {
                   </li>
                 </ul>
               </div>
-              <button class="btn btn-primary !h-8 w-full text-xs" :disabled="running" @click="aiRetrain">
-                <LoaderCircle v-if="running" :size="13" class="animate-spin" />
-                <Cpu v-else :size="13" />
-                {{ running ? '训练中…' : `用保留的 ${aiReview.keep.length} 个因子重新训练` }}
-              </button>
             </div>
 
-            <div v-else class="rounded-lg border border-up/30 bg-up/5 px-3 py-2 text-[11px] leading-relaxed text-up">
-              效果达标（或不建议继续删因子）：本轮可直接「保存模型」→ 到模型库一键建策略回测 / 部署模拟盘。
+            <div
+              v-else-if="!aiParamPairs.length"
+              class="rounded-lg border border-up/30 bg-up/5 px-3 py-2 text-[11px] leading-relaxed text-up"
+            >
+              效果达标（或不建议继续删因子/调参）：本轮可直接「保存模型」→ 到模型库一键建策略回测 / 部署模拟盘。
             </div>
+
+            <button v-if="aiCanApply" class="btn btn-primary !h-8 w-full text-xs" :disabled="running" @click="aiRetrain">
+              <LoaderCircle v-if="running" :size="13" class="animate-spin" />
+              <Cpu v-else :size="13" />
+              {{ running ? '训练中…' : '应用 AI 推荐并重新训练' }}
+            </button>
 
             <button class="btn btn-ghost !h-8 w-full text-xs" :disabled="aiBusy" @click="aiAnalyze">
               <RefreshCw v-if="!aiBusy" :size="12" />重新解析
@@ -648,7 +881,7 @@ onMounted(async () => {
             <div class="flex flex-col gap-2.5">
               <p class="text-xs leading-relaxed text-muted">
                 基于 <b class="text-fg">{{ resInfo.engine }}</b> 这轮结果（{{ resInfo.n_train }} train / {{ resInfo.n_test }} test，保留 {{ resInfo.n_features_kept }} 个特征）让大模型做诊断：
-                效果不理想时它会给出<b class="text-fg">特征精筛</b>——保留哪些、剔除哪些，并可一键用精筛后的因子重新训练。
+                效果不理想时它会给出<b class="text-fg">特征精筛</b>与<b class="text-fg">参数调优</b>建议，可一键应用后重新训练。
               </p>
               <button class="btn btn-primary !h-9 w-full" @click="aiAnalyze">
                 <Sparkles :size="14" />生成 AI 解析

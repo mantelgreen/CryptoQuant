@@ -33,9 +33,11 @@ router = APIRouter(prefix="/factors", tags=["factors"])
 
 _INTERVALS = {"1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d", "3d", "1w"}
 
+MAX_ML_FEATURES = 12
+
 
 class ResearchReq(BaseModel):
-    codes: list[str] = Field(..., min_length=1, max_length=12)
+    codes: list[str] = Field(..., min_length=1)
     symbols: list[str] = Field(..., min_length=1, max_length=20)
     interval: str = Field(..., pattern=r"^(1m|3m|5m|15m|30m|1h|2h|4h|6h|12h|1d|3d|1w)$")
     start: datetime
@@ -43,7 +45,7 @@ class ResearchReq(BaseModel):
 
 
 class MatrixReq(BaseModel):
-    codes: list[str] = Field(..., min_length=2, max_length=12)
+    codes: list[str] = Field(..., min_length=2, max_length=MAX_ML_FEATURES)
     symbols: list[str] = Field(..., min_length=1, max_length=20)
     interval: str = Field(..., pattern=r"^(1m|3m|5m|15m|30m|1h|2h|4h|6h|12h|1d|3d|1w)$")
     start: datetime
@@ -67,15 +69,19 @@ class JoinFactorReq(BaseModel):
 
 
 class MlTrainReq(BaseModel):
-    codes: list[str] = Field(..., min_length=2, max_length=12)
+    codes: list[str] = Field(..., min_length=2, max_length=MAX_ML_FEATURES)
     symbols: list[str] = Field(..., min_length=1, max_length=20)
     interval: str = Field(..., pattern=r"^(1m|3m|5m|15m|30m|1h|2h|4h|6h|12h|1d|3d|1w)$")
     start: datetime
     end: datetime
     horizon: int = Field(default=1, ge=1, le=10)
     test_ratio: float = Field(default=0.25, ge=0.15, le=0.5)
-    alpha: float = Field(default=1.0, ge=0.0)
+    alpha: float = Field(default=1.0, ge=0.0, le=50.0)
     max_corr: float | None = Field(default=0.85, ge=0.0, lt=1.0)
+    winsor: float | None = Field(default=None, ge=0.0, lt=0.5)
+    cost_bps: float = Field(default=0.0, ge=0.0, le=1000.0)
+    fine_interval: str | None = Field(default=None, pattern=r"^(1m|3m|5m|15m|30m|1h|2h|4h|6h|12h)$")
+    agg_features: list[str] = Field(default_factory=list)
     model: str = Field(default="ridge", pattern=r"^(ridge|gbdt)$")
     learning_rate: float = Field(default=0.05, ge=0.001, le=1.0)
     n_estimators: int = Field(default=240, ge=10, le=5000)
@@ -234,6 +240,10 @@ async def ml_train(
         test_ratio=req.test_ratio,
         alpha=req.alpha,
         max_corr=req.max_corr,
+        winsor=req.winsor,
+        cost_bps=req.cost_bps,
+        fine_interval=req.fine_interval,
+        agg_features=req.agg_features,
         model=req.model,
         learning_rate=req.learning_rate,
         n_estimators=req.n_estimators,
@@ -265,6 +275,10 @@ async def ml_save_model(
             test_ratio=req.test_ratio,
             alpha=req.alpha,
             max_corr=req.max_corr,
+            winsor=req.winsor,
+            cost_bps=req.cost_bps,
+            fine_interval=req.fine_interval,
+            agg_features=req.agg_features,
             model=req.model,
             learning_rate=req.learning_rate,
             n_estimators=req.n_estimators,

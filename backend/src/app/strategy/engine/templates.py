@@ -18,30 +18,44 @@ def _sma(df: pd.DataFrame, n: int) -> pd.Series:
     return df["close"].rolling(window=n, min_periods=n).mean()
 
 
+def _feature_series(df: pd.DataFrame, f: dict, available: set[str]) -> pd.Series | None:
+    """按因子定义取出原始序列：内置 → registry；用户/AI → expression；聚合特征 → 直接从 df 取列。"""
+    code = f.get("code")
+    if f.get("aggregate"):
+        return df[code] if code in df.columns else None
+    expr = (f.get("expression") or "").strip()
+    if code in available:
+        try:
+            return _compute_factor(code, df)
+        except KeyError:
+            return None
+    if expr:
+        try:
+            return safe_eval_expr(expr, df).astype(float)
+        except Exception:  # noqa: BLE001
+            return None
+    return None
+
+
+def _standardize(val: pd.Series, f: dict) -> pd.Series:
+    """按训练时保存的 clip 上下界 + mean/std 做与训练一致的特征标准化。"""
+    v = val
+    if f.get("clip_low") is not None and f.get("clip_high") is not None:
+        v = v.clip(float(f["clip_low"]), float(f["clip_high"]))
+    std = float(f.get("std", 1.0) or 1.0)
+    if std == 0:
+        std = 1.0
+    return (v - float(f.get("mean", 0.0) or 0.0)) / std
+
+
 def _ml_linear_score(df: pd.DataFrame, feats: list[dict]) -> pd.Series:
     score = pd.Series(0.0, index=df.index)
     available = set(_get_factors().keys())
     for f in feats:
-        code = f.get("code")
-        expr = (f.get("expression") or "").strip()
-        val: pd.Series | None = None
-        if code in available:
-            try:
-                val = _compute_factor(code, df)
-            except KeyError:
-                val = None
-        elif expr:
-            try:
-                val = safe_eval_expr(expr, df).astype(float)
-            except Exception:  # noqa: BLE001
-                val = None
+        val = _feature_series(df, f, available)
         if val is None:
             continue
-        mean = float(f.get("mean", 0.0) or 0.0)
-        std = float(f.get("std", 1.0) or 1.0)
-        if std == 0:
-            std = 1.0
-        score += float(f.get("coef", 0.0) or 0.0) * (val - mean) / std
+        score += float(f.get("coef", 0.0) or 0.0) * _standardize(val, f)
     return score
 
 
@@ -50,19 +64,9 @@ def _ml_tree_score(df: pd.DataFrame, feats: list[dict], booster) -> pd.Series:
     available = set(_get_factors().keys())
     series: dict[str, pd.Series] = {}
     for f in feats:
-        code = f.get("code")
-        expr = (f.get("expression") or "").strip()
-        try:
-            if code in available:
-                val = _compute_factor(code, df)
-            elif expr:
-                val = safe_eval_expr(expr, df).astype(float)
-            else:
-                val = None
-        except Exception:  # noqa: BLE001
-            val = None
+        val = _feature_series(df, f, available)
         if val is not None:
-            series[code] = val
+            series[f["code"]] = val
     if not series:
         return pd.Series(0.0, index=df.index)
     fdf = pd.DataFrame(series)
@@ -70,12 +74,10 @@ def _ml_tree_score(df: pd.DataFrame, feats: list[dict], booster) -> pd.Series:
     if len(cols) < len(feats):
         # 有特征完全算不出来，树模型无法打分（与线性容忍缺失不同）
         return pd.Series(0.0, index=df.index)
+    fmap = {f["code"]: f for f in feats}
     z = fdf[cols].copy()
-    for f in feats:
-        std = float(f.get("std", 1.0) or 1.0)
-        if std == 0:
-            std = 1.0
-        z[f["code"]] = (z[f["code"]] - float(f.get("mean", 0.0) or 0.0)) / std
+    for code in cols:
+        z[code] = _standardize(z[code], fmap[code])
     sub = z.dropna()
     score = pd.Series(np.nan, index=df.index)
     if sub.empty:
@@ -139,6 +141,10 @@ def register_templates() -> RegistryType:
             return pd.Series(0.0, index=df.index)
         booster = params.get("_booster")
         score = _ml_tree_score(df, feats, booster) if booster is not None else _ml_linear_score(df, feats)
+        # 方向自校准：保存模型若记录 flip=-1，回测同样取反，保证“高分为多”语义一致
+        flip = float(params.get("_flip", 1) or 1)
+        if flip < 0:
+            score = -score
 
         window = int(params.get("window", 60) or 60)
         enter_q = float(params.get("enter_q", 0.8) or 0.8)

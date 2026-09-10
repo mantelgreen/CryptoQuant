@@ -16,7 +16,7 @@ from ...core.config import get_settings
 from ...core.db import get_db
 from ...core.errors import BadRequest, NotFound
 from ...strategy.engine.repo import BacktestRepository, StrategyRepository, StrategyVersionRepository
-from ...strategy.engine.service import start_backtest
+from ...strategy.engine.service import delete_backtest, delete_strategy, start_backtest
 from ...strategy.engine.templates import get_templates
 
 router = APIRouter(prefix="/strategy", tags=["strategy"])
@@ -71,37 +71,6 @@ async def list_strategies(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
     repo = StrategyRepository(db)
     items = await repo.list()
     return {"code": "OK", "message": "ok", "data": items}
-
-
-@router.get("/{strategy_id}")
-async def get_strategy(strategy_id: UUID, db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
-    repo = StrategyRepository(db)
-    item = await repo.get(strategy_id)
-    if not item:
-        raise NotFound("strategy_not_found")
-    vrepo = StrategyVersionRepository(db)
-    versions = await vrepo.list_for(strategy_id)
-    return {"code": "OK", "message": "ok", "data": {"strategy": item, "versions": versions}}
-
-
-@router.post("/{strategy_id}/versions")
-async def create_version(
-    strategy_id: UUID,
-    req: CreateVersionReq = Body(...),
-    db: AsyncSession = Depends(get_db),
-) -> dict[str, Any]:
-    if req.template_id not in get_templates():
-        raise BadRequest("unknown_template")
-    repo = StrategyRepository(db)
-    if not await repo.get(strategy_id):
-        raise NotFound("strategy_not_found")
-    vrepo = StrategyVersionRepository(db)
-    vid = await vrepo.create(
-        strategy_id=strategy_id,
-        code=req.code or f"# {req.template_id}\n",
-        params={**req.params, "template_id": req.template_id},
-    )
-    return {"code": "OK", "message": "ok", "data": {"version_id": str(vid)}}
 
 
 # ===== 回测 =====
@@ -216,3 +185,58 @@ async def backtest_progress_stream(
             "X-Accel-Buffering": "no",
         },
     )
+
+# ===== 带参路由（放在静态路径之后注册，避免抢占 /backtests 等） =====
+
+@router.get("/{strategy_id}")
+async def get_strategy(strategy_id: UUID, db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    repo = StrategyRepository(db)
+    item = await repo.get(strategy_id)
+    if not item:
+        raise NotFound("strategy_not_found")
+    vrepo = StrategyVersionRepository(db)
+    versions = await vrepo.list_for(strategy_id)
+    return {"code": "OK", "message": "ok", "data": {"strategy": item, "versions": versions}}
+
+
+@router.post("/{strategy_id}/versions")
+async def create_version(
+    strategy_id: UUID,
+    req: CreateVersionReq = Body(...),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    if req.template_id not in get_templates():
+        raise BadRequest("unknown_template")
+    repo = StrategyRepository(db)
+    if not await repo.get(strategy_id):
+        raise NotFound("strategy_not_found")
+    vrepo = StrategyVersionRepository(db)
+    vid = await vrepo.create(
+        strategy_id=strategy_id,
+        code=req.code or f"# {req.template_id}\n",
+        params={**req.params, "template_id": req.template_id},
+    )
+    return {"code": "OK", "message": "ok", "data": {"version_id": str(vid)}}
+
+@router.delete("/backtests/{backtest_id}")
+async def delete_backtest_record(
+    backtest_id: UUID,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """删除一次回测（连同资金曲线与成交明细）。"""
+    ok = await delete_backtest(db, backtest_id)
+    if not ok:
+        raise NotFound("backtest_not_found")
+    return {"code": "OK", "message": "ok", "data": {"deleted": True}}
+
+
+@router.delete("/{strategy_id}")
+async def delete_strategy_record(
+    strategy_id: UUID,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """删除策略及其全部版本与回测记录。"""
+    ok = await delete_strategy(db, strategy_id)
+    if not ok:
+        raise NotFound("strategy_not_found")
+    return {"code": "OK", "message": "ok", "data": {"deleted": True}}

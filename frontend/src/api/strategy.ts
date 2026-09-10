@@ -96,6 +96,10 @@ export interface Trade {
   qty: number
   fee: number
   pnl: number
+  signal?: number | null
+  position?: number | null
+  basis?: number | null
+  reason?: string | null
 }
 
 export interface BacktestDetail {
@@ -120,6 +124,11 @@ export async function createStrategy(payload: {
   tags?: string[]
 }): Promise<{ strategy_id: string }> {
   const { data } = await http.post<{ data: { strategy_id: string } }>('/strategy', payload)
+  return data.data
+}
+
+export async function deleteStrategy(id: string): Promise<{ deleted: boolean }> {
+  const { data } = await http.delete<{ data: { deleted: boolean } }>(`/strategy/${id}`)
   return data.data
 }
 
@@ -163,6 +172,11 @@ export async function runBacktest(payload: {
 export async function listBacktests(): Promise<Backtest[]> {
   const { data } = await http.get<{ data: Backtest[] }>('/strategy/backtests')
   return data.data ?? []
+}
+
+export async function deleteBacktest(id: string): Promise<{ deleted: boolean }> {
+  const { data } = await http.delete<{ data: { deleted: boolean } }>(`/strategy/backtests/${id}`)
+  return data.data
 }
 
 export async function getBacktest(id: string): Promise<BacktestDetail> {

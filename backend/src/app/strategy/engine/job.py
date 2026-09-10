@@ -28,17 +28,21 @@ async def _materialize_ml_scorer(session, template_id: str, params: dict, model_
     """ml_score + gbdt：回测需真实树模型打分。按 model_id 从磁盘加载 pickle 注入 params。
 
     strategy_versions.params 只存 JSON（features/model_type/model_id），树对象在这里临时注入，
-    不入库、不参与任务序列化。
+    不入库、不参与任务序列化；同时把训练时记录的 flip 方向一起注入，保证“高分为多”。
     """
-    if template_id != "ml_score" or str(params.get("model_type") or "").lower() != "gbdt":
+    if template_id != "ml_score":
         return params
-    if model_row is None or not model_row.get("model_path"):
-        raise RuntimeError("模型不存在或未落盘 artifact（model_path 缺失）")
-    from ...factor.ml import load_model_pickle
-
     params = dict(params)
-    params["_booster"] = load_model_pickle(model_row["model_path"])
+    if model_row is None:
+        raise RuntimeError("模型不存在或未落盘 artifact（model_row 缺失）")
+    if str(params.get("model_type") or "").lower() == "gbdt":
+        if not model_row.get("model_path"):
+            raise RuntimeError("模型不存在或未落盘 artifact（model_path 缺失）")
+        from ...factor.ml import load_model_pickle
+
+        params["_booster"] = load_model_pickle(model_row["model_path"])
     params["features"] = model_row.get("features") or params.get("features") or []
+    params["_flip"] = float((model_row.get("dataset") or {}).get("flip", 1) or 1)
     return params
 
 
@@ -105,19 +109,20 @@ async def run_backtest_job(
     """执行一次回测并写库。"""
     async with SessionLocal() as session:
         repo = BacktestRepository(session)
-        # 0. ml_score 策略：取模型行，做训练期样本排除（评估起点抬到训练窗口后）
-        model_row = await _load_ml_model_row(session, template_id, params)
-        start = _clip_ml_start(model_row, symbol, start)
-        if start >= end:
-            train_end = (model_row or {}).get("train_end")
-            raise RuntimeError(
-                f"回测窗口与训练数据区间重叠已按样本排除（{symbol} 训练至 "
-                f"{train_end:%Y-%m-%d %H:%M}），窗口内已无样本可回测；"
-                "请选择训练结束之后的回测区间，或缩短训练期后再保存模型。"
-            )
-        await repo.update_status(backtest_id, status="running", progress_pct=5, stage="loading_data")
-        await _publish_progress(backtest_id, status="running", stage="loading_data", pct=5)
         try:
+            # 0. ml_score 策略：取模型行，做训练期样本排除（评估起点抬到训练窗口后）。
+            #    护栏校验也在 try 内：一旦触发就把该回测置为 failed 并推送终态，避免前端“排队/运行中”卡死。
+            model_row = await _load_ml_model_row(session, template_id, params)
+            start = _clip_ml_start(model_row, symbol, start)
+            if start >= end:
+                train_end = (model_row or {}).get("train_end")
+                raise RuntimeError(
+                    f"回测窗口与训练数据区间重叠已按样本排除（{symbol} 训练至 "
+                    f"{train_end:%Y-%m-%d %H:%M}），窗口内已无样本可回测；"
+                    "请选择训练结束之后的回测区间，或缩短训练期后再保存模型。"
+                )
+            await repo.update_status(backtest_id, status="running", progress_pct=5, stage="loading_data")
+            await _publish_progress(backtest_id, status="running", stage="loading_data", pct=5)
             # 1. 加载 K 线（支持自动桶聚合：库里只有 15m 时也能回测 30m/1h/1d）
             kline_repo = KlineRepository(session)
             rows = await kline_repo.query_or_aggregate(symbol, interval, start, end, limit=20000)
@@ -141,6 +146,19 @@ async def run_backtest_job(
             allow_short = bool(template_meta.get("long_short", False))
             cfg = BacktestConfig(initial_cash=100_000.0, fee_rate=0.001, allow_short=allow_short)
             bt_params = await _materialize_ml_scorer(session, template_id, params, model_row)
+            # 跨粒度聚合特征：把细粒度数据在每根粗 bar 内汇总出的 agg:* 列注入 df，供 ml_score 打分
+            agg_feats = [f for f in (bt_params.get("features") or []) if f.get("aggregate")]
+            if agg_feats:
+                from ...factor.ml import _load_fine_agg
+
+                for fi in {
+                    f.get("aggregate", {}).get("fine_interval")
+                    for f in agg_feats
+                    if f.get("aggregate", {}).get("fine_interval")
+                }:
+                    agg_series = await _load_fine_agg(kline_repo, symbol, str(fi), start, end, df.index)
+                    for code, s in agg_series.items():
+                        df[code] = s
             result = run_backtest_vectorized(
                 ohlcv=df, template_id=template_id, params=bt_params, cfg=cfg, interval=interval
             )

@@ -148,6 +148,24 @@ class UserFactorRepository:
         rows = await self.db.execute(select(self._t).order_by(_desc(self._t.c.created_at)))
         return [dict(r._mapping) for r in rows]
 
+    async def get(self, fid: UUID) -> dict[str, Any] | None:
+        result = await self.db.execute(select(self._t).where(self._t.c.id == fid))
+        row = result.first()
+        return dict(row._mapping) if row else None
+
+    async def add_tag(self, fid: UUID, tag: str) -> None:
+        row = await self.get(fid)
+        if not row:
+            return
+        tags = row.get("tags")
+        if not isinstance(tags, list):
+            tags = []
+        if tag not in tags:
+            await self.db.execute(
+                self._t.update().where(self._t.c.id == fid).values(tags=[*tags, tag])
+            )
+            await self.db.commit()
+
     async def delete(self, fid: UUID) -> None:
         await self.db.execute(self._t.delete().where(self._t.c.id == fid))
         await self.db.commit()

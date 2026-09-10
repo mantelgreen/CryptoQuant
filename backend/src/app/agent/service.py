@@ -287,24 +287,105 @@ async def pick_factors(
     }
 
 
-_TRAIN_REVIEW_SYSTEM = """你是量化多因子模型诊断专家。用户给你一次多因子模型训练的结果，你要：
+_TRAIN_REVIEW_SYSTEM = """你是量化多因子模型诊断与调参专家。用户给你一次多因子模型训练的结果，你要：
 1) 基于样本外指标判断这轮训练效果是否理想；
-2) 效果不理想时，从“进入模型的特征”里做进一步精筛，建议下一轮应保留 / 剔除哪些因子。
+2) 效果不理想时，从“进入模型的特征”里做进一步精筛（建议下一轮保留/剔除哪些因子）；
+3) 结合“当前超参数配置”给出下一轮建议的超参数（需要时才改，尽量小步）。
 
 判断基准（严格按数据）：
 - 理想：样本外 IC/RankIC 与 train 同号或方向一致、|RankIC|≥0.02、Top−Bottom 价差>0，且过拟合差距 |train_IC−OOS_IC|<0.06；
 - 一般：方向对但强度不足（0.01≤|RankIC|<0.02），或过拟合差距偏大；
 - 不理想：价差≤0、方向反转、|RankIC|<0.01，或明显在记忆噪声（train_IC 远高 OOS_IC）。
+
+诊断时的调参思路（据此给建议，不要乱给）：
+- 过拟合差距大 / OOS loss 拐点早：降低 learning_rate、提高 alpha/L2、减 n_estimators、加深正则（num_leaves/max_depth 更小）、加大 subsample/colsample 采样收紧等；
+- 信号弱但稳健：适度加大容量（gbdt 增加 num_leaves/n_estimators，ridge 调低 alpha）；
+- 样本少/噪声大：优先 Ridge 并提高 alpha；数据量大且非线性明显才用 gbdt；
+- 收益/特征离群明显（极值价差、厚尾）：适度加大 winsor（0.01→0.02→0.05）；
+- 只在确有理由时切换 model（ridge/gbdt），并把相关超参一起给出；
+- 不要把容量压到无法拟合：gbdt 的 learning_rate 不要低于 0.01、n_estimators 不要低于 100、max_depth 不要设成 1（树桩），否则输出会退化成近似常值、回测无交易。
+
 精筛原则：剔除样本外单因子 IC 方向与组合相反、|IC| 极弱、明显冗余或仅靠个别时点贡献的特征；不要为了剔除而剔除，特征数≤3 时除非某因子明显有害否则保留。
 
 只输出一个 JSON 对象（不要 markdown、不要代码块、不要解释文字）：
-{"grade":"ok|warn|bad","review":"≤220字，换行分段或用 1. 2. 3. 列要点","advice":"≤60字下一步建议","keep":["保留的因子 code，全部来自输入特征列表"],"drop":[{"code":"剔除的因子 code","reason":"≤25字理由"}]}
-- grade 只能是 ok/warn/bad；keep 至少 2 个、code 必须原样来自输入的特征列表；
-- keep 与 drop 不要重叠；效果理想时 drop 给空数组、keep 保留全部特征。"""
+{"grade":"ok|warn|bad","review":"≤220字，换行分段或用 1. 2. 3. 列要点","advice":"≤60字下一步建议","keep":["保留的因子 code，全部来自输入特征列表"],"drop":[{"code":"剔除的因子 code","reason":"≤25字理由"}],"agg_keep":["下一轮要保留的聚合特征类型"],"params":{...建议的超参，只包含需要改的键...}}
+超参 params 可用的键与范围（键名与数值要落在范围内）：
+- model: "ridge" | "gbdt"（仅在确实要换模型时给出）
+- horizon: 1~10（int）；test_ratio: 0.15~0.5
+- alpha: 0~50；max_corr: 0~0.99
+- learning_rate: 0.01~1；n_estimators: 100~5000；max_depth: -1~32；num_leaves: 2~256；subsample: 0.1~1；colsample_bytree: 0.1~1
+- winsor: 0 | 0.01 | 0.02 | 0.05（仅从这 4 个值里选，0 表示关闭稳健化；离群明显时建议调大）
+规则：
+- grade 只能是 ok/warn/bad；keep 至少 2 个、code 必须原样来自输入的特征列表；keep 与 drop 不要重叠；
+- agg_keep 的值只能来自输入里给出的“聚合特征类型”（rv/vol_imb/taker_ratio），表示下一轮保留哪些聚合特征——想剔除某个聚合特征就把它排除在 agg_keep 之外；全保留就给全量；本轮没用聚合特征时给 []；
+- 效果理想且无必要改动时 drop 给空数组、keep 保留全部特征、agg_keep 保留全部聚合特征、params 给空对象 {}；
+- params 只放“这轮值得调”的键，数值必须落在上面范围，且不能调当前模型不用的键（如 ridge 不调 learning_rate/n_estimators/…）。"""
 
 
 def _fmt_metric(v: Any, digits: int = 4) -> str:
     return "—" if v is None else f"{float(v):.{digits}f}"
+
+
+_HYPER_SPEC: dict[str, dict[str, Any]] = {
+    "model": {"type": "enum", "values": ["ridge", "gbdt"]},
+    "horizon": {"type": "int", "min": 1, "max": 10},
+    "test_ratio": {"type": "float", "min": 0.15, "max": 0.5},
+    "alpha": {"type": "float", "min": 0.0, "max": 50.0},
+    "max_corr": {"type": "float", "min": 0.0, "max": 0.99},
+    "learning_rate": {"type": "float", "min": 0.01, "max": 1.0},
+    "n_estimators": {"type": "int", "min": 100, "max": 5000},
+    "max_depth": {"type": "int", "min": -1, "max": 32},
+    "num_leaves": {"type": "int", "min": 2, "max": 256},
+    "subsample": {"type": "float", "min": 0.1, "max": 1.0},
+    "colsample_bytree": {"type": "float", "min": 0.1, "max": 1.0},
+    "winsor": {"type": "float", "min": 0.0, "max": 0.2},
+}
+
+_GBDT_KEYS = {"learning_rate", "n_estimators", "max_depth", "num_leaves", "subsample", "colsample_bytree"}
+
+_WINSOR_CHOICES = (0.0, 0.01, 0.02, 0.05)
+
+_AGG_LABELS = {"rv": "已实现波动率", "vol_imb": "量能买卖不平衡", "taker_ratio": "主动买占比"}
+
+
+def _sanitize_hypers(raw: Any, current: dict[str, Any]) -> dict[str, Any]:
+    """把 LLM 给的超参建议清洗到合法范围；剔掉当前（或拟切换后）模型用不上的键。"""
+    if not isinstance(raw, dict):
+        return {}
+    cur_model = str(current.get("model") or "ridge")
+    target_model = cur_model
+    raw_model = str(raw.get("model") or "").strip().lower()
+    if raw_model in _HYPER_SPEC["model"]["values"]:
+        target_model = raw_model
+
+    out: dict[str, Any] = {}
+    for k, v in raw.items():
+        if k == "model":
+            continue
+        spec = _HYPER_SPEC.get(k)
+        if spec is None:
+            continue
+        if target_model != "gbdt" and k in _GBDT_KEYS:
+            continue
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            continue
+        lo = float(spec["min"])
+        hi = float(spec["max"])
+        if fv < lo or fv > hi:
+            continue
+        if spec["type"] == "int":
+            fv = int(round(fv))
+            fv = max(int(lo), min(int(hi), fv))
+        else:
+            fv = max(lo, min(hi, round(fv, 4)))
+        if k == "winsor":
+            fv = min(_WINSOR_CHOICES, key=lambda c: abs(c - fv))
+        out[k] = fv
+    if target_model != cur_model:
+        out["model"] = target_model
+    return out
 
 
 def _rule_grade(metrics: dict[str, Any]) -> str:
@@ -367,7 +448,7 @@ def _rule_refine(features: list[dict[str, Any]], metrics: dict[str, Any], grade:
     return [f["code"] for f in good], drops
 
 
-def _parse_training_review(raw: str, allowed: set[str]):
+def _parse_training_review(raw: str, allowed: set[str], current_cfg: dict[str, Any] | None = None, allowed_agg: set[str] | None = None):
     obj = _extract_json_object(raw)
     grade = obj.get("grade")
     if grade not in {"ok", "warn", "bad"}:
@@ -392,7 +473,15 @@ def _parse_training_review(raw: str, allowed: set[str]):
             c = str(it.get("code", "")).strip()
             if c in allowed and c not in keep and all(d["code"] != c for d in drop):
                 drop.append({"code": c, "reason": str(it.get("reason", ""))[:100]})
-    return grade, review, advice, keep, drop
+    params = _sanitize_hypers(obj.get("params"), current_cfg or {})
+    agg_keep: list[str] = []
+    agg_allowed = allowed_agg or set()
+    if isinstance(obj.get("agg_keep"), list):
+        for a in obj["agg_keep"]:
+            a = str(a).strip()
+            if a in agg_allowed and a not in agg_keep:
+                agg_keep.append(a)
+    return grade, review, advice, keep, drop, params, agg_keep
 
 
 async def review_training(
@@ -412,7 +501,16 @@ async def review_training(
     features = features[:30]
     allowed = {f["code"] for f in features}
     metrics = payload.get("metrics") or {}
+    cfg = payload.get("config") or {}
+    cfg_txt = "；".join(f"{k}={v}" for k, v in cfg.items()) or "—"
     grade_rule = _rule_grade(metrics)
+
+    current_agg: list[str] = []
+    for a in cfg.get("agg_features") or []:
+        a = str(a).strip()
+        if a in _AGG_LABELS and a not in current_agg:
+            current_agg.append(a)
+    allowed_agg = set(current_agg)
 
     def feature_line(f: dict[str, Any]) -> str:
         return (
@@ -444,16 +542,20 @@ async def review_training(
         f"训练对象 {payload.get('symbol') or '?'} / {payload.get('interval') or '?'}，"
         f"预测窗口 h={payload.get('horizon')}，模型 {payload.get('model') or '?'}（{payload.get('engine') or '?'}），"
         f"样本 train={payload.get('n_train')} / OOS test={payload.get('n_test')}，保留特征 {len(features)} 个。\n"
+        f"当前超参配置：{cfg_txt}。\n"
         f"指标：train_IC={_fmt_metric(m.get('train_ic'))}，OOS_IC={_fmt_metric(m.get('oos_ic'))}，"
         f"OOS_RankIC={_fmt_metric(m.get('oos_rank_ic'))}，过拟合差距={_fmt_metric(m.get('overfit_gap'))}，"
-        f"命中率={_fmt_metric(m.get('hit_rate'))}%，Top−Bottom 价差={_fmt_metric(m.get('spread'))}。\n"
+        f"命中率={_fmt_metric(m.get('hit_rate'))}%，Top−Bottom 价差={_fmt_metric(m.get('spread'))}，"
+        f"净价差（扣成本）={_fmt_metric(m.get('net_spread'))}。\n"
         f"体检勾选：{checks_txt or '—'}。\n"
         f"已因相关性剔除：{removed_txt}。\n"
         f"特征明细（共 {len(features)} 个）：\n" + "\n".join(feature_line(f) for f in features) + "\n"
+        f"本轮细粒度聚合特征（fine={cfg.get('fine_interval') or '—'}）："
+        f"{'、'.join(f'{a}({_AGG_LABELS.get(a, a)})' for a in current_agg) or '无'}。\n"
         f"分层诊断：十分位单调相关 r={_fmt_metric(diag.get('monotonic_r'))}，"
         f"高分组净值终点={_fmt_metric(diag.get('q5_end'))}，低分组={_fmt_metric(diag.get('q1_end'))}。\n"
         f"LightGBM 训练曲线：{learn_txt}。\n"
-        f"请给出诊断与精筛建议（grade 与 keep/drop）。"
+        f"请给出诊断、特征精筛、聚合特征取舍与下一轮超参建议（grade、keep/drop、agg_keep、params）。"
     )
 
     provider = await resolve_provider(db, model_id)
@@ -480,12 +582,16 @@ async def review_training(
             "若是思考型模型，请在「模型设置」对该供应商勾选“关闭思维模式”，或改用非思考模型后重试"
         )
     try:
-        grade, review, advice, keep, drop = _parse_training_review(content_raw, allowed)
+        grade, review, advice, keep, drop, params, agg_keep = _parse_training_review(
+            content_raw, allowed, cfg, allowed_agg
+        )
         fallback = False
     except ValueError:
         fallback = True
+        params = {}
         grade = grade_rule
         keep, drop = _rule_refine(features, metrics, grade)
+        agg_keep = list(current_agg)
         review = {
             "ok": "样本外方向一致、价差为正且过拟合差距可控，这轮信号初步可用。建议先去回测与滚动验证，而非继续加因子。",
             "warn": "方向对但强度或过拟合差距一般，可小步调整（更多样本、更严相关性过滤、降低模型容量）后再看。",
@@ -504,6 +610,8 @@ async def review_training(
         "advice": advice,
         "keep": keep,
         "drop": drop,
+        "agg_keep": agg_keep,
+        "params": params,
         "fallback": fallback,
     }
 

@@ -31,6 +31,9 @@ export interface FactorResearch {
   decay: Record<string, number | null>
   n_total: number
   per_symbol: FactorSymbolResult[]
+  symbols?: string[]
+  start?: string
+  end?: string
   message?: string
 }
 
@@ -172,10 +175,17 @@ export interface MlTrainResult {
   train_ic: number | null
   overfit_gap: number | null
   n_features_kept: number
-  hit_rate: number
+  hit_rate: number | null
   top_quintile_mean_ret: number
   bottom_quintile_mean_ret: number
   spread: number
+  net_spread?: number | null
+  cost_bps?: number
+  fine_interval?: string | null
+  agg_features?: string[]
+  pred_nunique?: number
+  pred_std?: number
+  degenerate?: boolean
   features: MlFeature[]
   feature_filter?: MlFeatureFilter
   oos_charts?: MlOosCharts
@@ -193,6 +203,10 @@ export async function trainMl(payload: {
   alpha?: number
   model?: string
   max_corr?: number | null
+  winsor?: number | null
+  cost_bps?: number
+  fine_interval?: string | null
+  agg_features?: string[]
   learning_rate?: number
   n_estimators?: number
   max_depth?: number
@@ -224,7 +238,15 @@ export interface MlModelRow {
   interval: string
   horizon: number
   symbols: string[]
-  features: Array<{ code: string; name?: string; coef: number; mean: number; std: number; expression?: string }>
+  features: Array<{
+    code: string
+    name?: string
+    coef: number
+    mean: number
+    std: number
+    expression?: string
+    aggregate?: { type: string; fine_interval?: string | null }
+  }>
   metrics: { oos_ic?: number | null; oos_rank_ic?: number | null; hit_rate?: number | null; spread?: number | null }
   n_train: number
   n_test: number
@@ -239,6 +261,8 @@ export interface MlModelRow {
     test_ratio?: number
     n_train?: number
     n_test?: number
+    fine_interval?: string | null
+    agg_features?: string[]
     test_windows?: Array<{ symbol: string; interval: string; start: string; end: string; bars: number }>
   } | null
   created_at: string
@@ -288,6 +312,10 @@ export interface MlTrainArgs {
   alpha?: number
   model?: string
   max_corr?: number
+  winsor?: number | null
+  cost_bps?: number
+  fine_interval?: string | null
+  agg_features?: string[]
   learning_rate?: number
   n_estimators?: number
   max_depth?: number

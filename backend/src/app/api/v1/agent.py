@@ -124,6 +124,7 @@ class TrainReviewReq(BaseModel):
     removed: list[dict[str, Any]] = Field(default_factory=list)
     oos_charts: dict[str, Any] = Field(default_factory=dict)
     learning: dict[str, Any] | None = None
+    config: dict[str, Any] = Field(default_factory=dict)
     model_id: str | None = None
 
 

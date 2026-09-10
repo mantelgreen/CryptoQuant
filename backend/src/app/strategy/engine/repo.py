@@ -201,21 +201,34 @@ class BacktestRepository:
     async def save_trades(self, backtest_id: UUID, trades: list[dict[str, Any]]) -> None:
         if not trades:
             return
+        avail = set(self._tr.c.keys())
         rows = [
             {
-                "backtest_id": backtest_id,
-                "ts": datetime.fromisoformat(str(t["ts"])) if isinstance(t["ts"], str) else t["ts"],
-                "symbol": t.get("symbol", ""),
-                "side": t.get("side", "buy"),
-                "price": float(t["price"]),
-                "qty": float(t["qty"]),
-                "fee": float(t.get("fee", 0)),
-                "pnl": float(t.get("pnl", 0)),
-                "reason": None,
+                k: v
+                for k, v in {
+                    "backtest_id": backtest_id,
+                    "ts": datetime.fromisoformat(str(t["ts"])) if isinstance(t["ts"], str) else t["ts"],
+                    "symbol": t.get("symbol", ""),
+                    "side": t.get("side", "buy"),
+                    "price": float(t["price"]),
+                    "qty": float(t["qty"]),
+                    "fee": float(t.get("fee", 0)),
+                    "notional": float(t.get("notional", 0) or 0),
+                    "pnl": float(t.get("pnl", 0) or 0),
+                    "signal": float(t["signal"]) if t.get("signal") is not None else None,
+                    "position": float(t["position"]) if t.get("position") is not None else None,
+                    "basis": float(t["basis"]) if t.get("basis") is not None else None,
+                    "reason": t.get("reason"),
+                }.items()
+                if k in avail
             }
             for t in trades
         ]
-        await self.db.execute(self._tr.insert().values(rows))
+        if not rows:
+            return
+        # asyncpg 单条 SQL 参数有上限（32767），按行分块批量插入
+        for i in range(0, len(rows), 1500):
+            await self.db.execute(self._tr.insert().values(rows[i : i + 1500]))
         await self.db.commit()
 
     async def get_equity(self, run_type: str, run_id: UUID, limit: int = 2000) -> list[dict[str, Any]]:

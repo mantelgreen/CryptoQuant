@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { Boxes, FlaskConical, Info, LayoutGrid, List, ListChecks, LoaderCircle, RefreshCw, Search, Send, Sparkles, Trash2, X } from '@lucide/vue'
+import { Boxes, Copy, FlaskConical, Info, LayoutGrid, List, ListChecks, LoaderCircle, RefreshCw, Search, Send, Sparkles, Trash2, X } from '@lucide/vue'
 import PageHeader from '@/components/ui/PageHeader.vue'
 import HelpDrawer, { type PageHelp } from '@/components/ui/HelpDrawer.vue'
 import Panel from '@/components/ui/Panel.vue'
@@ -26,7 +26,7 @@ import {
 import EquityChart from '@/components/chart/EquityChart.vue'
 import { pickFactorsByAi, type FactorPickItem, type FactorPick } from '@/api/agent'
 import { useTrainHandoffStore } from '@/stores/trainHandoff'
-import { INTERVALS, MAJOR_SYMBOLS, timeAgo, fmtTime } from '@/utils/format'
+import { INTERVALS, MAJOR_SYMBOLS, timeAgo, fmtTime, MAX_ML_FEATURES } from '@/utils/format'
 
 const pageHelp: PageHelp = {
   title: '因子库与研究',
@@ -123,6 +123,9 @@ function toResearch(r: FactorRun, meta: FactorMeta | undefined): FactorResearch 
     decay: { h_1: r.ic_h1, h_3: r.ic_h3, h_5: r.ic_h5 },
     n_total: r.n,
     per_symbol: [],
+    symbols: (r.symbol || '').split('|').filter(Boolean),
+    start: r.start_time,
+    end: r.end_time,
   }
 }
 
@@ -132,15 +135,36 @@ async function prefillRuns() {
     if (!runs.length) return
     const metaByCode = new Map(factors.value.map((f) => [f.code, f]))
     const out: Record<string, FactorResearch> = {}
-    // 只回填“当前库中仍存在”的因子：避免把历史里已删除/已被移除的因子 code 算进统计
+    const latestByCode: Record<string, FactorRun> = {}
     for (const r of runs) {
-      const meta = metaByCode.get(r.code)
-      if (meta) out[r.code] = toResearch(r, meta)
+      // runs 按 created_at 降序，第一次遇到即最新
+      if (metaByCode.has(r.code) && !(r.code in latestByCode)) {
+        latestByCode[r.code] = r
+      }
+    }
+    // 优先默认口径（BTCUSDT/1d），取其中最新
+    for (const r of runs) {
+      const code = r.code
+      if (!metaByCode.has(code) || code in out) continue
+      if ((r.symbol || '').split('|').includes('BTCUSDT') && r.interval === '1d') {
+        out[code] = toResearch(r, metaByCode.get(code))
+      }
+    }
+    // 无默认口径记录的因子，退回到最新一次（任意口径）
+    for (const code in latestByCode) {
+      if (!(code in out)) out[code] = toResearch(latestByCode[code], metaByCode.get(code))
     }
     results.value = out
   } catch {
     /* 历史读取失败不阻塞列表 */
   }
+}
+
+function researchScope(r: FactorResearch | undefined): string {
+  if (!r) return ''
+  const syms = r.symbols ?? []
+  const s = syms.length === 1 ? syms[0] : syms.length > 1 ? `${syms[0]}等${syms.length}` : ''
+  return `${s ? s + '·' : ''}${r.interval}`
 }
 
 const bulkRunning = ref(false)
@@ -227,6 +251,17 @@ function resultOf(code: string): FactorResearch | undefined {
 function chipTags(f: FactorMeta): string[] {
   // AI 已由右上角 tone-ai 徽标表达，避免在标签区重复
   return (f.tags ?? []).filter((t) => !(f.is_user && t === 'AI'))
+}
+
+function tagTone(t: string): string {
+  return t === '优质' ? 'tone-up' : 'tone-neutral'
+}
+
+function copyFormula(f: FactorMeta) {
+  navigator.clipboard?.writeText(f.expression ?? f.code).then(
+    () => toast.success('已复制公式', f.name),
+    () => toast.error('复制失败'),
+  )
 }
 
 function decay1(r: FactorResearch | undefined): string {
@@ -460,6 +495,23 @@ function cancelFabDrag() {
 function candMeasured(r: FactorResearch | undefined): boolean {
   return !!r?.found && (r.ic != null || r.rank_ic != null)
 }
+
+const IC_REUSE_MAX_AGE_MS = 7 * 24 * 3600 * 1000
+const IC_REUSE_MIN_WINDOW_MS = 300 * 24 * 3600 * 1000
+function reuseIc(r: FactorResearch | undefined): boolean {
+  if (!r?.found || (r.ic == null && r.rank_ic == null)) return false
+  if (r.interval !== '1d') return false
+  if (!(r.symbols ?? []).includes('BTCUSDT')) return false
+  if (r.end) {
+    const age = Date.now() - new Date(r.end).getTime()
+    if (!Number.isFinite(age) || age > IC_REUSE_MAX_AGE_MS) return false
+  }
+  if (r.start && r.end) {
+    const span = new Date(r.end).getTime() - new Date(r.start).getTime()
+    if (Number.isFinite(span) && span < IC_REUSE_MIN_WINDOW_MS) return false
+  }
+  return true
+}
 function toPickItem(meta: FactorMeta, r: FactorResearch): FactorPickItem {
   return {
     code: meta.code,
@@ -509,9 +561,14 @@ async function aiSelect() {
   aiPicks.value = []
   aiPhase.value = '准备候选因子的实测数据…'
   try {
-    // 统一用 BTCUSDT/1d/近一年窗口重新体检目标池，保证送入 AI 的数据口径一致
-    const need = pool.map((f) => f.code)
-    await measureCodes(need, (s) => (aiPhase.value = s))
+    // 统一口径为 BTCUSDT/1d/近一年：已存在同口径且足够新鲜的 IC 直接复用，只补测缺失/过期/口径不符的因子
+    const allCodes = pool.map((f) => f.code)
+    const need = allCodes.filter((c) => !reuseIc(results.value[c]))
+    if (need.length) {
+      await measureCodes(need, (s) => (aiPhase.value = s))
+    } else {
+      aiPhase.value = '复用已有 IC（BTCUSDT/1d），无需重算…'
+    }
     const usable = pool
       .map((f) => ({ f, r: results.value[f.code] }))
       .filter((x): x is { f: FactorMeta; r: FactorResearch } => !!x.r && candMeasured(x.r))
@@ -552,8 +609,8 @@ function sendToTrain() {
     toast.error('候选池为空', '请先勾选因子，或点「AI 选」让模型挑选')
     return
   }
-  const codes = set.slice(0, 12).map((f) => f.code)
-  if (set.length > 12) toast.info('已截取前 12 个', '模型训练页最多支持 12 个特征因子')
+  const codes = set.slice(0, MAX_ML_FEATURES).map((f) => f.code)
+  if (set.length > MAX_ML_FEATURES) toast.info(`已截取前 ${MAX_ML_FEATURES} 个`, `模型训练页最多支持 ${MAX_ML_FEATURES} 个特征因子`)
   useTrainHandoffStore().stage(codes)
   void router.push({ name: 'ml-train' })
 }
@@ -688,7 +745,7 @@ onMounted(load)
               </span>
               <div class="min-w-0 flex-1">
                 <h3 class="truncate text-[15px] font-semibold text-fg">{{ f.name }}</h3>
-                <p class="truncate font-mono text-[11px] text-subtle" :title="f.is_user ? f.expression : f.code">{{ f.is_user ? (f.expression ?? f.code) : f.code }}</p>
+                <p v-if="!f.is_user" class="truncate font-mono text-[11px] text-subtle" :title="f.code">{{ f.code }}</p>
               </div>
               <span class="badge shrink-0" :class="f.is_user ? 'tone-ai' : 'tone-neutral'">{{ f.is_user ? 'AI' : '内置' }}</span>
               <button
@@ -703,8 +760,15 @@ onMounted(load)
 
             <p class="mt-3 line-clamp-2 flex-1 text-[13px] leading-relaxed text-muted">{{ f.description }}</p>
 
+            <div v-if="f.is_user && f.expression" class="mt-2.5 flex items-start gap-1.5">
+              <code class="min-w-0 flex-1 max-h-24 overflow-y-auto whitespace-pre-wrap break-all rounded-md bg-inset px-2.5 py-2 font-mono text-[10.5px] leading-relaxed text-fg">{{ f.expression }}</code>
+              <button class="btn btn-icon !h-7 !w-7 shrink-0 text-muted hover:text-fg" title="复制公式" @click="copyFormula(f)">
+                <Copy :size="12" />
+              </button>
+            </div>
+
             <div class="mt-3 flex flex-wrap gap-1.5">
-              <span v-for="t in chipTags(f)" :key="t" class="badge tone-neutral">{{ t }}</span>
+              <span v-for="t in chipTags(f)" :key="t" class="badge" :class="tagTone(t)">{{ t }}</span>
               <span v-if="f.min_bars" class="badge tone-neutral">需 ≥{{ f.min_bars }} bar</span>
             </div>
 
@@ -725,7 +789,7 @@ onMounted(load)
                   <span class="num font-semibold text-fg">{{ resultOf(f.code)?.rank_ic ?? '—' }}</span>
                 </div>
                 <div class="mt-1 flex items-center justify-between text-[11px] text-subtle">
-                  <span>样本 {{ resultOf(f.code)?.n_total ?? 0 }}</span>
+                  <span>样本 {{ resultOf(f.code)?.n_total ?? 0 }}<template v-if="researchScope(resultOf(f.code))"> · {{ researchScope(resultOf(f.code)) }}</template></span>
                   <span class="font-mono">衰减 h1 = {{ decay1(resultOf(f.code)) }}</span>
                 </div>
               </template>
@@ -782,7 +846,7 @@ onMounted(load)
                   </td>
                   <td>
                     <div class="flex max-w-[12rem] flex-wrap gap-1">
-                      <span v-for="t in chipTags(f)" :key="t" class="badge tone-neutral !h-[16px] !px-1.5 text-[9px]">{{ t }}</span>
+                      <span v-for="t in chipTags(f)" :key="t" class="badge !h-[16px] !px-1.5 text-[9px]" :class="tagTone(t)">{{ t }}</span>
                       <span v-if="f.min_bars" class="badge tone-neutral !h-[16px] !px-1.5 text-[9px]">≥{{ f.min_bars }} bar</span>
                     </div>
                   </td>
@@ -790,7 +854,7 @@ onMounted(load)
                     <template v-if="resultOf(f.code)">
                       <span class="block font-mono text-[11px]" :class="(resultOf(f.code)?.ic ?? 0) >= 0 ? 'text-up' : 'text-down'">IC {{ fmtR(resultOf(f.code)?.ic) }}</span>
                       <span class="mt-0.5 block font-mono text-[11px] text-fg">RankIC {{ fmtR(resultOf(f.code)?.rank_ic) }}</span>
-                      <span class="mt-0.5 block font-mono text-[10px] text-subtle">n={{ resultOf(f.code)?.n_total ?? 0 }} · h1 {{ decay1(resultOf(f.code)) }}</span>
+                      <span class="mt-0.5 block font-mono text-[10px] text-subtle">n={{ resultOf(f.code)?.n_total ?? 0 }} · h1 {{ decay1(resultOf(f.code)) }}<template v-if="researchScope(resultOf(f.code))"> · {{ researchScope(resultOf(f.code)) }}</template></span>
                     </template>
                     <span v-else class="text-xs text-subtle">—</span>
                   </td>
