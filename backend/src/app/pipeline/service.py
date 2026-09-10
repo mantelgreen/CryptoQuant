@@ -872,6 +872,7 @@ _TRAIN_CFG_KEYS = (
     "n_estimators",
     "max_depth",
     "num_leaves",
+    "min_child_samples",
     "subsample",
     "colsample_bytree",
 )
