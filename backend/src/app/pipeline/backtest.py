@@ -93,6 +93,11 @@ async def run_pipeline_backtest(
         "metrics": metrics,
         "final_equity": float(equity.iloc[-1]) if len(equity) else None,
         "bars": len(equity),
+        "params": {
+            "window": int(window or 60),
+            "enter_q": float(enter_q or 0.8),
+            "exit_q": float(exit_q or 0.2),
+        },
     }
     return {
         "found": True,

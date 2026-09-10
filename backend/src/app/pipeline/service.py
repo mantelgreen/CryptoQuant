@@ -166,6 +166,10 @@ def _normalize_config(cfg: dict[str, Any]) -> dict[str, Any]:
     out["min_child_samples"] = max(
         5, min(200, int(cfg.get("min_child_samples") or 20))
     )
+    # 回测择时参数：score 滚动分位窗口 + 进出场分位（可配，默认 60/0.8/0.2）
+    out["bt_window"] = max(20, min(240, int(cfg.get("bt_window") or 60)))
+    out["bt_enter_q"] = max(0.5, min(0.95, float(cfg.get("bt_enter_q") or 0.8)))
+    out["bt_exit_q"] = max(0.05, min(0.5, float(cfg.get("bt_exit_q") or 0.2)))
     out["thresholds"] = th
     out["stop_on_excellent"] = bool(cfg.get("stop_on_excellent", True))
     out["save_quality_factors"] = bool(cfg.get("save_quality_factors", True))
@@ -692,6 +696,9 @@ async def _backtest(
         start=_parse_dt(cfg["backtest_start"]),
         end=_parse_dt(cfg["backtest_end"]),
         artifact=train_resp["artifact"],
+        window=int(cfg.get("bt_window") or 60),
+        enter_q=float(cfg.get("bt_enter_q") or 0.8),
+        exit_q=float(cfg.get("bt_exit_q") or 0.2),
     )
 
 
