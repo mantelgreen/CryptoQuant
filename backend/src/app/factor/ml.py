@@ -41,7 +41,6 @@ _INTERVAL_SEC = {
     "1h": 3600, "2h": 7200, "4h": 14400, "6h": 21600, "12h": 43200,
     "1d": 86400, "3d": 259200, "1w": 604800,
 }
-_FINE_LIMIT = 1_000_000
 
 
 def model_storage_dir() -> Path:
@@ -67,7 +66,7 @@ def load_model_pickle(rel: str) -> Any:
 
 
 async def _load_frame(repo: KlineRepository, symbol: str, interval: str, start: datetime, end: datetime) -> pd.DataFrame:
-    rows = await repo.query_or_aggregate(symbol, interval, start, end, limit=50_000)
+    rows = await repo.query_or_aggregate(symbol, interval, start, end)
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows)
@@ -98,7 +97,7 @@ async def _load_fine_agg(
 
     返回以 coarse_index 为索引的 Series 字典（缺失桶为 NaN）。
     """
-    rows = await repo.query_or_aggregate(symbol, fine_interval, start, end, limit=_FINE_LIMIT)
+    rows = await repo.query_or_aggregate(symbol, fine_interval, start, end)
     if not rows:
         return {}
     fdf = pd.DataFrame(rows)
@@ -301,6 +300,70 @@ def _build_oos_diag(
     return out
 
 
+def _eval_block(pred: np.ndarray, y: np.ndarray, cost_bps: float) -> dict[str, Any]:
+    """样本外评价块（返回未取整的原始值，由调用方决定展示精度）。
+
+    IC / RankIC / 方向命中率 / Top−Bottom 价差 / 模型退化体检。
+    """
+    ic = _pearson_arr(pred, y)
+    rank_ic = _spearman(pred, y)
+    nz = np.abs(y) > 1e-12
+    hit = (
+        float(np.mean(np.sign(pred[nz]) == np.sign(y[nz])))
+        if int(nz.sum()) > 0
+        else float("nan")
+    )
+    k = max(5, int(len(pred) * 0.2)) if len(pred) else 0
+    if k:
+        order = np.argsort(pred)
+        top = order[-k:]
+        bottom = order[:k]
+        top_mean = float(y[top].mean())
+        btm_mean = float(y[bottom].mean())
+    else:
+        top_mean = btm_mean = float("nan")
+    spread = top_mean - btm_mean
+    net_spread = spread - float(cost_bps) / 1e4
+    pred_nunique = int(len(np.unique(np.round(pred, 10)))) if pred.size else 0
+    pred_std = float(np.std(pred)) if pred.size else 0.0
+    degenerate = bool(pred.size > 0 and (pred_nunique < 20 or pred_nunique < 0.05 * pred.size))
+    return {
+        "ic": ic,
+        "rank_ic": rank_ic,
+        "hit": hit,
+        "top_mean": top_mean,
+        "btm_mean": btm_mean,
+        "spread": spread,
+        "net_spread": net_spread,
+        "pred_nunique": pred_nunique,
+        "pred_std": pred_std,
+        "degenerate": degenerate,
+    }
+
+
+def _univariate_block(
+    Xz: np.ndarray, y: np.ndarray, feature_cols: list[str], w: np.ndarray, extras: dict | None
+) -> list[dict[str, Any]]:
+    """逐特征单因子 IC（在给定样本块上），按 |coef| 降序。"""
+    out: list[dict[str, Any]] = []
+    for i, code in enumerate(feature_cols):
+        col = Xz[:, i]
+        ui = _pearson_arr(col, y) if len(np.unique(col)) > 2 else float("nan")
+        ur = _spearman(col, y) if len(np.unique(col)) > 2 else float("nan")
+        out.append(
+            {
+                "code": code,
+                "name": _AGG_NAMES.get(code)
+                or (meta_or_extra(code, extras) or {}).get("name", code),
+                "coef": round(float(w[i]), 5),
+                "ic_oos": round(ui, 5) if not math.isnan(ui) else None,
+                "rank_ic_oos": round(ur, 5) if not math.isnan(ur) else None,
+            }
+        )
+    out.sort(key=lambda x: abs(x["coef"]), reverse=True)
+    return out
+
+
 async def run_ml_research(
     repo: KlineRepository,
     codes: list[str],
@@ -310,6 +373,7 @@ async def run_ml_research(
     end: datetime,
     horizon: int = 1,
     test_ratio: float = 0.25,
+    val_ratio: float = 0.0,
     alpha: float = 1.0,
     max_corr: float | None = 0.85,
     winsor: float | None = None,
@@ -348,8 +412,11 @@ async def run_ml_research(
 
     Xtr_parts: list[np.ndarray] = []
     ytr_parts: list[np.ndarray] = []
+    Xval_parts: list[np.ndarray] = []
+    yval_parts: list[np.ndarray] = []
     Xte_parts: list[np.ndarray] = []
     yte_parts: list[np.ndarray] = []
+    val_time_parts: list[np.ndarray] = []
     te_time_parts: list[np.ndarray] = []
     used_symbols: list[str] = []
     feature_cols: list[str] = []
@@ -382,16 +449,36 @@ async def run_ml_research(
         X = sub[cols].to_numpy(dtype=float)
         y = sub["label"].to_numpy(dtype=float)
         n = len(sub)
-        n_test = max(30, int(n * test_ratio))
-        n_train = n - n_test
-        # purge：训练与测试之间留 horizon 根缓冲，避免重叠泄漏
+        # 时间序切分：train | (purge) | val | (purge) | test。测试集只在最终评估用一次；
+        # 验证集用于方向校准/调参/因子精筛；purge 留 horizon 根缓冲避免标签重叠泄漏。
         purge = max(1, horizon)
-        te_start = n_train
-        tr_end = max(1, te_start - purge)
-        Xte_parts.append(X[te_start:])
-        yte_parts.append(y[te_start:])
+        n_test = max(30, int(n * test_ratio))
+        use_val = bool(val_ratio and val_ratio > 0)
+        n_val = max(30, int(n * val_ratio)) if use_val else 0
+        if use_val and n - n_test - n_val < 60:
+            use_val = False
+            n_val = 0
+        te_start = n - n_test
+        if use_val:
+            val_end = te_start - purge
+            val_start = val_end - n_val
+            tr_end = val_start - purge
+            if tr_end < 60:
+                use_val = False
+                n_val = 0
+        if not use_val:
+            tr_end = max(1, te_start - purge)
+
         Xtr_parts.append(X[:tr_end])
         ytr_parts.append(y[:tr_end])
+        if use_val:
+            Xval_parts.append(X[val_start:val_end])
+            yval_parts.append(y[val_start:val_end])
+            val_time_parts.append(
+                np.asarray(sub.index[val_start:val_end], dtype="datetime64[ns]")
+            )
+        Xte_parts.append(X[te_start:])
+        yte_parts.append(y[te_start:])
         used_symbols.append(sym)
         te_time_parts.append(np.asarray(sub.index[te_start:], dtype="datetime64[ns]"))
         # 记录该标的本轮切出的真实测试段时间窗（末段 n_test 根），供模型库展示测试集
@@ -416,9 +503,22 @@ async def run_ml_research(
     Xte = np.vstack(Xte_parts)
     yte = np.concatenate(yte_parts)
     te_time = np.concatenate(te_time_parts) if te_time_parts else np.array([], dtype="datetime64[ns]")
+    has_val = bool(Xval_parts)
+    if has_val:
+        Xval = np.vstack(Xval_parts)
+        yval = np.concatenate(yval_parts)
+        val_time = (
+            np.concatenate(val_time_parts)
+            if val_time_parts
+            else np.array([], dtype="datetime64[ns]")
+        )
+    else:
+        Xval = np.empty((0, Xtr.shape[1]))
+        yval = np.array([], dtype=float)
+        val_time = np.array([], dtype="datetime64[ns]")
 
     # —— 稳健化：用训练集分位数对特征与标签做 Winsorize，钳制厚尾离群值 ——
-    # 特征需 train/test 同口径钳制（打分时同样用这些边界）；标签只对训练目标稳健化，
+    # 特征需 train/val/test 同口径钳制（打分时同样用这些边界）；标签只对训练目标稳健化，
     # 样本外评价仍用原始收益，保证 IC/价差/命中率反映真实可交易表现。
     clip_low: np.ndarray | None = None
     clip_high: np.ndarray | None = None
@@ -426,6 +526,8 @@ async def run_ml_research(
         clip_low, clip_high = _clip_bounds(Xtr, winsor)
         Xtr = np.clip(Xtr, clip_low, clip_high)
         Xte = np.clip(Xte, clip_low, clip_high)
+        if has_val:
+            Xval = np.clip(Xval, clip_low, clip_high)
         y_lo = float(np.quantile(ytr, winsor))
         y_hi = float(np.quantile(ytr, 1.0 - winsor))
         ytr = np.clip(ytr, y_lo, y_hi)
@@ -435,6 +537,8 @@ async def run_ml_research(
     feature_cols = [feature_cols[i] for i in keep_idx]
     Xtr = Xtr[:, keep_idx]
     Xte = Xte[:, keep_idx]
+    if has_val:
+        Xval = Xval[:, keep_idx]
     if clip_low is not None and clip_high is not None:
         clip_low = clip_low[keep_idx]
         clip_high = clip_high[keep_idx]
@@ -445,6 +549,7 @@ async def run_ml_research(
     sd = Xtr.std(axis=0)
     sd[sd == 0] = 1.0
     Xte_z = (Xte - mu) / sd
+    Xval_z = (Xval - mu) / sd if has_val else np.empty((0, Xtr_z.shape[1]))
 
     # LightGBM 超参先做联合约束：max_depth>0 时需满足 num_leaves <= 2^max_depth，否则训练期抛 LightGBMError
     max_depth_v = max(-1, int(max_depth))
@@ -470,13 +575,16 @@ async def run_ml_research(
             "random_state": 7,
         }
         booster = None
+        # 学习曲线用验证集（无验证集时退回测试集），仅用于诊断，不参与早停
+        eval_X = (Xtr_z, Xval_z) if has_val else (Xtr_z, Xte_z)
+        eval_y = (ytr, yval) if has_val else (ytr, yte)
         try:  # 记录每轮 train/oos 损失做学习曲线（仅用于展示，不参与早停）
             evals: dict[str, Any] = {}
             booster = LGBMRegressor(**lgb_params).fit(
                 Xtr_z,
                 ytr,
-                eval_X=(Xtr_z, Xte_z),
-                eval_y=(ytr, yte),
+                eval_X=eval_X,
+                eval_y=eval_y,
                 eval_names=["train", "oos"],
                 eval_metric="l2",
                 callbacks=[record_evaluation(evals)],
@@ -508,74 +616,55 @@ async def run_ml_research(
         except ImportError:
             engine = "numpy-ridge"
 
-    # —— 样本外评价 ——
-    def _pearson(a: np.ndarray, b: np.ndarray) -> float:
-        if a.std() == 0 or b.std() == 0:
-            return float("nan")
-        return float(np.corrcoef(a, b)[0, 1])
-
+    # —— 方向自校准：仅用「训练集」决定符号，避免用验证/测试集挑方向（防泄漏） ——
     if model_name == "ridge":
         pred_train = Xtr_z @ w
+        pred_val = Xval_z @ w if has_val else np.array([])
     else:
         pred_train = booster.predict(Xtr_z)
+        pred_val = booster.predict(Xval_z) if has_val else np.array([])
+    pred = Xte_z @ w if model_name == "ridge" else booster.predict(Xte_z)
 
-    # —— 方向自校准：若模型整体“反向”（OOS RankIC<0），统一翻转为“高预测分=高未来收益”，
-    #    使 hit / Top−Bottom 价差 / OOS IC 与下游“高分做多”语义一致。
     pred_flip = 1.0
-    raw_rank = _spearman(pred, yte)
+    raw_rank = _spearman(pred_train, ytr)
     if not math.isnan(raw_rank) and raw_rank < 0:
         pred_flip = -1.0
-        pred = -pred
         pred_train = -pred_train
+        pred = -pred
+        if has_val:
+            pred_val = -pred_val
 
-    train_ic = _pearson(pred_train, ytr)
-    oos_ic = _pearson(pred, yte)
+    train_ic = _pearson_arr(pred_train, ytr)
+    test = _eval_block(pred, yte, cost_bps)
+    val = _eval_block(pred_val, yval, cost_bps) if has_val else None
+
+    oos_ic = test["ic"]
+    oos_rank_ic = test["rank_ic"]
     overfit_gap = (
-        abs(train_ic - oos_ic) if not math.isnan(train_ic) and not math.isnan(oos_ic) else None
-    )
-    oos_rank_ic = _spearman(pred, yte)
-    nz = np.abs(yte) > 1e-12
-    hit = (
-        float(np.mean(np.sign(pred[nz]) == np.sign(yte[nz])))
-        if int(nz.sum()) > 0
-        else float("nan")
+        abs(train_ic - oos_ic)
+        if not math.isnan(train_ic) and not math.isnan(oos_ic)
+        else None
     )
 
-    # top/bottom 20% 平均未来收益差（长空价差代理）
-    k = max(5, int(len(pred) * 0.2))
-    order = np.argsort(pred)
-    bottom = order[:k]
-    top = order[-k:]
-    top_mean = float(yte[top].mean())
-    btm_mean = float(yte[bottom].mean())
-    spread = top_mean - btm_mean
-    net_spread = spread - float(cost_bps) / 1e4
+    def _r(v: Any, n: int) -> float | None:
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            return None
+        return round(fv, n) if not math.isnan(fv) else None
 
-    # —— 模型退化体检：预测近似常值（唯一取值极少 / 标准差极小）意味着几乎无择时区分度 ——
-    pred_nunique = int(len(np.unique(np.round(pred, 10)))) if pred.size else 0
-    pred_std = float(np.std(pred)) if pred.size else 0.0
-    degenerate = bool(pred.size > 0 and (pred_nunique < 20 or pred_nunique < 0.05 * pred.size))
-
-    univariate: list[dict[str, Any]] = []
-    for i, code in enumerate(feature_cols):
-        col = Xte_z[:, i]
-        ui = _pearson(col, yte) if len(np.unique(col)) > 2 else float("nan")
-        ur = _spearman(col, yte) if len(np.unique(col)) > 2 else float("nan")
-        univariate.append(
-            {
-                "code": code,
-                "name": _AGG_NAMES.get(code) or (meta_or_extra(code, extras) or {}).get("name", code),
-                "coef": round(float(w[i]), 5),
-                "ic_oos": round(ui, 5) if not math.isnan(ui) else None,
-                "rank_ic_oos": round(ur, 5) if not math.isnan(ur) else None,
-            }
-        )
-    univariate.sort(key=lambda x: abs(x["coef"]), reverse=True)
+    univariate = _univariate_block(Xte_z, yte, feature_cols, w, extras)
+    val_univariate = (
+        _univariate_block(Xval_z, yval, feature_cols, w, extras) if has_val else None
+    )
 
     # —— 样本外诊断图表：散点 / 十分位单调性 / 分层净值（逐样本 pred·actual·时间） ——
     oos_charts: dict[str, Any] = {}
     if te_time.size == yte.size and yte.size > 0:
         oos_charts = _build_oos_diag(te_time, pred, yte)
+    val_charts: dict[str, Any] = {}
+    if has_val and val_time.size == yval.size and yval.size > 0:
+        val_charts = _build_oos_diag(val_time, pred_val, yval)
 
     artifact = {
         "model": model_name,
@@ -631,24 +720,45 @@ async def run_ml_research(
         "test_windows": test_windows,
         "n_train": int(len(ytr)),
         "n_test": int(len(yte)),
+        "n_val": int(len(yval)) if has_val else 0,
+        "val_ratio": val_ratio,
         "feature_filter": {"max_corr": max_corr, "removed": removed_feats},
-        "oos_ic": round(oos_ic, 5) if not math.isnan(oos_ic) else None,
-        "oos_rank_ic": round(oos_rank_ic, 5) if not math.isnan(oos_rank_ic) else None,
-        "train_ic": round(train_ic, 5) if not math.isnan(train_ic) else None,
-        "overfit_gap": round(overfit_gap, 5) if overfit_gap is not None else None,
+        "oos_ic": _r(oos_ic, 5),
+        "oos_rank_ic": _r(oos_rank_ic, 5),
+        "train_ic": _r(train_ic, 5),
+        "overfit_gap": _r(overfit_gap, 5),
         "n_features_kept": len(feature_cols),
-        "hit_rate": round(hit, 5) if not math.isnan(hit) else None,
-        "top_quintile_mean_ret": round(top_mean, 6),
-        "bottom_quintile_mean_ret": round(btm_mean, 6),
-        "spread": round(spread, 6),
-        "net_spread": round(net_spread, 6),
-        "pred_nunique": pred_nunique,
-        "pred_std": round(pred_std, 8),
-        "degenerate": degenerate,
+        "hit_rate": _r(test["hit"], 5),
+        "top_quintile_mean_ret": _r(test["top_mean"], 6),
+        "bottom_quintile_mean_ret": _r(test["btm_mean"], 6),
+        "spread": _r(test["spread"], 6),
+        "net_spread": _r(test["net_spread"], 6),
+        "pred_nunique": test["pred_nunique"],
+        "pred_std": _r(test["pred_std"], 8),
+        "degenerate": test["degenerate"],
         "flip": pred_flip,
         "features": univariate,
         "oos_charts": oos_charts,
     }
+    if val is not None:
+        resp.update(
+            {
+                "val_ic": _r(val["ic"], 5),
+                "val_rank_ic": _r(val["rank_ic"], 5),
+                "val_hit_rate": _r(val["hit"], 5),
+                "val_spread": _r(val["spread"], 6),
+                "val_net_spread": _r(val["net_spread"], 6),
+                "val_overfit_gap": _r(
+                    abs(train_ic - val["ic"])
+                    if not math.isnan(train_ic) and not math.isnan(val["ic"])
+                    else None,
+                    5,
+                ),
+                "val_degenerate": val["degenerate"],
+                "val_features": val_univariate,
+                "val_charts": val_charts,
+            }
+        )
     if learning is not None:
         resp["learning"] = learning
     if return_artifact:

@@ -26,7 +26,7 @@ async def run_pipeline_backtest(
 
     artifact 含 features / flip / booster（gbdt）。返回 {found, metrics, summary, equity_points, n_trades}。
     """
-    rows = await repo.query_or_aggregate(symbol, interval, start, end, limit=20_000)
+    rows = await repo.query_or_aggregate(symbol, interval, start, end)
     if not rows:
         return {"found": False, "message": "回测窗口内无数据（请先下载 K 线）"}
     df = pd.DataFrame(rows)
@@ -73,7 +73,20 @@ async def run_pipeline_backtest(
         {"ts": pd.Timestamp(ts).to_pydatetime().isoformat(), "equity": round(float(v), 2)}
         for ts, v in equity.iloc[::step].items()
     ]
-    metrics = result["metrics"]
+    metrics = dict(result["metrics"])
+
+    # —— 基准：同区间买入持有（B&H），用于判断策略是否真有超额收益 ——
+    close = df["close"].dropna()
+    if len(close) >= 2 and float(close.iloc[0]) > 0:
+        bench_equity = close / float(close.iloc[0])
+        benchmark_return = float(bench_equity.iloc[-1] - 1)
+        benchmark_mdd = float((bench_equity / bench_equity.cummax() - 1).min())
+        metrics["benchmark_return"] = round(benchmark_return, 6)
+        metrics["benchmark_max_drawdown"] = round(benchmark_mdd, 6)
+        metrics["excess_return"] = round(
+            float(metrics.get("total_return") or 0.0) - benchmark_return, 6
+        )
+
     summary = {
         "symbol": symbol,
         "interval": interval,

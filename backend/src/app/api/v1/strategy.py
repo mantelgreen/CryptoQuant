@@ -39,7 +39,7 @@ class RunBacktestReq(BaseModel):
     strategy_id: UUID
     version_id: UUID | None = None
     symbol: str
-    interval: str = Field(..., pattern="^(1m|5m|15m|30m|1h|2h|4h|6h|12h|1d)$")
+    interval: str = Field(..., pattern="^(15m|30m|1h|2h|4h|6h|12h|1d)$")
     start: datetime
     end: datetime
     params: dict[str, Any] = {}

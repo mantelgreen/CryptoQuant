@@ -9,7 +9,19 @@ from sqlalchemy import and_, desc, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ...core.config import get_settings
 from ..models.orm import download_jobs_table, klines_table, scheduled_jobs_table
+
+
+def _capped_limit(limit: int | None) -> int | None:
+    """limit=None（不限制）时用配置的全局上限兜底，防止长窗口一次性读入过多行。
+
+    `KLINE_QUERY_MAX_ROWS<=0` 表示真正不限制；显式传入的 limit 原样返回。
+    """
+    if limit is not None:
+        return limit
+    cap = int(get_settings().KLINE_QUERY_MAX_ROWS or 0)
+    return cap if cap > 0 else None
 
 # interval -> 秒（用于判断“目标粒度是否能由底库粒度整除聚合”）
 _INTERVAL_SECONDS: dict[str, int] = {
@@ -62,8 +74,9 @@ class KlineRepository:
         interval: str,
         start: datetime,
         end: datetime,
-        limit: int = 1000,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
+        limit = _capped_limit(limit)
         stmt = (
             select(self._t)
             .where(
@@ -75,8 +88,9 @@ class KlineRepository:
                 )
             )
             .order_by(self._t.c.open_time.asc())
-            .limit(limit)
         )
+        if limit is not None:
+            stmt = stmt.limit(limit)
         result = await self.db.execute(stmt)
         return [dict(row._mapping) for row in result]
 
@@ -116,9 +130,11 @@ class KlineRepository:
         interval: str,
         start: datetime,
         end: datetime,
-        limit: int = 1000,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         """优先按存储粒度精确查询；若该粒度原始数据不全，则用更细粒度底库做桶聚合。
+
+        limit=None 表示不截断（默认），返回窗口内全部数据；传入正整数则只取最早 limit 根。
 
         例如：ETH 只存了 30 根 1d（2026-08-09 起），但 1m 底库完整覆盖到 2025-01，
         请求 1d 时发现 1d 开始得比 1m 晚 → 改由 1m 聚合，保证“更早历史”不丢。
@@ -126,6 +142,7 @@ class KlineRepository:
         target_sec = _INTERVAL_SECONDS.get(interval)
         if target_sec is None or interval not in _BUCKET_LITERAL:
             return []
+        limit = _capped_limit(limit)
 
         cov = await self.coverage(symbol)
         cov_min = {row["interval"]: row.get("min_time") for row in cov}
@@ -163,6 +180,7 @@ class KlineRepository:
         # bucket 来自内部白名单 _BUCKET_LITERAL，可安全内插
         # （参数化会触发 asyncpg 把字符串当 interval 类型编码而报错）
         bucket = _BUCKET_LITERAL[interval]
+        limit_clause = "LIMIT :limit" if limit is not None else ""
         sql = text(
             f"""
             SELECT
@@ -190,20 +208,19 @@ class KlineRepository:
             ) s
             GROUP BY bucket
             ORDER BY bucket ASC
-            LIMIT :limit
+            {limit_clause}
             """
         )
-        result = await self.db.execute(
-            sql,
-            {
-                "sym": symbol,
-                "interval": interval,
-                "base": base,
-                "start": start,
-                "end": end,
-                "limit": limit,
-            },
-        )
+        params: dict[str, Any] = {
+            "sym": symbol,
+            "interval": interval,
+            "base": base,
+            "start": start,
+            "end": end,
+        }
+        if limit is not None:
+            params["limit"] = limit
+        result = await self.db.execute(sql, params)
         return [dict(row._mapping) for row in result]
 
     async def query_latest(

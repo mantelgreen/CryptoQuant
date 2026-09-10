@@ -34,11 +34,16 @@ const form = ref({
   end: '',
 })
 
+function localDatetime(d: Date): string {
+  const p = (x: number) => String(x).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
 function defaultRange() {
   const e = new Date()
   const s = new Date(e.getTime() - 7 * 24 * 3600 * 1000)
-  form.value.start = s.toISOString().slice(0, 16)
-  form.value.end = e.toISOString().slice(0, 16)
+  form.value.start = localDatetime(s)
+  form.value.end = localDatetime(e)
 }
 
 const jobs = ref<DownloadJob[]>([])
@@ -72,6 +77,16 @@ async function load(showSpinner = true) {
 }
 
 async function submit() {
+  const start = new Date(form.value.start)
+  const end = new Date(form.value.end)
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+    toast.error('时间范围无效', '开始与结束时间都需要填写')
+    return
+  }
+  if (end <= start) {
+    toast.error('时间范围无效', '结束时间须晚于开始时间')
+    return
+  }
   submitting.value = true
   try {
     const r = await createDownload({
@@ -144,11 +159,11 @@ onBeforeUnmount(stopPoll)
         </div>
         <div class="field">
           <label class="label" for="dl-start">开始时间</label>
-          <input id="dl-start" v-model="form.start" type="datetime-local" class="input" />
+          <input id="dl-start" v-model="form.start" type="datetime-local" class="input" :max="form.end" />
         </div>
         <div class="field">
           <label class="label" for="dl-end">结束时间</label>
-          <input id="dl-end" v-model="form.end" type="datetime-local" class="input" />
+          <input id="dl-end" v-model="form.end" type="datetime-local" class="input" :min="form.start" />
         </div>
         <div class="field">
           <label class="label">模式</label>

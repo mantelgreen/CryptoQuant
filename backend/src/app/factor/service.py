@@ -21,7 +21,7 @@ HORIZONS = (1, 3, 5)
 
 
 async def _load_frame(repo: KlineRepository, symbol: str, interval: str, start: datetime, end: datetime) -> pd.DataFrame:
-    rows = await repo.query_or_aggregate(symbol, interval, start, end, limit=50_000)
+    rows = await repo.query_or_aggregate(symbol, interval, start, end)
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows)
@@ -500,6 +500,7 @@ async def train_factor_model(
     end: datetime,
     horizon: int = 1,
     test_ratio: float = 0.25,
+    val_ratio: float = 0.0,
     alpha: float = 1.0,
     model: str = "ridge",
     max_corr: float | None = 0.85,
@@ -527,6 +528,7 @@ async def train_factor_model(
         end,
         horizon=horizon,
         test_ratio=test_ratio,
+        val_ratio=val_ratio,
         alpha=alpha,
         max_corr=max_corr,
         winsor=winsor,
@@ -554,6 +556,7 @@ async def train_factor_model_full(
     end: datetime,
     horizon: int = 1,
     test_ratio: float = 0.25,
+    val_ratio: float = 0.0,
     alpha: float = 1.0,
     model: str = "ridge",
     max_corr: float | None = 0.85,
@@ -582,6 +585,7 @@ async def train_factor_model_full(
         end,
         horizon=horizon,
         test_ratio=test_ratio,
+        val_ratio=val_ratio,
         alpha=alpha,
         max_corr=max_corr,
         winsor=winsor,
@@ -644,6 +648,10 @@ async def persist_model_artifact(
             "oos_rank_ic": resp.get("oos_rank_ic"),
             "hit_rate": resp.get("hit_rate"),
             "spread": resp.get("spread"),
+            "val_ic": resp.get("val_ic"),
+            "val_rank_ic": resp.get("val_rank_ic"),
+            "val_hit_rate": resp.get("val_hit_rate"),
+            "val_spread": resp.get("val_spread"),
         },
         n_train=resp.get("n_train", 0),
         n_test=resp.get("n_test", 0),
@@ -657,6 +665,7 @@ async def persist_model_artifact(
             "start": start.isoformat(),
             "end": end.isoformat(),
             "test_ratio": test_ratio,
+            "val_ratio": resp.get("val_ratio", 0.0),
             "horizon": horizon,
             "winsor": winsor,
             "cost_bps": cost_bps,
@@ -664,6 +673,7 @@ async def persist_model_artifact(
             "agg_features": resp.get("agg_features") or [],
             "n_train": resp.get("n_train", 0),
             "n_test": resp.get("n_test", 0),
+            "n_val": resp.get("n_val", 0),
             "flip": resp.get("flip", 1.0),
             "test_windows": resp.get("test_windows") or [],
         },
@@ -694,6 +704,7 @@ async def persist_trained_model(
     name: str,
     horizon: int = 1,
     test_ratio: float = 0.25,
+    val_ratio: float = 0.0,
     alpha: float = 1.0,
     model: str = "ridge",
     max_corr: float | None = 0.85,
@@ -718,6 +729,7 @@ async def persist_trained_model(
         end=end,
         horizon=horizon,
         test_ratio=test_ratio,
+        val_ratio=val_ratio,
         alpha=alpha,
         max_corr=max_corr,
         winsor=winsor,

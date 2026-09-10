@@ -31,15 +31,14 @@ from ...factor.service import (
 
 router = APIRouter(prefix="/factors", tags=["factors"])
 
-_INTERVALS = {"1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d", "3d", "1w"}
-
+# 训练/研究/回测可选的目标粒度：排除过重的 1m/5m（1m/5m 仅保留为「细粒度增强」底库）
 MAX_ML_FEATURES = 12
 
 
 class ResearchReq(BaseModel):
     codes: list[str] = Field(..., min_length=1)
     symbols: list[str] = Field(..., min_length=1, max_length=20)
-    interval: str = Field(..., pattern=r"^(1m|3m|5m|15m|30m|1h|2h|4h|6h|12h|1d|3d|1w)$")
+    interval: str = Field(..., pattern=r"^(3m|15m|30m|1h|2h|4h|6h|12h|1d|3d|1w)$")
     start: datetime
     end: datetime
 
@@ -47,7 +46,7 @@ class ResearchReq(BaseModel):
 class MatrixReq(BaseModel):
     codes: list[str] = Field(..., min_length=2, max_length=MAX_ML_FEATURES)
     symbols: list[str] = Field(..., min_length=1, max_length=20)
-    interval: str = Field(..., pattern=r"^(1m|3m|5m|15m|30m|1h|2h|4h|6h|12h|1d|3d|1w)$")
+    interval: str = Field(..., pattern=r"^(3m|15m|30m|1h|2h|4h|6h|12h|1d|3d|1w)$")
     start: datetime
     end: datetime
 
@@ -55,7 +54,7 @@ class MatrixReq(BaseModel):
 class VerifyReq(BaseModel):
     expression: str = Field(..., min_length=1, max_length=500)
     symbol: str = Field(..., min_length=1)
-    interval: str = Field(..., pattern=r"^(1m|3m|5m|15m|30m|1h|2h|4h|6h|12h|1d|3d|1w)$")
+    interval: str = Field(..., pattern=r"^(3m|15m|30m|1h|2h|4h|6h|12h|1d|3d|1w)$")
     start: datetime
     end: datetime
 
@@ -71,11 +70,12 @@ class JoinFactorReq(BaseModel):
 class MlTrainReq(BaseModel):
     codes: list[str] = Field(..., min_length=2, max_length=MAX_ML_FEATURES)
     symbols: list[str] = Field(..., min_length=1, max_length=20)
-    interval: str = Field(..., pattern=r"^(1m|3m|5m|15m|30m|1h|2h|4h|6h|12h|1d|3d|1w)$")
+    interval: str = Field(..., pattern=r"^(3m|15m|30m|1h|2h|4h|6h|12h|1d|3d|1w)$")
     start: datetime
     end: datetime
     horizon: int = Field(default=1, ge=1, le=10)
     test_ratio: float = Field(default=0.25, ge=0.15, le=0.5)
+    val_ratio: float = Field(default=0.0, ge=0.0, le=0.4)
     alpha: float = Field(default=1.0, ge=0.0, le=50.0)
     max_corr: float | None = Field(default=0.85, ge=0.0, lt=1.0)
     winsor: float | None = Field(default=None, ge=0.0, lt=0.5)
@@ -238,6 +238,7 @@ async def ml_train(
         end=req.end,
         horizon=req.horizon,
         test_ratio=req.test_ratio,
+        val_ratio=req.val_ratio,
         alpha=req.alpha,
         max_corr=req.max_corr,
         winsor=req.winsor,
@@ -273,6 +274,7 @@ async def ml_save_model(
             name=req.name,
             horizon=req.horizon,
             test_ratio=req.test_ratio,
+            val_ratio=req.val_ratio,
             alpha=req.alpha,
             max_corr=req.max_corr,
             winsor=req.winsor,

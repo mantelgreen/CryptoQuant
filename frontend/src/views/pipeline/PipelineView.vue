@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import {
   Boxes,
   Check,
+  ChevronDown,
   ChevronRight,
   Cpu,
   FlaskConical,
@@ -24,10 +25,11 @@ import {
   listPipelines,
   startPipeline,
   stopPipeline,
+  type PipelineDiagnosis,
   type PipelineRound,
   type PipelineRun,
 } from '@/api/pipeline'
-import { fmtStamp } from '@/utils/format'
+import { fmtStamp, MAJOR_SYMBOLS } from '@/utils/format'
 
 const toast = useToastStore()
 
@@ -53,10 +55,34 @@ function isoOf(dateStr: string, endOfDay = false): string {
   return new Date(`${dateStr}T${endOfDay ? '23:59:59' : '00:00:00'}`).toISOString()
 }
 
+/** 数字输入框被清空时 v-model.number 会得到 ''，直接提交会触发 422；这里夹取到合法区间并给默认值兜底。 */
+function clampInt(v: unknown, min: number, max: number, fallback: number): number {
+  const n = Math.round(Number(v))
+  if (!Number.isFinite(n)) return fallback
+  return Math.min(max, Math.max(min, n))
+}
+
+/** 把后端错误（含 FastAPI 422 的 detail 数组）转成可读文案。 */
+function errText(e: unknown): string {
+  const err = e as { message?: string; detail?: unknown }
+  if (typeof err?.message === 'string' && err.message) return err.message
+  if (Array.isArray(err?.detail)) {
+    return err.detail
+      .map((d) => {
+        const item = d as { loc?: unknown[]; msg?: string }
+        const loc = Array.isArray(item.loc) ? item.loc.slice(1).join('.') : ''
+        return loc ? `${loc}: ${item.msg ?? ''}` : (item.msg ?? '')
+      })
+      .filter(Boolean)
+      .join('；')
+  }
+  return '未知错误'
+}
+
 const form = reactive({
   name: '',
   objective: '',
-  researchSymbols: 'BTCUSDT',
+  researchSymbols: ['BTCUSDT'] as string[],
   researchInterval: '1d',
   researchStart: daysAgo(700),
   researchEnd: daysAgo(180),
@@ -84,6 +110,11 @@ const liveRound = ref(0)
 const starting = ref(false)
 const loadingDetail = ref(false)
 let es: EventSource | null = null
+let sseRunId: string | null = null
+let sseAttempt = 0
+let sseRetryTimer = 0
+let refreshTimer = 0
+let pollTimer = 0
 
 const runStatus = computed(() => activeRun.value?.status ?? null)
 const running = computed(() => runStatus.value === 'running' || runStatus.value === 'pending')
@@ -123,15 +154,35 @@ async function confirmDelete() {
   }
 }
 
-function symbolsOf(s: string): string[] {
-  return s.split(/[,，\s]+/).map((x) => x.trim().toUpperCase()).filter(Boolean)
+// —— 研究标的多选下拉 ——
+const symOpen = ref(false)
+const symRef = ref<HTMLElement | null>(null)
+
+function toggleResearchSymbol(s: string) {
+  const i = form.researchSymbols.indexOf(s)
+  if (i >= 0) form.researchSymbols.splice(i, 1)
+  else form.researchSymbols.push(s)
+}
+
+function onDocClick(e: MouseEvent) {
+  if (symRef.value && !symRef.value.contains(e.target as Node)) symOpen.value = false
 }
 
 async function start() {
   if (starting.value || running.value) return
-  const syms = symbolsOf(form.researchSymbols)
+  const syms = (Array.isArray(form.researchSymbols) ? form.researchSymbols : [])
+    .map((s) => String(s).trim().toUpperCase())
+    .filter(Boolean)
   if (!syms.length) {
-    toast.error('请填写研究标的', '至少一个交易对，如 BTCUSDT')
+    toast.error('请选择研究标的', '至少选择一个交易对，如 BTCUSDT')
+    return
+  }
+  const factorCount = clampInt(form.factorCount, 1, 5, 4)
+  const maxPick = clampInt(form.maxPick, 2, 12, 6)
+  const maxRounds = clampInt(form.maxRounds, 1, 20, 5)
+  const horizon = clampInt(form.horizon, 1, 10, 1)
+  if (!form.researchStart || !form.researchEnd || !form.backtestStart || !form.backtestEnd) {
+    toast.error('时间窗口不完整', '研究/回测的起止日期都需要填写')
     return
   }
   if (form.researchEnd <= form.researchStart) {
@@ -149,21 +200,21 @@ async function start() {
   starting.value = true
   try {
     const payload = {
-      name: form.name.trim() || undefined,
-      objective: form.objective.trim() || undefined,
+      name: form.name.trim().slice(0, 120) || undefined,
+      objective: form.objective.trim().slice(0, 1200) || undefined,
       research_symbols: syms,
       research_interval: form.researchInterval,
       research_start: isoOf(form.researchStart),
       research_end: isoOf(form.researchEnd),
-      backtest_symbol: form.backtestSymbol.trim().toUpperCase() || syms[0],
+      backtest_symbol: form.backtestSymbol || syms[0],
       backtest_interval: form.backtestInterval,
       backtest_start: isoOf(form.backtestStart),
       backtest_end: isoOf(form.backtestEnd, true),
-      factor_count_per_round: form.factorCount,
-      max_pick: form.maxPick,
-      max_rounds: form.maxRounds,
+      factor_count_per_round: factorCount,
+      max_pick: maxPick,
+      max_rounds: maxRounds,
       model: form.model as 'ridge' | 'gbdt',
-      horizon: form.horizon,
+      horizon,
       test_ratio: form.testRatio,
       alpha: form.alpha,
       stop_on_excellent: form.stopOnExcellent,
@@ -175,7 +226,7 @@ async function start() {
     await loadDetail(run_id)
     openSse(run_id)
   } catch (e: unknown) {
-    toast.error('启动失败', (e as { message?: string }).message)
+    toast.error('启动失败', errText(e))
   } finally {
     starting.value = false
   }
@@ -188,7 +239,7 @@ async function stop() {
     toast.info('已请求停止', '下一轮任务开始前将终止')
     await loadDetail(activeRun.value.id)
   } catch (e: unknown) {
-    toast.error('停止失败', (e as { message?: string }).message)
+    toast.error('停止失败', errText(e))
   }
 }
 
@@ -208,16 +259,57 @@ async function loadDetail(id: string) {
     rounds.value = r
     liveRound.value = run.current_round
   } catch (e: unknown) {
-    toast.error('加载失败', (e as { message?: string }).message)
+    toast.error('加载失败', errText(e))
   } finally {
     loadingDetail.value = false
   }
 }
 
+// SSE 只负责推送「阶段/状态」；每轮的结果（指标/诊断）落库后需要重新拉详情。
+// 因此：本轮完成 / 新一轮开始 / 兜底轮询时都刷新详情，无需手动刷新页面。
+function scheduleDetailRefresh(id: string, delay = 400) {
+  if (refreshTimer) return
+  refreshTimer = window.setTimeout(() => {
+    refreshTimer = 0
+    if (activeRun.value?.id === id) void loadDetail(id)
+  }, delay)
+}
+
+function startPoll(id: string) {
+  stopPoll()
+  pollTimer = window.setInterval(() => {
+    if (activeRun.value?.id !== id) return stopPoll()
+    if (!running.value) return stopPoll()
+    void loadDetail(id)
+    void loadHistory()
+  }, 5000)
+}
+
+function stopPoll() {
+  if (pollTimer) {
+    clearInterval(pollTimer)
+    pollTimer = 0
+  }
+}
+
 function openSse(id: string) {
   closeSse()
+  sseRunId = id
+  sseAttempt = 0
+  startPoll(id)
+  connectSse()
+}
+
+function connectSse() {
+  const id = sseRunId
+  if (!id) return
   const source = new EventSource(`/api/v1/pipeline/${id}/events`)
+  es = source
+  source.onopen = () => {
+    sseAttempt = 0
+  }
   source.onmessage = (ev) => {
+    if (sseRunId !== id) return
     try {
       const msg = JSON.parse(ev.data) as {
         type?: string
@@ -238,16 +330,46 @@ function openSse(id: string) {
         closeSse()
         void loadDetail(id)
         void loadHistory()
+        return
+      }
+      // 本轮落库完成 → 拉取结果；新一轮开始 → 补出运行中的轮次卡片
+      if (msg.message === '本轮完成') {
+        scheduleDetailRefresh(id)
+        void loadHistory()
+      } else if (typeof msg.round_no === 'number' && msg.round_no > rounds.value.length) {
+        scheduleDetailRefresh(id)
       }
     } catch {
       /* ignore */
     }
   }
-  source.onerror = () => closeSse()
-  es = source
+  source.onerror = () => {
+    if (es !== source) return
+    es = null
+    source.close()
+    const cur = activeRun.value
+    if (sseRunId !== id || !cur || cur.id !== id) return
+    if (cur.status !== 'running' && cur.status !== 'pending') return
+    // 运行中连接中断：指数退避重连，避免长任务中途丢失进度
+    const delay = Math.min(1000 * 2 ** sseAttempt, 15000)
+    sseAttempt += 1
+    sseRetryTimer = window.setTimeout(() => {
+      if (sseRunId === id && !es) connectSse()
+    }, delay)
+  }
 }
 
 function closeSse() {
+  sseRunId = null
+  stopPoll()
+  if (sseRetryTimer) {
+    clearTimeout(sseRetryTimer)
+    sseRetryTimer = 0
+  }
+  if (refreshTimer) {
+    clearTimeout(refreshTimer)
+    refreshTimer = 0
+  }
   if (es) {
     es.close()
     es = null
@@ -257,7 +379,8 @@ function closeSse() {
 function viewRun(run: PipelineRun) {
   selectedTab.value = 'active'
   void loadDetail(run.id)
-  openSse(run.id)
+  if (run.status === 'running' || run.status === 'pending') openSse(run.id)
+  else closeSse()
 }
 
 // —— 展示辅助 ——
@@ -322,10 +445,27 @@ function genOnly(r: PipelineRound) {
   return (r.factors_generated ?? []).filter((f) => !pickedCodes.has(f.code))
 }
 
-onMounted(() => {
-  void loadHistory()
+function paramsText(d: PipelineDiagnosis): string {
+  const p = d.params_applied
+  if (!p) return ''
+  return Object.entries(p).map(([k, v]) => `${k}=${v}`).join(' · ')
+}
+
+onMounted(async () => {
+  document.addEventListener('mousedown', onDocClick)
+  await loadHistory()
+  // 刷新/首次进入时自动恢复：优先正在运行的流水线，否则展示最近一次
+  const target =
+    history.value.find((r) => r.status === 'running' || r.status === 'pending') ?? history.value[0]
+  if (!target) return
+  selectedTab.value = 'active'
+  await loadDetail(target.id)
+  if (target.status === 'running' || target.status === 'pending') openSse(target.id)
 })
-onBeforeUnmount(closeSse)
+onBeforeUnmount(() => {
+  closeSse()
+  document.removeEventListener('mousedown', onDocClick)
+})
 </script>
 
 <template>
@@ -358,8 +498,50 @@ onBeforeUnmount(closeSse)
 
           <div class="grid grid-cols-2 gap-2.5">
             <div class="field">
-              <label class="label" for="pipeline-symbols">研究标的（逗号分隔）</label>
-              <input id="pipeline-symbols" v-model="form.researchSymbols" class="input font-mono uppercase" spellcheck="false" />
+              <label class="label">研究标的（可多选）</label>
+              <div ref="symRef" class="relative">
+                <button
+                  id="pipeline-symbols"
+                  type="button"
+                  class="input flex !h-auto min-h-[34px] cursor-pointer flex-wrap items-center gap-1 py-1 text-left"
+                  :aria-expanded="symOpen"
+                  @click="symOpen = !symOpen"
+                >
+                  <span
+                    v-for="s in form.researchSymbols"
+                    :key="s"
+                    class="badge tone-primary !h-[18px] !px-1.5 font-mono text-[10px]"
+                  >
+                    {{ s }}
+                  </span>
+                  <span v-if="!form.researchSymbols.length" class="text-subtle">选择交易对…</span>
+                  <ChevronDown :size="14" class="ml-auto shrink-0 text-subtle" />
+                </button>
+                <div
+                  v-if="symOpen"
+                  class="absolute z-20 mt-1 max-h-56 w-full overflow-y-auto rounded-lg border border-border bg-surface p-1 shadow-pop"
+                >
+                  <button
+                    v-for="s in MAJOR_SYMBOLS"
+                    :key="s"
+                    type="button"
+                    class="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left font-mono text-xs transition-colors hover:bg-surface-2"
+                    @click="toggleResearchSymbol(s)"
+                  >
+                    <span
+                      class="flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-colors"
+                      :class="
+                        form.researchSymbols.includes(s)
+                          ? 'border-primary bg-primary text-white'
+                          : 'border-strong bg-surface'
+                      "
+                    >
+                      <Check v-if="form.researchSymbols.includes(s)" :size="11" />
+                    </span>
+                    {{ s }}
+                  </button>
+                </div>
+              </div>
             </div>
             <div class="field">
               <label class="label" for="pipeline-research-interval">研究粒度</label>
@@ -372,18 +554,20 @@ onBeforeUnmount(closeSse)
           <div class="grid grid-cols-2 gap-2.5">
             <div class="field">
               <label class="label" for="pipeline-research-start">测试（研究）起点</label>
-              <input id="pipeline-research-start" v-model="form.researchStart" type="date" class="input font-mono" />
+              <input id="pipeline-research-start" v-model="form.researchStart" type="date" class="input font-mono" :max="form.researchEnd" />
             </div>
             <div class="field">
               <label class="label" for="pipeline-research-end">测试（研究）结束</label>
-              <input id="pipeline-research-end" v-model="form.researchEnd" type="date" class="input font-mono" />
+              <input id="pipeline-research-end" v-model="form.researchEnd" type="date" class="input font-mono" :min="form.researchStart" />
             </div>
           </div>
 
           <div class="grid grid-cols-2 gap-2.5">
             <div class="field">
               <label class="label" for="pipeline-backtest-symbol">回测标的</label>
-              <input id="pipeline-backtest-symbol" v-model="form.backtestSymbol" class="input font-mono uppercase" spellcheck="false" />
+              <select id="pipeline-backtest-symbol" v-model="form.backtestSymbol" class="select font-mono">
+                <option v-for="s in MAJOR_SYMBOLS" :key="s" :value="s">{{ s }}</option>
+              </select>
             </div>
             <div class="field">
               <label class="label" for="pipeline-backtest-interval">回测粒度</label>
@@ -396,11 +580,11 @@ onBeforeUnmount(closeSse)
           <div class="grid grid-cols-2 gap-2.5">
             <div class="field">
               <label class="label" for="pipeline-backtest-start">回测起点（晚于结束）</label>
-              <input id="pipeline-backtest-start" v-model="form.backtestStart" type="date" class="input font-mono" />
+              <input id="pipeline-backtest-start" v-model="form.backtestStart" type="date" class="input font-mono" :min="form.researchEnd" :max="form.backtestEnd" />
             </div>
             <div class="field">
               <label class="label" for="pipeline-backtest-end">回测结束</label>
-              <input id="pipeline-backtest-end" v-model="form.backtestEnd" type="date" class="input font-mono" />
+              <input id="pipeline-backtest-end" v-model="form.backtestEnd" type="date" class="input font-mono" :min="form.backtestStart" />
             </div>
           </div>
 
@@ -523,6 +707,7 @@ onBeforeUnmount(closeSse)
                   </span>
                   <span v-if="r.diagnosis" class="badge" :class="gradeMeta(r.diagnosis.grade).tone">{{ gradeMeta(r.diagnosis.grade).label }}</span>
                   <span v-if="r.diagnosis" class="badge" :class="rootMeta(r.diagnosis.root_cause).tone">{{ rootMeta(r.diagnosis.root_cause).label }}</span>
+                  <span v-if="r.diagnosis?.param_attempts" class="badge tone-primary">参数调优 {{ r.diagnosis.param_attempts }} 次</span>
                   <span v-if="r.model_id" class="badge tone-up">已入库</span>
                   <span v-if="r.error" class="badge tone-down">异常</span>
                   <span class="ml-auto text-[11px] text-subtle">{{ fmtStamp(r.created_at) }}</span>
@@ -620,6 +805,9 @@ onBeforeUnmount(closeSse)
                   </p>
                   <p class="mt-1.5 text-xs leading-relaxed text-muted">{{ r.diagnosis.review }}</p>
                   <p v-if="r.diagnosis.advice" class="mt-1 text-xs leading-relaxed text-subtle">建议：{{ r.diagnosis.advice }}</p>
+                  <p v-if="paramsText(r.diagnosis)" class="mt-1 text-xs leading-relaxed text-subtle">
+                    调参（{{ r.diagnosis.param_attempts }}/{{ r.diagnosis.param_retry_limit }}）：{{ paramsText(r.diagnosis) }}
+                  </p>
                   <p v-if="r.diagnosis.backtest_review" class="mt-1.5 text-xs leading-relaxed text-muted">复盘：{{ r.diagnosis.backtest_review }}</p>
                   <div v-if="r.diagnosis.drop?.length" class="mt-2 flex flex-wrap gap-1.5">
                     <span class="text-[11px] text-subtle">剔除：</span>

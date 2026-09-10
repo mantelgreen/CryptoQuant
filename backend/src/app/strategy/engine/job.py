@@ -125,7 +125,7 @@ async def run_backtest_job(
             await _publish_progress(backtest_id, status="running", stage="loading_data", pct=5)
             # 1. 加载 K 线（支持自动桶聚合：库里只有 15m 时也能回测 30m/1h/1d）
             kline_repo = KlineRepository(session)
-            rows = await kline_repo.query_or_aggregate(symbol, interval, start, end, limit=20000)
+            rows = await kline_repo.query_or_aggregate(symbol, interval, start, end)
             if not rows:
                 cover = await kline_repo.coverage(symbol)
                 have = ", ".join(f"{r['interval']}×{r['count']}" for r in cover) or "无"

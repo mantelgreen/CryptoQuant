@@ -47,7 +47,8 @@ const result = ref<MlTrainResult | null>(null)
 const args = ref<MlTrainArgs | null>(null)
 const resInfo = computed(() => (result.value?.found ? result.value : null))
 
-const TRAIN_INTERVALS = ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '12h', '1d', '3d', '1w']
+// 训练目标粒度：排除过重的 1m/5m（1m/5m 仍可作为下方「细粒度增强」的底库）
+const TRAIN_INTERVALS = ['3m', '15m', '30m', '1h', '2h', '4h', '6h', '12h', '1d', '3d', '1w']
 const LOOKBACKS = [
   { n: 90, label: '3 月' },
   { n: 180, label: '6 月' },
@@ -116,7 +117,7 @@ function fmtDur(ms: number): string {
   if (ms % 3_600_000 === 0) return `${ms / 3_600_000} 小时`
   return `${ms / 60_000} 分钟`
 }
-const minuteHeavy = computed(() => ['1m', '3m'].includes(cfg.value.interval))
+const minuteHeavy = computed(() => ['3m'].includes(cfg.value.interval))
 const horizonHint = computed(() => {
   const ms = barMs(cfg.value.interval) * cfg.value.horizon
   return ms ? `${cfg.value.horizon} × ${cfg.value.interval} ≈ ${fmtDur(ms)}` : ''

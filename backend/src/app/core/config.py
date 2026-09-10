@@ -65,6 +65,11 @@ class Settings(BaseSettings):
     JOB_QUEUE_SIM: str = "sim"
     JOB_QUEUE_ANALYTICS: str = "analytics"
 
+    # ===== K 线查询 =====
+    # 单次 K 线查询返回的最大行数（安全阀，防止分钟级长窗口把上百万行读进内存）。
+    # 训练/研究/回测默认不设 limit，此时用该值兜底；<=0 表示完全不限制。
+    KLINE_QUERY_MAX_ROWS: int = 500_000
+
     # ===== ML 模型 artifact =====
     # LightGBM 等不可用权重表达的模型 pickle 落盘目录。
     # 空则用 <backend>/data/models；可填绝对路径或相对 backend 的路径。

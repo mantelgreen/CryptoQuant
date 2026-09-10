@@ -20,6 +20,10 @@ export const MAJOR_SYMBOLS = [
 
 export const INTERVALS = ['1m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '12h', '1d'] as const
 
+// 训练/研究/回测/流水线可选的目标粒度：排除过重的 1m/5m。
+// 注意：1m/5m 仍保留在 INTERVALS 中，供「K 线下载/定时任务」及「细粒度增强」底库使用。
+export const RESEARCH_INTERVALS = INTERVALS.filter((i) => i !== '1m' && i !== '5m')
+
 export const MAX_ML_FEATURES = 12
 
 export type Interval = (typeof INTERVALS)[number]

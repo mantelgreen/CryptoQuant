@@ -27,7 +27,7 @@ from ...pipeline.service import (
 router = APIRouter(prefix="/pipeline", tags=["pipeline"])
 settings = get_settings()
 
-_INTERVALS = r"^(1m|3m|5m|15m|30m|1h|2h|4h|6h|12h|1d|3d|1w)$"
+_INTERVALS = r"^(3m|15m|30m|1h|2h|4h|6h|12h|1d|3d|1w)$"
 _TERMINAL = ("succeeded", "finished", "failed", "stopped")
 
 
@@ -49,6 +49,7 @@ class PipelineStartReq(BaseModel):
     model: str = Field(default="ridge", pattern=r"^(ridge|gbdt)$")
     horizon: int = Field(default=1, ge=1, le=10)
     test_ratio: float = Field(default=0.25, ge=0.15, le=0.5)
+    val_ratio: float = Field(default=0.15, ge=0.0, le=0.4)
     alpha: float = Field(default=1.0, ge=0.0, le=50.0)
     max_corr: float | None = Field(default=0.85, ge=0.0, lt=1.0)
     winsor: float | None = Field(default=None, ge=0.0, lt=0.5)

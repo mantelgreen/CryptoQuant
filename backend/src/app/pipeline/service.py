@@ -26,15 +26,32 @@ DEFAULT_THRESHOLDS: dict[str, float | int] = {
     "hit_rate": 0.5,
     "overfit_gap": 0.06,
     "total_return": 0.0,
+    "excess_return": 0.0,
     "sharpe": 0.5,
     "max_drawdown": -0.20,
     "num_trades": 3,
     "excellent_sharpe": 1.0,
     "excellent_max_drawdown": -0.12,
-    "stall_limit": 3,
+    "param_retry": 3,
 }
 
 _STAGES = ("gen", "research", "select", "train", "backtest", "evaluate", "finalize")
+
+# 可由 LLM 诊断建议覆盖的训练超参键（与 agent.service._HYPER_SPEC 对齐）
+_PARAM_KEYS = (
+    "model",
+    "horizon",
+    "test_ratio",
+    "alpha",
+    "max_corr",
+    "winsor",
+    "learning_rate",
+    "n_estimators",
+    "max_depth",
+    "num_leaves",
+    "subsample",
+    "colsample_bytree",
+)
 
 
 def _parse_dt(v: Any) -> datetime:
@@ -135,6 +152,9 @@ def _normalize_config(cfg: dict[str, Any]) -> dict[str, Any]:
     )
     out["max_pick"] = max(2, min(12, int(cfg.get("max_pick") or 6)))
     out["max_rounds"] = int(cfg.get("max_rounds") or 5)
+    # 验证集比例：调参/因子精筛只在验证集上做，测试集仅最终报告一次（默认 0.15）
+    vr = cfg.get("val_ratio")
+    out["val_ratio"] = max(0.0, min(0.4, float(0.15 if vr is None else vr)))
     out["model"] = cfg.get("model") or "ridge"
     out["thresholds"] = th
     out["stop_on_excellent"] = bool(cfg.get("stop_on_excellent", True))
@@ -207,6 +227,15 @@ async def get_pipeline_detail(db: AsyncSession, run_id: UUID) -> dict[str, Any] 
 # =============================================================================
 # 单轮执行
 # =============================================================================
+
+
+def _apply_params(cfg: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
+    """把 LLM 诊断出的超参覆盖到当前配置，返回新配置（不改原对象）。"""
+    out = dict(cfg)
+    for k, v in (params or {}).items():
+        if k in _PARAM_KEYS and v is not None:
+            out[k] = v
+    return out
 
 
 async def run_round(
@@ -291,49 +320,87 @@ async def run_round(
     await mark("train", stage_idx=3, message="训练多因子模型")
     train_resp = await _train(db, cfg, picked)
 
-    # 5. backtest
-    await mark("backtest", stage_idx=4, message="样本外回测")
-    bt = await _backtest(db, cfg, train_resp)
-
-    # 6. evaluate
-    await mark("evaluate", stage_idx=5, message="效果评估")
-    grade, excellent, score, checks = evaluate_round(train_resp, bt, th)
-
     model_id: UUID | None = None
     diagnosis: dict[str, Any] | None = None
     next_pool: list[str] = pool
     terminate = False
     succeeded = False
+    active_cfg = cfg
 
     best_score = None
     if run.get("best_metrics"):
         best_score = (run["best_metrics"] or {}).get("sharpe")
 
+    # 参数调优循环：仅在「验证集」上判定是否达标并给诊断，测试集不参与调参（防泄漏/多重检验）。
+    # 复用同一批已选因子（不重新生成/研究），开销可控；仍不理想则本轮停止、进入下一轮。
+    param_retry_limit = int(th.get("param_retry", 3) or 0)
+    param_attempts = 0
+    applied_param_keys: set[str] = set()
+    val_ok = _ml_ok(train_resp, th, val=True)
+    if not val_ok and param_retry_limit > 0:
+        diagnosis = await _diagnose(db, active_cfg, train_resp, None, name_map, "warn")
+        while (
+            not val_ok
+            and param_attempts < param_retry_limit
+            and diagnosis.get("root_cause") == "params"
+            and diagnosis.get("params")
+        ):
+            param_attempts += 1
+            applied_param_keys |= {
+                k for k in (diagnosis.get("params") or {}) if k in _PARAM_KEYS
+            }
+            active_cfg = _apply_params(active_cfg, diagnosis.get("params") or {})
+            await mark(
+                "train",
+                stage_idx=3,
+                message=f"参数调优重训（第 {param_attempts}/{param_retry_limit} 次，按验证集判定）",
+                attempt=param_attempts,
+                params=diagnosis.get("params") or {},
+            )
+            train_resp = await _train(db, active_cfg, picked)
+            val_ok = _ml_ok(train_resp, th, val=True)
+            if val_ok:
+                break
+            diagnosis = await _diagnose(db, active_cfg, train_resp, None, name_map, "warn")
+
+    # 5. backtest：真正的样本外持有窗，调参结束后只跑一次
+    await mark("backtest", stage_idx=4, message="样本外回测")
+    bt = await _backtest(db, active_cfg, train_resp)
+
+    # 6. evaluate：测试集 + 回测，最终判定（测试集只在此处用一次）
+    await mark("evaluate", stage_idx=5, message="效果评估")
+    grade, excellent, score, checks = evaluate_round(train_resp, bt, th)
+
     if grade == "ok" and train_resp.get("found") and "artifact" in train_resp:
-        # 入库
+        # 入库（使用调优后的最终参数）
         await mark("finalize", stage_idx=6, message="入库模型")
-        saved = await _persist(db, cfg, train_resp, round_no, run["name"])
+        saved = await _persist(db, active_cfg, train_resp, round_no, run["name"])
         model_id = UUID(saved["model_id"])
         # 优质因子入因子库：把进入该模型的因子打上「优质」标签
         n_quality = 0
-        if cfg.get("save_quality_factors", True):
+        if active_cfg.get("save_quality_factors", True):
             quality_codes = [
                 f.get("code")
                 for f in (train_resp.get("artifact") or {}).get("features") or []
                 if f.get("code")
             ]
             n_quality = await _tag_quality_factors(db, quality_codes)
+        review_text = "样本外与回测均达标，模型已入库；{} 个优质因子已打标进入因子库。".format(
+            n_quality
+        )
+        if param_attempts:
+            review_text += f"（经 {param_attempts} 次参数调优后达标）"
         diagnosis = {
             "grade": "ok",
             "root_cause": "none",
-            "review": "样本外与回测均达标，模型已入库；{} 个优质因子已打标进入因子库。".format(
-                n_quality
-            ),
+            "review": review_text,
             "advice": "可在模型库查看该模型，或在因子库按「优质」标签筛选复用这些因子。",
             "keep": picked,
             "drop": [],
             "params": {},
             "checks": checks,
+            "param_attempts": param_attempts,
+            "params_applied": {k: active_cfg.get(k) for k in applied_param_keys},
         }
         next_pool = picked
         # 更新 best / stall
@@ -355,18 +422,20 @@ async def run_round(
             terminate = True
             succeeded = True
     else:
-        # 诊断
+        # 诊断（调优循环已给出最终诊断时不再重复调用 LLM）
         await mark("finalize", stage_idx=6, message="失败诊断")
-        diagnosis = await _diagnose(db, cfg, train_resp, bt, name_map, grade)
+        if diagnosis is None:
+            diagnosis = await _diagnose(db, active_cfg, train_resp, bt, name_map, grade)
+        diagnosis["grade"] = grade
+        diagnosis["param_attempts"] = param_attempts
+        diagnosis["param_retry_limit"] = param_retry_limit
+        diagnosis["params_applied"] = {k: active_cfg.get(k) for k in applied_param_keys}
+        diagnosis["val_ok"] = val_ok
         next_pool = diagnosis.get("keep") or []
         if len(next_pool) < 2:
             next_pool = picked or pool
         new_stall = (run.get("stall_count") or 0) + 1
         await rrun.update_status(run_id, status="running", stall_count=new_stall)
-        stall_limit = int(th.get("stall_limit", 3))
-        if new_stall >= stall_limit:
-            terminate = True
-            succeeded = False
 
     # 写回 factor_pool（保留 keep 供下一轮）
     await rrun.update_status(run_id, status="running", factor_pool=next_pool)
@@ -398,7 +467,10 @@ async def run_round(
         summary={
             "grade": grade,
             "oos_rank_ic": train_resp.get("oos_rank_ic"),
+            "val_rank_ic": train_resp.get("val_rank_ic"),
             "sharpe": (bt.get("metrics") or {}).get("sharpe"),
+            "excess_return": (bt.get("metrics") or {}).get("excess_return"),
+            "param_attempts": param_attempts,
         },
     )
     return {"terminate": terminate, "succeeded": succeeded, "grade": grade}
@@ -529,6 +601,7 @@ async def _train(
         end=_parse_dt(cfg["research_end"]),
         horizon=int(cfg.get("horizon") or 1),
         test_ratio=float(cfg.get("test_ratio") or 0.25),
+        val_ratio=float(cfg.get("val_ratio") or 0.0),
         alpha=float(cfg.get("alpha") or 1.0),
         max_corr=cfg.get("max_corr"),
         winsor=cfg.get("winsor"),
@@ -605,28 +678,41 @@ async def _tag_quality_factors(db: AsyncSession, codes: list[str]) -> int:
 # =============================================================================
 
 
-def evaluate_round(
-    train_resp: dict[str, Any], bt: dict[str, Any], th: dict[str, Any]
-) -> tuple[str, bool, float, dict[str, Any]]:
-    m = train_resp
-    rank = m.get("oos_rank_ic")
-    spread = m.get("spread")
-    hit = m.get("hit_rate")
-    gap = m.get("overfit_gap")
-    ml_ok = bool(
+def _ml_ok(train_resp: dict[str, Any], th: dict[str, Any], *, val: bool = False) -> bool:
+    """模型层达标判定。val=True 用验证集指标（调参/因子精筛），否则用测试集指标（最终评估）。"""
+    if val:
+        rank = train_resp.get("val_rank_ic")
+        spread = train_resp.get("val_spread")
+        hit = train_resp.get("val_hit_rate")
+        gap = train_resp.get("val_overfit_gap")
+    else:
+        rank = train_resp.get("oos_rank_ic")
+        spread = train_resp.get("spread")
+        hit = train_resp.get("hit_rate")
+        gap = train_resp.get("overfit_gap")
+    return bool(
         (rank is not None and float(rank) >= float(th["oos_rank_ic"]))
         and (spread is not None and float(spread) >= float(th.get("spread", 0.0)))
         and (hit is not None and float(hit) >= float(th["hit_rate"]))
         and (gap is None or float(gap) < float(th["overfit_gap"]))
     )
+
+
+def evaluate_round(
+    train_resp: dict[str, Any], bt: dict[str, Any], th: dict[str, Any]
+) -> tuple[str, bool, float, dict[str, Any]]:
+    ml_ok = _ml_ok(train_resp, th, val=False)
     bm = bt.get("metrics") or {}
     tr = bm.get("total_return")
+    excess = bm.get("excess_return")
     sharpe = bm.get("sharpe")
     mdd = bm.get("max_drawdown")
     nt = bm.get("num_trades")
+    excess_ok = excess is not None and float(excess) > float(th.get("excess_return", 0.0))
     bt_ok = bool(
         bt.get("found")
         and (tr is not None and float(tr) > float(th["total_return"]))
+        and excess_ok
         and (sharpe is not None and float(sharpe) >= float(th["sharpe"]))
         and (mdd is not None and float(mdd) >= float(th["max_drawdown"]))
         and (nt is not None and int(nt) >= int(th["num_trades"]))
@@ -648,20 +734,20 @@ def evaluate_round(
     score = (
         float(sharpe)
         if (sharpe is not None and bt.get("found"))
-        else (float(rank) if rank is not None else 0.0)
+        else (float(train_resp.get("oos_rank_ic")) if train_resp.get("oos_rank_ic") is not None else 0.0)
     )
-    checks = {"ml_ok": ml_ok, "bt_ok": bt_ok, "excellent": excellent}
+    checks = {"ml_ok": ml_ok, "bt_ok": bt_ok, "excess_ok": excess_ok, "excellent": excellent}
     return grade, excellent, score, checks
 
 
-def _determine_root_cause(train_resp: dict[str, Any], review: dict[str, Any]) -> str:
-    if train_resp.get("degenerate"):
+def _determine_root_cause(metrics: dict[str, Any], review: dict[str, Any]) -> str:
+    if metrics.get("degenerate"):
         return "params"
-    gap = train_resp.get("overfit_gap")
+    gap = metrics.get("overfit_gap")
     if gap is not None and float(gap) >= 0.06:
         return "params"
-    rank = train_resp.get("oos_rank_ic")
-    spread = train_resp.get("spread")
+    rank = metrics.get("rank_ic")
+    spread = metrics.get("spread")
     drops = review.get("drop") or []
     if (
         rank is not None
@@ -674,8 +760,8 @@ def _determine_root_cause(train_resp: dict[str, Any], review: dict[str, Any]) ->
     return "factor"
 
 
-def _enrich_oos_diag(train_resp: dict[str, Any]) -> dict[str, Any]:
-    diag = train_resp.get("oos_charts") or {}
+def _enrich_diag(charts: dict[str, Any]) -> dict[str, Any]:
+    diag = charts or {}
     out = dict(diag)
     deciles = diag.get("deciles") or []
     if len(deciles) >= 2:
@@ -722,6 +808,8 @@ def _trim_train(train_resp: dict[str, Any]) -> dict[str, Any]:
             "horizon",
             "n_train",
             "n_test",
+            "n_val",
+            "val_ratio",
             "oos_ic",
             "oos_rank_ic",
             "train_ic",
@@ -739,6 +827,15 @@ def _trim_train(train_resp: dict[str, Any]) -> dict[str, Any]:
             "features",
             "feature_filter",
             "oos_charts",
+            "val_ic",
+            "val_rank_ic",
+            "val_hit_rate",
+            "val_spread",
+            "val_net_spread",
+            "val_overfit_gap",
+            "val_degenerate",
+            "val_features",
+            "val_charts",
             "learning",
             "message",
         )
@@ -756,7 +853,12 @@ async def _diagnose(
 ) -> dict[str, Any]:
     from ..agent.service import review_backtest, review_training
 
-    features = [f for f in (train_resp.get("features") or []) if f.get("code")]
+    # 诊断/精筛一律基于「验证集」（无验证集时才退回测试集），避免把测试集信息反馈进下一轮
+    has_val = (
+        train_resp.get("val_rank_ic") is not None or train_resp.get("val_ic") is not None
+    )
+    feat_src = train_resp.get("val_features") if has_val else train_resp.get("features")
+    features = [f for f in (feat_src or []) if f.get("code")]
     if not features:
         return {
             "grade": grade,
@@ -771,6 +873,35 @@ async def _diagnose(
             "fallback": True,
         }
 
+    metrics = {
+        "oos_ic": train_resp.get("val_ic") if has_val else train_resp.get("oos_ic"),
+        "oos_rank_ic": (
+            train_resp.get("val_rank_ic") if has_val else train_resp.get("oos_rank_ic")
+        ),
+        "train_ic": train_resp.get("train_ic"),
+        "overfit_gap": (
+            train_resp.get("val_overfit_gap") if has_val else train_resp.get("overfit_gap")
+        ),
+        "hit_rate": (
+            train_resp.get("val_hit_rate") if has_val else train_resp.get("hit_rate")
+        ),
+        "spread": train_resp.get("val_spread") if has_val else train_resp.get("spread"),
+        "net_spread": (
+            train_resp.get("val_net_spread") if has_val else train_resp.get("net_spread")
+        ),
+    }
+    rc_metrics = {
+        "degenerate": (
+            train_resp.get("val_degenerate") if has_val else train_resp.get("degenerate")
+        ),
+        "overfit_gap": metrics["overfit_gap"],
+        "rank_ic": metrics["oos_rank_ic"],
+        "spread": metrics["spread"],
+    }
+    diag_charts = (
+        (train_resp.get("val_charts") if has_val else train_resp.get("oos_charts")) or {}
+    )
+
     payload = {
         "symbol": "|".join(cfg["research_symbols"]),
         "interval": cfg["research_interval"],
@@ -778,22 +909,11 @@ async def _diagnose(
         "model": train_resp.get("model"),
         "engine": train_resp.get("engine"),
         "n_train": train_resp.get("n_train"),
-        "n_test": train_resp.get("n_test"),
-        "metrics": {
-            k: train_resp.get(k)
-            for k in (
-                "oos_ic",
-                "oos_rank_ic",
-                "train_ic",
-                "overfit_gap",
-                "hit_rate",
-                "spread",
-                "net_spread",
-            )
-        },
+        "n_test": train_resp.get("n_val") if has_val else train_resp.get("n_test"),
+        "metrics": metrics,
         "features": features,
         "removed": (train_resp.get("feature_filter") or {}).get("removed") or [],
-        "oos_charts": _enrich_oos_diag(train_resp),
+        "oos_charts": _enrich_diag(diag_charts),
         "learning": _learning_summary(train_resp),
         "config": {
             k: cfg.get(k)
@@ -832,7 +952,7 @@ async def _diagnose(
         }
 
     bt_review_text = ""
-    if bt.get("found") and (bt.get("metrics") or {}).get("num_trades", 0) >= 1:
+    if bt and bt.get("found") and (bt.get("metrics") or {}).get("num_trades", 0) >= 1:
         try:
             bt_payload = {
                 "summary": bt.get("summary"),
@@ -845,7 +965,7 @@ async def _diagnose(
         except Exception as exc:  # noqa: BLE001
             logger.warning("pipeline.backtest_review_failed", error=str(exc))
 
-    root = _determine_root_cause(train_resp, review)
+    root = _determine_root_cause(rc_metrics, review)
     drops = [
         {
             "code": d["code"],

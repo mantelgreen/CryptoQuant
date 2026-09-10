@@ -11,7 +11,6 @@ export interface PipelineThresholds {
   num_trades?: number
   excellent_sharpe?: number
   excellent_max_drawdown?: number
-  stall_limit?: number
 }
 
 export interface PipelineStartPayload {
@@ -76,6 +75,9 @@ export interface PipelineDiagnosis {
   params: Record<string, unknown>
   fallback: boolean
   checks?: Record<string, boolean>
+  param_attempts?: number
+  param_retry_limit?: number
+  params_applied?: Record<string, unknown>
 }
 
 export interface PipelineFactor {

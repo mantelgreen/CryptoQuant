@@ -35,7 +35,7 @@ import StateView from '@/components/ui/StateView.vue'
 import EquityChart from '@/components/chart/EquityChart.vue'
 import { useToastStore } from '@/stores/toast'
 import { reviewBacktest } from '@/api/agent'
-import { fmtTime, INTERVALS, MAJOR_SYMBOLS, intervalLabel, timeAgo, fmtPct } from '@/utils/format'
+import { fmtTime, RESEARCH_INTERVALS, MAJOR_SYMBOLS, intervalLabel, timeAgo, fmtPct } from '@/utils/format'
 
 const pageHelp: PageHelp = {
   title: '回测研究台',
@@ -243,11 +243,38 @@ function presetDays(d: number) {
   customRange.value = false
 }
 
+function localDatetime(d: Date): string {
+  const p = (x: number) => String(x).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
+function toggleCustomRange() {
+  if (!customRange.value && (!customStart.value || !customEnd.value)) {
+    const end = new Date()
+    const start = new Date(end.getTime() - runDays.value * 24 * 3600 * 1000)
+    customStart.value = localDatetime(start)
+    customEnd.value = localDatetime(end)
+  }
+  customRange.value = !customRange.value
+}
+
 async function submitRun() {
   const v = activeVersion.value
   if (!v) {
     showVersionModal.value = true
     return
+  }
+  if (customRange.value) {
+    const start = new Date(customStart.value)
+    const end = new Date(customEnd.value)
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+      toast.error('自定义区间无效', '开始与结束时间都需要填写')
+      return
+    }
+    if (end <= start) {
+      toast.error('自定义区间无效', '结束时间须晚于开始时间')
+      return
+    }
   }
   submitting.value = true
   try {
@@ -560,7 +587,7 @@ onBeforeUnmount(() => {
               <div class="field">
                 <label class="label" for="bt-interval">K 线颗粒度</label>
                 <select id="bt-interval" v-model="runInterval" class="select font-mono">
-                  <option v-for="i in INTERVALS" :key="i" :value="i">{{ i }}</option>
+                  <option v-for="i in RESEARCH_INTERVALS" :key="i" :value="i">{{ i }}</option>
                 </select>
               </div>
             </div>
@@ -572,10 +599,10 @@ onBeforeUnmount(() => {
                 </button>
               </div>
               <div v-else class="grid flex-1 grid-cols-2 gap-3">
-                <div class="field"><label class="label" for="bt-start">开始</label><input id="bt-start" v-model="customStart" type="datetime-local" class="input" /></div>
-                <div class="field"><label class="label" for="bt-end">结束</label><input id="bt-end" v-model="customEnd" type="datetime-local" class="input" /></div>
+                <div class="field"><label class="label" for="bt-start">开始</label><input id="bt-start" v-model="customStart" type="datetime-local" class="input" :max="customEnd" /></div>
+                <div class="field"><label class="label" for="bt-end">结束</label><input id="bt-end" v-model="customEnd" type="datetime-local" class="input" :min="customStart" /></div>
               </div>
-              <button class="chip !h-8" :class="{ 'is-active': customRange }" @click="customRange = !customRange">
+              <button class="chip !h-8" :class="{ 'is-active': customRange }" @click="toggleCustomRange">
                 {{ customRange ? '预设区间' : '自定义区间' }}
               </button>
             </div>
