@@ -159,6 +159,9 @@ def _normalize_config(cfg: dict[str, Any]) -> dict[str, Any]:
     wv = cfg.get("winsor")
     out["winsor"] = float(wv) if wv is not None else 0.01
     out["model"] = cfg.get("model") or "ridge"
+    # gbdt 目标函数：默认 huber（对厚尾稳健），可选 regression(l2)/regression_l1
+    go = (cfg.get("gbdt_objective") or "huber").strip().lower()
+    out["gbdt_objective"] = go if go in ("regression", "regression_l1", "huber") else "huber"
     out["thresholds"] = th
     out["stop_on_excellent"] = bool(cfg.get("stop_on_excellent", True))
     out["save_quality_factors"] = bool(cfg.get("save_quality_factors", True))
@@ -654,6 +657,7 @@ async def _train(
         fine_interval=cfg.get("fine_interval"),
         agg_features=cfg.get("agg_features"),
         model=cfg.get("model") or "ridge",
+        gbdt_objective=cfg.get("gbdt_objective") or "huber",
         learning_rate=float(cfg.get("learning_rate") or 0.05),
         n_estimators=int(cfg.get("n_estimators") or 240),
         max_depth=int(cfg.get("max_depth") or 3),
@@ -842,6 +846,7 @@ def _learning_summary(train_resp: dict[str, Any]) -> dict[str, Any] | None:
 
 _TRAIN_CFG_KEYS = (
     "model",
+    "gbdt_objective",
     "horizon",
     "test_ratio",
     "val_ratio",

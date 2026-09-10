@@ -47,6 +47,7 @@ class PipelineStartReq(BaseModel):
     max_pick: int = Field(default=6, ge=2, le=12)
     max_rounds: int = Field(default=5, ge=1, le=20)
     model: str = Field(default="ridge", pattern=r"^(ridge|gbdt)$")
+    gbdt_objective: str = Field(default="huber", pattern=r"^(regression|regression_l1|huber)$")
     horizon: int = Field(default=1, ge=1, le=10)
     test_ratio: float = Field(default=0.25, ge=0.15, le=0.5)
     val_ratio: float = Field(default=0.15, ge=0.0, le=0.4)

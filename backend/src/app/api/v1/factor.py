@@ -83,6 +83,7 @@ class MlTrainReq(BaseModel):
     fine_interval: str | None = Field(default=None, pattern=r"^(1m|3m|5m|15m|30m|1h|2h|4h|6h|12h)$")
     agg_features: list[str] = Field(default_factory=list)
     model: str = Field(default="ridge", pattern=r"^(ridge|gbdt)$")
+    gbdt_objective: str = Field(default="huber", pattern=r"^(regression|regression_l1|huber)$")
     learning_rate: float = Field(default=0.05, ge=0.001, le=1.0)
     n_estimators: int = Field(default=240, ge=10, le=5000)
     max_depth: int = Field(default=3, ge=-1, le=32)
@@ -246,6 +247,7 @@ async def ml_train(
         fine_interval=req.fine_interval,
         agg_features=req.agg_features,
         model=req.model,
+        gbdt_objective=req.gbdt_objective,
         learning_rate=req.learning_rate,
         n_estimators=req.n_estimators,
         max_depth=req.max_depth,
@@ -282,6 +284,7 @@ async def ml_save_model(
             fine_interval=req.fine_interval,
             agg_features=req.agg_features,
             model=req.model,
+            gbdt_objective=req.gbdt_objective,
             learning_rate=req.learning_rate,
             n_estimators=req.n_estimators,
             max_depth=req.max_depth,

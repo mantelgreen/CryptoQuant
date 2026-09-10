@@ -204,6 +204,7 @@ export async function trainMl(payload: {
   test_ratio?: number
   alpha?: number
   model?: string
+  gbdt_objective?: string
   max_corr?: number | null
   winsor?: number | null
   cost_bps?: number
@@ -313,6 +314,7 @@ export interface MlTrainArgs {
   test_ratio?: number
   alpha?: number
   model?: string
+  gbdt_objective?: string
   max_corr?: number
   winsor?: number | null
   cost_bps?: number

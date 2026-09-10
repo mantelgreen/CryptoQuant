@@ -30,6 +30,7 @@ export interface PipelineStartPayload {
   max_pick?: number
   max_rounds?: number
   model?: 'ridge' | 'gbdt'
+  gbdt_objective?: 'regression' | 'regression_l1' | 'huber'
   horizon?: number
   test_ratio?: number
   val_ratio?: number

@@ -381,6 +381,7 @@ async def run_ml_research(
     fine_interval: str | None = None,
     agg_features: list[str] | None = None,
     model: str = "ridge",
+    gbdt_objective: str = "huber",
     learning_rate: float = 0.05,
     n_estimators: int = 240,
     max_depth: int = 3,
@@ -559,12 +560,21 @@ async def run_ml_research(
 
     learning: dict[str, Any] | None = None
     best_iteration: int | None = None
+    gbdt_obj: str | None = None
     if model_name == "gbdt":
         try:
             from lightgbm import LGBMRegressor, early_stopping, record_evaluation
         except ImportError as exc:  # pragma: no cover
             return {"found": False, "message": "未安装 lightgbm（pip install lightgbm）"}
+        # 目标函数：默认 huber（对厚尾收益比 l2 稳健），可切 regression(l2)/regression_l1。
+        obj = (
+            gbdt_objective
+            if gbdt_objective in ("regression", "regression_l1", "huber")
+            else "huber"
+        )
+        gbdt_obj = obj
         lgb_params: dict[str, Any] = {
+            "objective": obj,
             "n_estimators": max(10, int(n_estimators)),
             "learning_rate": float(learning_rate),
             "max_depth": max_depth_v,
@@ -578,6 +588,9 @@ async def run_ml_research(
             "colsample_bytree": min(1.0, max(0.1, float(colsample_bytree))),
             "random_state": 7,
         }
+        # huber 的 delta 需按标签尺度缩放，否则默认 0.9 远大于收益量级（~1e-2）→ 退化成 l2
+        if obj == "huber":
+            lgb_params["alpha"] = max(1e-6, float(np.std(ytr)))
         booster = None
         # 学习曲线用验证集（无验证集时退回测试集，仅展示）；早停只在有独立验证集时启用，避免用测试集早停泄漏。
         eval_X = (Xtr_z, Xval_z) if has_val else (Xtr_z, Xte_z)
@@ -698,6 +711,7 @@ async def run_ml_research(
             "subsample_freq": 1,
             "colsample_bytree": colsample_bytree,
             "best_iteration": best_iteration,
+            "objective": gbdt_obj,
         },
         "features": [
             {

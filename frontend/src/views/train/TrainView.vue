@@ -73,6 +73,7 @@ const cfg = ref({
   endDate: '',
   horizon: 1,
   model: 'ridge',
+  gbdtObjective: 'huber' as 'regression' | 'regression_l1' | 'huber',
   alpha: 1,
   maxCorr: 0.85,
   winsor: 0.01 as number | null,
@@ -207,6 +208,7 @@ async function run() {
     fine_interval: cfg.value.fineInterval,
     agg_features: cfg.value.fineInterval ? [...cfg.value.aggFeatures] : [],
     model: cfg.value.model,
+    gbdt_objective: cfg.value.gbdtObjective,
     learning_rate: cfg.value.learningRate,
     n_estimators: cfg.value.nEstimators,
     max_depth: cfg.value.maxDepth,
@@ -285,6 +287,7 @@ function last(arr?: number[]): number | null {
 function reviewConfig(): Record<string, unknown> {
   const base: Record<string, unknown> = {
     model: cfg.value.model,
+    gbdt_objective: cfg.value.gbdtObjective,
     alpha: cfg.value.alpha,
     max_corr: cfg.value.maxCorr,
     winsor: cfg.value.winsor,
@@ -571,12 +574,20 @@ onMounted(async () => {
               <label class="label" for="t-model">模型 <Tip text="Ridge 线性稳健、可保存复用；LightGBM 捕捉非线性，保存时序列化模型文件供打分/回测" /></label>
               <select id="t-model" v-model="cfg.model" class="select"><option value="ridge">Ridge 线性</option><option value="gbdt">LightGBM</option></select>
             </div>
+            <div v-if="!isRidge" class="field">
+              <label class="label" for="t-obj">目标函数 <Tip text="LightGBM 损失：huber 对厚尾收益更稳健（默认，delta 按标签尺度自适应）；regression_l1 为 MAE；regression 为均方误差" /></label>
+              <select id="t-obj" v-model="cfg.gbdtObjective" class="select">
+                <option value="huber">Huber（稳健）</option>
+                <option value="regression_l1">MAE（L1）</option>
+                <option value="regression">MSE（L2）</option>
+              </select>
+            </div>
             <div class="field">
               <label class="label" for="t-ratio">测试集比例 <Tip text="按时间末尾切出的样本外比例，用于无未来函数评价" /></label>
               <select id="t-ratio" v-model.number="cfg.testRatio" class="select"><option :value="0.2">20%</option><option :value="0.25">25%</option><option :value="0.3">30%</option></select>
             </div>
             <div class="field">
-              <label class="label" :for="'t-alpha'">{{ isRidge ? '正则 α' : 'L2 叶子权重' }} <Tip :text="isRidge ? 'Ridge 惩罚系数，越大越强约束、越防过拟合' : 'LightGBM 叶子权重的 L2 正则项（实际按 α×1e-3 传入，因收益量级约 1e-3）；建议 1~10，过大会把预测压向 0'" /></label>
+              <label class="label" :for="'t-alpha'">{{ isRidge ? '正则 α' : 'L2 正则 reg_lambda' }} <Tip :text="isRidge ? 'Ridge 惩罚系数，越大越强约束、越防过拟合' : 'LightGBM 的 L2 正则 reg_lambda（直接使用该值）；建议 1~10，过大把叶子值压向 0'" /></label>
               <input id="t-alpha" v-model.number="cfg.alpha" type="number" min="0" max="50" step="0.1" class="input font-mono" />
             </div>
             <div class="field">
