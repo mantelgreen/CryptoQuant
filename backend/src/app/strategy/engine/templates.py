@@ -38,7 +38,15 @@ def _feature_series(df: pd.DataFrame, f: dict, available: set[str]) -> pd.Series
 
 
 def _standardize(val: pd.Series, f: dict) -> pd.Series:
-    """按训练时保存的 clip 上下界 + mean/std 做与训练一致的特征标准化。"""
+    """按训练时保存的口径做与训练一致的特征标准化。
+
+    norm=expanding → 因果 expanding z-score；否则用 clip 上下界 + mean/std。
+    """
+    if f.get("norm") == "expanding":
+        mp = int(f.get("norm_min_periods") or 60)
+        m = val.expanding(min_periods=mp).mean()
+        sd = val.expanding(min_periods=mp).std().replace(0, np.nan)
+        return ((val - m) / sd).fillna(0.0)
     v = val
     if f.get("clip_low") is not None and f.get("clip_high") is not None:
         v = v.clip(float(f["clip_low"]), float(f["clip_high"]))

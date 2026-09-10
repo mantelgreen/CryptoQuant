@@ -37,6 +37,7 @@ export interface PipelineStartPayload {
   alpha?: number
   max_corr?: number | null
   winsor?: number | null
+  feature_norm?: 'global' | 'expanding'
   cost_bps?: number
   fine_interval?: string | null
   agg_features?: string[]

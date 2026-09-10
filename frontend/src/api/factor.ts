@@ -207,6 +207,7 @@ export async function trainMl(payload: {
   gbdt_objective?: string
   max_corr?: number | null
   winsor?: number | null
+  feature_norm?: string
   cost_bps?: number
   fine_interval?: string | null
   agg_features?: string[]
@@ -318,6 +319,7 @@ export interface MlTrainArgs {
   gbdt_objective?: string
   max_corr?: number
   winsor?: number | null
+  feature_norm?: string
   cost_bps?: number
   fine_interval?: string | null
   agg_features?: string[]

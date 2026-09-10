@@ -162,6 +162,9 @@ def _normalize_config(cfg: dict[str, Any]) -> dict[str, Any]:
     # 往返成本（bps）：把毛价差折成净价差，模型层达标也按净价差判定；默认 15bps
     cb = cfg.get("cost_bps")
     out["cost_bps"] = float(cb) if cb is not None else 15.0
+    # 特征标准化：global（默认，全局 mean/std）| expanding（因果滚动 z-score，适配 regime 漂移）
+    fnn = (cfg.get("feature_norm") or "global").strip().lower()
+    out["feature_norm"] = fnn if fnn in ("global", "expanding") else "global"
     out["model"] = cfg.get("model") or "ridge"
     # gbdt 目标函数：默认 huber（对厚尾稳健），可选 regression(l2)/regression_l1
     go = (cfg.get("gbdt_objective") or "huber").strip().lower()
@@ -664,6 +667,7 @@ async def _train(
         alpha=float(cfg.get("alpha") or 1.0),
         max_corr=cfg.get("max_corr"),
         winsor=cfg.get("winsor"),
+        feature_norm=cfg.get("feature_norm") or "global",
         cost_bps=float(cfg.get("cost_bps") or 0.0),
         fine_interval=cfg.get("fine_interval"),
         agg_features=cfg.get("agg_features"),
@@ -873,6 +877,7 @@ _TRAIN_CFG_KEYS = (
     "alpha",
     "max_corr",
     "winsor",
+    "feature_norm",
     "cost_bps",
     "fine_interval",
     "agg_features",

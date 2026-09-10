@@ -77,6 +77,7 @@ const cfg = ref({
   alpha: 1,
   maxCorr: 0.8,
   winsor: 0.01 as number | null,
+  featureNorm: 'global' as 'global' | 'expanding',
   costBps: 15,
   fineInterval: null as string | null,
   aggFeatures: ['rv', 'vol_imb', 'taker_ratio'],
@@ -205,6 +206,7 @@ async function run() {
     alpha: cfg.value.alpha,
     max_corr: cfg.value.maxCorr,
     winsor: cfg.value.winsor,
+    feature_norm: cfg.value.featureNorm,
     cost_bps: cfg.value.costBps,
     fine_interval: cfg.value.fineInterval,
     agg_features: cfg.value.fineInterval ? [...cfg.value.aggFeatures] : [],
@@ -293,6 +295,7 @@ function reviewConfig(): Record<string, unknown> {
     alpha: cfg.value.alpha,
     max_corr: cfg.value.maxCorr,
     winsor: cfg.value.winsor,
+    feature_norm: cfg.value.featureNorm,
     cost_bps: cfg.value.costBps,
     fine_interval: cfg.value.fineInterval,
     agg_features: cfg.value.fineInterval ? [...cfg.value.aggFeatures] : [],
@@ -604,6 +607,13 @@ onMounted(async () => {
                 <option :value="0.01">1%</option>
                 <option :value="0.02">2%</option>
                 <option :value="0.05">5%</option>
+              </select>
+            </div>
+            <div class="field">
+              <label class="label" for="t-norm">特征标准化 <Tip text="global：用训练集全局 mean/std；expanding：逐标的因果滚动 z-score（只用 ≤t 信息），适配 regime 漂移、无未来泄漏" /></label>
+              <select id="t-norm" v-model="cfg.featureNorm" class="select">
+                <option value="global">全局 mean/std</option>
+                <option value="expanding">因果滚动 z-score</option>
               </select>
             </div>
             <div class="field">

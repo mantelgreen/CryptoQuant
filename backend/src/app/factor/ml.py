@@ -45,6 +45,16 @@ _INTERVAL_SEC = {
     "1d": 86400, "3d": 259200, "1w": 604800,
 }
 
+# expanding 标准化（因果滚动 z-score）的最小观测数：训练与推理必须一致
+_EXPANDING_MIN_PERIODS = 60
+
+
+def _expanding_z(s: pd.Series, min_periods: int = _EXPANDING_MIN_PERIODS) -> pd.Series:
+    """因果 expanding z-score：仅用 ≤t 的信息，适配 regime 漂移，无未来泄漏。"""
+    m = s.expanding(min_periods=min_periods).mean()
+    sd = s.expanding(min_periods=min_periods).std()
+    return ((s - m) / sd.replace(0.0, np.nan)).fillna(0.0)
+
 
 def model_storage_dir() -> Path:
     """pickle 模型文件的存放目录（首次调用自动创建）。"""
@@ -158,7 +168,12 @@ def _clip_bounds(a: np.ndarray, q: float) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _std_feature(s: pd.Series, f: dict[str, Any]) -> pd.Series:
-    """按模型保存的 clip 上下界与 mean/std 对单列特征做稳健标准化（打分时与训练口径一致）。"""
+    """按模型保存的标准化口径对单列特征做稳健标准化（打分时与训练一致）。
+
+    norm=expanding → 因果 expanding z-score；否则用 clip 上下界 + mean/std。
+    """
+    if f.get("norm") == "expanding":
+        return _expanding_z(s, int(f.get("norm_min_periods") or _EXPANDING_MIN_PERIODS))
     if f.get("clip_low") is not None and f.get("clip_high") is not None:
         s = s.clip(float(f["clip_low"]), float(f["clip_high"]))
     return (s - float(f["mean"] or 0.0)) / float(f["std"] or 1.0)
@@ -407,6 +422,7 @@ async def run_ml_research(
     alpha: float = 1.0,
     max_corr: float | None = 0.8,
     winsor: float | None = None,
+    feature_norm: str = "global",
     cost_bps: float = 0.0,
     fine_interval: str | None = None,
     agg_features: list[str] | None = None,
@@ -424,6 +440,7 @@ async def run_ml_research(
     return_artifact: bool = False,
 ) -> dict[str, Any]:
     """训练多因子（内置或用户表达式因子），返回样本外评价。extras 提供用户因子 code→{expression,...}。"""
+    fn = feature_norm if feature_norm in ("global", "expanding") else "global"
     valid = [c for c in codes if meta_or_extra(c, extras) is not None]
 
     # 跨粒度聚合：仅当 fine_interval 确比 interval 更细且可整除时启用
@@ -474,8 +491,12 @@ async def run_ml_research(
         for acode in agg_codes:
             frame[acode] = agg_series.get(acode, pd.Series(np.nan, index=df.index))
         fdf = pd.DataFrame(frame)
-        fdf["label"] = fdf["close"].pct_change(periods=horizon, fill_method=None).shift(-horizon)
         cols = valid + agg_codes
+        if fn == "expanding":
+            # 逐标的做因果 expanding 标准化（只用 ≤t 信息），适配 regime 漂移
+            for c in cols:
+                fdf[c] = _expanding_z(pd.to_numeric(fdf[c], errors="coerce"))
+        fdf["label"] = fdf["close"].pct_change(periods=horizon, fill_method=None).shift(-horizon)
         sub = fdf[[*cols, "label"]].dropna()
         if len(sub) < 60:
             continue
@@ -556,11 +577,13 @@ async def run_ml_research(
     clip_low: np.ndarray | None = None
     clip_high: np.ndarray | None = None
     if winsor is not None and 0.0 < winsor < 0.5:
-        clip_low, clip_high = _clip_bounds(Xtr, winsor)
-        Xtr = np.clip(Xtr, clip_low, clip_high)
-        Xte = np.clip(Xte, clip_low, clip_high)
-        if has_val:
-            Xval = np.clip(Xval, clip_low, clip_high)
+        # expanding 模式下特征已标准化，不再做特征钳制（避免与推理口径不一致）；标签仍稳健化
+        if fn != "expanding":
+            clip_low, clip_high = _clip_bounds(Xtr, winsor)
+            Xtr = np.clip(Xtr, clip_low, clip_high)
+            Xte = np.clip(Xte, clip_low, clip_high)
+            if has_val:
+                Xval = np.clip(Xval, clip_low, clip_high)
         y_lo = float(np.quantile(ytr, winsor))
         y_hi = float(np.quantile(ytr, 1.0 - winsor))
         ytr = np.clip(ytr, y_lo, y_hi)
@@ -585,12 +608,20 @@ async def run_ml_research(
         clip_high = clip_high[keep_idx]
 
     model_name = model if model in ("ridge", "gbdt") else "ridge"
-    Xtr_z, _ = _zscore(Xtr)
-    mu = Xtr.mean(axis=0)
-    sd = Xtr.std(axis=0)
-    sd[sd == 0] = 1.0
-    Xte_z = (Xte - mu) / sd
-    Xval_z = (Xval - mu) / sd if has_val else np.empty((0, Xtr_z.shape[1]))
+    if fn == "expanding":
+        # 特征已在逐标的 expanding 阶段标准化，无需再做全局 z-score
+        mu = np.zeros(Xtr.shape[1])
+        sd = np.ones(Xtr.shape[1])
+        Xtr_z = Xtr
+        Xte_z = Xte
+        Xval_z = Xval if has_val else np.empty((0, Xtr.shape[1]))
+    else:
+        Xtr_z, _ = _zscore(Xtr)
+        mu = Xtr.mean(axis=0)
+        sd = Xtr.std(axis=0)
+        sd[sd == 0] = 1.0
+        Xte_z = (Xte - mu) / sd
+        Xval_z = (Xval - mu) / sd if has_val else np.empty((0, Xtr_z.shape[1]))
 
     # LightGBM 超参先做联合约束：max_depth>0 时需满足 num_leaves <= 2^max_depth，否则训练期抛 LightGBMError
     max_depth_v = max(-1, int(max_depth))
@@ -776,9 +807,13 @@ async def run_ml_research(
             "seed_ensemble": max(1, min(10, int(seed_ensemble or 1))),
             "min_child_samples": max(5, int(min_child_samples)),
         },
+        "feature_norm": fn,
         "features": [
             {
-                **{"code": code, "coef": float(w[i]), "mean": float(mu[i]), "std": float(sd[i])},
+                **{"code": code, "coef": float(w[i]), "mean": float(mu[i]), "std": float(sd[i]), "norm": fn},
+                **(
+                    {"norm_min_periods": _EXPANDING_MIN_PERIODS} if fn == "expanding" else {}
+                ),
                 **(
                     {"name": _AGG_NAMES.get(code), "aggregate": {"type": code.split(":", 1)[1], "fine_interval": fine_interval}}
                     if code.startswith("agg:") and fine_interval

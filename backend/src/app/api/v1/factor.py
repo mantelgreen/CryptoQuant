@@ -79,6 +79,7 @@ class MlTrainReq(BaseModel):
     alpha: float = Field(default=1.0, ge=0.0, le=50.0)
     max_corr: float | None = Field(default=0.8, ge=0.0, lt=1.0)
     winsor: float | None = Field(default=None, ge=0.0, lt=0.5)
+    feature_norm: str = Field(default="global", pattern=r"^(global|expanding)$")
     cost_bps: float = Field(default=15.0, ge=0.0, le=1000.0)
     fine_interval: str | None = Field(default=None, pattern=r"^(1m|3m|5m|15m|30m|1h|2h|4h|6h|12h)$")
     agg_features: list[str] = Field(default_factory=list)
@@ -244,6 +245,7 @@ async def ml_train(
         alpha=req.alpha,
         max_corr=req.max_corr,
         winsor=req.winsor,
+        feature_norm=req.feature_norm,
         cost_bps=req.cost_bps,
         fine_interval=req.fine_interval,
         agg_features=req.agg_features,
@@ -282,6 +284,7 @@ async def ml_save_model(
             alpha=req.alpha,
             max_corr=req.max_corr,
             winsor=req.winsor,
+            feature_norm=req.feature_norm,
             cost_bps=req.cost_bps,
             fine_interval=req.fine_interval,
             agg_features=req.agg_features,
