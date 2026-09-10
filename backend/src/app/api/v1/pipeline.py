@@ -52,9 +52,9 @@ class PipelineStartReq(BaseModel):
     test_ratio: float = Field(default=0.25, ge=0.15, le=0.5)
     val_ratio: float = Field(default=0.15, ge=0.0, le=0.4)
     alpha: float = Field(default=1.0, ge=0.0, le=50.0)
-    max_corr: float | None = Field(default=0.85, ge=0.0, lt=1.0)
+    max_corr: float | None = Field(default=0.8, ge=0.0, lt=1.0)
     winsor: float | None = Field(default=None, ge=0.0, lt=0.5)
-    cost_bps: float = Field(default=0.0, ge=0.0, le=1000.0)
+    cost_bps: float = Field(default=15.0, ge=0.0, le=1000.0)
     fine_interval: str | None = Field(
         default=None, pattern=r"^(1m|3m|5m|15m|30m|1h|2h|4h|6h|12h)$"
     )

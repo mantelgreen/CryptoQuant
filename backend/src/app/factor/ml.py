@@ -405,7 +405,7 @@ async def run_ml_research(
     test_ratio: float = 0.25,
     val_ratio: float = 0.0,
     alpha: float = 1.0,
-    max_corr: float | None = 0.85,
+    max_corr: float | None = 0.8,
     winsor: float | None = None,
     cost_bps: float = 0.0,
     fine_interval: str | None = None,

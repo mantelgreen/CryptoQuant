@@ -159,6 +159,9 @@ def _normalize_config(cfg: dict[str, Any]) -> dict[str, Any]:
     # 稳健化 Winsorize：默认 1%（加密厚尾收益），抑制离群值对 L2/相关性过滤的扰动；显式传 0 可关闭
     wv = cfg.get("winsor")
     out["winsor"] = float(wv) if wv is not None else 0.01
+    # 往返成本（bps）：把毛价差折成净价差，模型层达标也按净价差判定；默认 15bps
+    cb = cfg.get("cost_bps")
+    out["cost_bps"] = float(cb) if cb is not None else 15.0
     out["model"] = cfg.get("model") or "ridge"
     # gbdt 目标函数：默认 huber（对厚尾稳健），可选 regression(l2)/regression_l1
     go = (cfg.get("gbdt_objective") or "huber").strip().lower()
@@ -743,12 +746,17 @@ def _ml_ok(train_resp: dict[str, Any], th: dict[str, Any], *, val: bool = False)
     """模型层达标判定。val=True 用验证集指标（调参/因子精筛），否则用测试集指标（最终评估）。"""
     if val:
         rank = train_resp.get("val_rank_ic")
-        spread = train_resp.get("val_spread")
+        # 成本感知：优先用净价差（扣 cost_bps），缺失时退回毛价差
+        spread = train_resp.get("val_net_spread")
+        if spread is None:
+            spread = train_resp.get("val_spread")
         hit = train_resp.get("val_hit_rate")
         gap = train_resp.get("val_overfit_gap")
     else:
         rank = train_resp.get("oos_rank_ic")
-        spread = train_resp.get("spread")
+        spread = train_resp.get("net_spread")
+        if spread is None:
+            spread = train_resp.get("spread")
         hit = train_resp.get("hit_rate")
         gap = train_resp.get("overfit_gap")
     return bool(
