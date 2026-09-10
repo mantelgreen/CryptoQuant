@@ -82,9 +82,10 @@ const cfg = ref({
   aggFeatures: ['rv', 'vol_imb', 'taker_ratio'],
   testRatio: 0.25,
   learningRate: 0.05,
-  nEstimators: 240,
+  nEstimators: 600,
   maxDepth: 3,
   numLeaves: 7,
+  minChildSamples: 20,
   subsample: 0.9,
   colsample: 0.9,
 })
@@ -213,6 +214,7 @@ async function run() {
     n_estimators: cfg.value.nEstimators,
     max_depth: cfg.value.maxDepth,
     num_leaves: cfg.value.numLeaves,
+    min_child_samples: cfg.value.minChildSamples,
     subsample: cfg.value.subsample,
     colsample_bytree: cfg.value.colsample,
   }
@@ -300,6 +302,7 @@ function reviewConfig(): Record<string, unknown> {
     n_estimators: cfg.value.nEstimators,
     max_depth: cfg.value.maxDepth,
     num_leaves: cfg.value.numLeaves,
+    min_child_samples: cfg.value.minChildSamples,
     subsample: cfg.value.subsample,
     colsample_bytree: cfg.value.colsample,
   }
@@ -656,6 +659,10 @@ onMounted(async () => {
               <div class="field">
                 <label class="label" for="t-nl">叶子数 <Tip text="num_leaves：每棵树叶子节点数，越大模型容量越大" /></label>
                 <input id="t-nl" v-model.number="cfg.numLeaves" type="number" min="2" max="256" step="1" class="input font-mono" />
+              </div>
+              <div class="field">
+                <label class="label" for="t-mcs">最小叶子样本 <Tip text="min_child_samples：单个叶子最少样本数，小样本/弱信号下调大（如 30~50）可显著降过拟合" /></label>
+                <input id="t-mcs" v-model.number="cfg.minChildSamples" type="number" min="5" max="200" step="5" class="input font-mono" />
               </div>
               <div class="field">
                 <label class="label" for="t-ss">行采样 <Tip text="subsample：每轮训练随机用多少比例样本，防过拟合" /></label>

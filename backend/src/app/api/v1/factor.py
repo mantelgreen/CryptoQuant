@@ -85,9 +85,10 @@ class MlTrainReq(BaseModel):
     model: str = Field(default="ridge", pattern=r"^(ridge|gbdt)$")
     gbdt_objective: str = Field(default="huber", pattern=r"^(regression|regression_l1|huber)$")
     learning_rate: float = Field(default=0.05, ge=0.001, le=1.0)
-    n_estimators: int = Field(default=240, ge=10, le=5000)
+    n_estimators: int = Field(default=600, ge=10, le=5000)
     max_depth: int = Field(default=3, ge=-1, le=32)
     num_leaves: int = Field(default=7, ge=2, le=256)
+    min_child_samples: int = Field(default=20, ge=5, le=200)
     subsample: float = Field(default=0.9, ge=0.1, le=1.0)
     colsample_bytree: float = Field(default=0.9, ge=0.1, le=1.0)
 
@@ -252,6 +253,7 @@ async def ml_train(
         n_estimators=req.n_estimators,
         max_depth=req.max_depth,
         num_leaves=req.num_leaves,
+        min_child_samples=req.min_child_samples,
         subsample=req.subsample,
         colsample_bytree=req.colsample_bytree,
     )
@@ -289,6 +291,7 @@ async def ml_save_model(
             n_estimators=req.n_estimators,
             max_depth=req.max_depth,
             num_leaves=req.num_leaves,
+            min_child_samples=req.min_child_samples,
             subsample=req.subsample,
             colsample_bytree=req.colsample_bytree,
         )

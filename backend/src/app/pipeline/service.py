@@ -49,6 +49,7 @@ _PARAM_KEYS = (
     "n_estimators",
     "max_depth",
     "num_leaves",
+    "min_child_samples",
     "subsample",
     "colsample_bytree",
 )
@@ -162,6 +163,9 @@ def _normalize_config(cfg: dict[str, Any]) -> dict[str, Any]:
     # gbdt 目标函数：默认 huber（对厚尾稳健），可选 regression(l2)/regression_l1
     go = (cfg.get("gbdt_objective") or "huber").strip().lower()
     out["gbdt_objective"] = go if go in ("regression", "regression_l1", "huber") else "huber"
+    out["min_child_samples"] = max(
+        5, min(200, int(cfg.get("min_child_samples") or 20))
+    )
     out["thresholds"] = th
     out["stop_on_excellent"] = bool(cfg.get("stop_on_excellent", True))
     out["save_quality_factors"] = bool(cfg.get("save_quality_factors", True))
@@ -659,9 +663,10 @@ async def _train(
         model=cfg.get("model") or "ridge",
         gbdt_objective=cfg.get("gbdt_objective") or "huber",
         learning_rate=float(cfg.get("learning_rate") or 0.05),
-        n_estimators=int(cfg.get("n_estimators") or 240),
+        n_estimators=int(cfg.get("n_estimators") or 600),
         max_depth=int(cfg.get("max_depth") or 3),
         num_leaves=int(cfg.get("num_leaves") or 7),
+        min_child_samples=int(cfg.get("min_child_samples") or 20),
         subsample=float(cfg.get("subsample") or 0.9),
         colsample_bytree=float(cfg.get("colsample_bytree") or 0.9),
     )
@@ -1011,11 +1016,12 @@ async def _diagnose(
                 "agg_features",
                 "learning_rate",
                 "n_estimators",
-                "max_depth",
-                "num_leaves",
-                "subsample",
-                "colsample_bytree",
-            )
+    "max_depth",
+    "num_leaves",
+    "min_child_samples",
+    "subsample",
+    "colsample_bytree",
+)
         },
     }
 

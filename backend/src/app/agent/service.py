@@ -298,7 +298,7 @@ _TRAIN_REVIEW_SYSTEM = """你是量化多因子模型诊断与调参专家。用
 - 不理想：价差≤0、方向反转、|RankIC|<0.01，或明显在记忆噪声（train_IC 远高 OOS_IC）。
 
 诊断时的调参思路（据此给建议，不要乱给）：
-- 过拟合差距大 / OOS loss 拐点早：降低 learning_rate、提高 alpha/L2、减 n_estimators、加深正则（num_leaves/max_depth 更小）、加大 subsample/colsample 采样收紧等；
+- 过拟合差距大 / OOS loss 拐点早：降低 learning_rate、提高 alpha/L2、减 n_estimators、加深正则（num_leaves/max_depth 更小、提高 min_child_samples）、加大 subsample/colsample 采样收紧等；
 - 信号弱但稳健：适度加大容量（gbdt 增加 num_leaves/n_estimators，ridge 调低 alpha）；
 - 样本少/噪声大：优先 Ridge 并提高 alpha；数据量大且非线性明显才用 gbdt；
 - 收益/特征离群明显（极值价差、厚尾）：适度加大 winsor（0.01→0.02→0.05）；
@@ -313,7 +313,7 @@ _TRAIN_REVIEW_SYSTEM = """你是量化多因子模型诊断与调参专家。用
 - model: "ridge" | "gbdt"（仅在确实要换模型时给出）
 - horizon: 1~10（int）；test_ratio: 0.15~0.5
 - alpha: 0~50；max_corr: 0~0.99
-- learning_rate: 0.01~1；n_estimators: 100~5000；max_depth: -1~32；num_leaves: 2~256；subsample: 0.1~1；colsample_bytree: 0.1~1
+- learning_rate: 0.01~1；n_estimators: 100~5000；max_depth: -1~32；num_leaves: 2~256；min_child_samples: 5~200；subsample: 0.1~1；colsample_bytree: 0.1~1
 - winsor: 0 | 0.01 | 0.02 | 0.05（仅从这 4 个值里选，0 表示关闭稳健化；离群明显时建议调大）
 规则：
 - grade 只能是 ok/warn/bad；keep 至少 2 个、code 必须原样来自输入的特征列表；keep 与 drop 不要重叠；
@@ -336,12 +336,21 @@ _HYPER_SPEC: dict[str, dict[str, Any]] = {
     "n_estimators": {"type": "int", "min": 100, "max": 5000},
     "max_depth": {"type": "int", "min": -1, "max": 32},
     "num_leaves": {"type": "int", "min": 2, "max": 256},
+    "min_child_samples": {"type": "int", "min": 5, "max": 200},
     "subsample": {"type": "float", "min": 0.1, "max": 1.0},
     "colsample_bytree": {"type": "float", "min": 0.1, "max": 1.0},
     "winsor": {"type": "float", "min": 0.0, "max": 0.2},
 }
 
-_GBDT_KEYS = {"learning_rate", "n_estimators", "max_depth", "num_leaves", "subsample", "colsample_bytree"}
+_GBDT_KEYS = {
+    "learning_rate",
+    "n_estimators",
+    "max_depth",
+    "num_leaves",
+    "min_child_samples",
+    "subsample",
+    "colsample_bytree",
+}
 
 _WINSOR_CHOICES = (0.0, 0.01, 0.02, 0.05)
 

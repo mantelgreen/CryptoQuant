@@ -414,9 +414,10 @@ async def run_ml_research(
     gbdt_objective: str = "huber",
     seed_ensemble: int = 3,
     learning_rate: float = 0.05,
-    n_estimators: int = 240,
+    n_estimators: int = 600,
     max_depth: int = 3,
     num_leaves: int = 7,
+    min_child_samples: int = 20,
     subsample: float = 0.9,
     colsample_bytree: float = 0.9,
     extras: dict[str, dict] | None = None,
@@ -618,6 +619,8 @@ async def run_ml_research(
             "learning_rate": float(learning_rate),
             "max_depth": max_depth_v,
             "num_leaves": num_leaves_v,
+            # 单叶子最少样本：小样本/弱信号下适当提高可显著降过拟合
+            "min_child_samples": max(5, int(min_child_samples)),
             # L2 正则用 sklearn 参数 reg_lambda（原 lambda_l2 是原生别名，且 alpha*1e-3 实际≈关闭）。
             # 叶子 hessian 之和 ≥ min_child_samples(默认20)，alpha=1 时收缩约 5%，温和有效。
             "reg_lambda": max(0.0, float(alpha)),
@@ -771,6 +774,7 @@ async def run_ml_research(
             "best_iteration": best_iteration,
             "objective": gbdt_obj,
             "seed_ensemble": max(1, min(10, int(seed_ensemble or 1))),
+            "min_child_samples": max(5, int(min_child_samples)),
         },
         "features": [
             {

@@ -44,6 +44,7 @@ export interface PipelineStartPayload {
   n_estimators?: number
   max_depth?: number
   num_leaves?: number
+  min_child_samples?: number
   subsample?: number
   colsample_bytree?: number
   thresholds?: PipelineThresholds
