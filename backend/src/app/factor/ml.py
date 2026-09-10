@@ -19,10 +19,13 @@ import numpy as np
 import pandas as pd
 
 from ..core.config import get_settings
+from ..core.logging import get_logger
 from ..data.repository.kline_repo import KlineRepository
 from .registry import compute_factor, get_factors
 from .compute import compute_series, meta_or_extra
 from .sandbox import safe_eval_expr
+
+logger = get_logger(__name__)
 
 # 跨粒度聚合特征：用更细粒度 K 线在每根粗 bar 内汇总出的低噪声特征
 _AGG_TYPES = ("rv", "vol_imb", "taker_ratio")
@@ -204,16 +207,43 @@ def _filter_high_corr(
     return keep, removed
 
 
-def _ridge(X: np.ndarray, y: np.ndarray, alpha: float) -> np.ndarray:
-    # 优先 scikit-learn（更数值稳定），缺失时用 numpy 正规方程
+def _ridge(
+    X: np.ndarray, y: np.ndarray, alpha: float, sample_weight: np.ndarray | None = None
+) -> np.ndarray:
+    # 优先 scikit-learn（更数值稳定），缺失时用 numpy 正规方程（支持样本权重）
     try:  # pragma: no cover - 可选依赖
         from sklearn.linear_model import Ridge
 
-        return Ridge(alpha=alpha, fit_intercept=False).fit(X, y).coef_.astype(float)
+        return (
+            Ridge(alpha=alpha, fit_intercept=False)
+            .fit(X, y, sample_weight=sample_weight)
+            .coef_.astype(float)
+        )
     except Exception:  # noqa: BLE001
-        n, p = X.shape
-        a = X.T @ X + alpha * np.eye(p)
-        return np.linalg.solve(a, X.T @ y)
+        p = X.shape[1]
+        if sample_weight is not None:
+            sw = np.asarray(sample_weight, dtype=float).reshape(-1, 1)
+            xtwx = (X * sw).T @ X
+            xtwy = (X * sw).T @ y
+        else:
+            xtwx = X.T @ X
+            xtwy = X.T @ y
+        a = xtwx + alpha * np.eye(p)
+        return np.linalg.solve(a, xtwy)
+
+
+class _EnsembleRegressor:
+    """多种子 LightGBM 集成：predict 取各子模型预测均值，降低单模型方差。
+
+    仅暴露 predict，可直接替换单个 booster 用于回测/打分/落盘（pickle 可序列化）。
+    """
+
+    def __init__(self, models: list[Any]) -> None:
+        self.models = models
+
+    def predict(self, X: Any, **kwargs: Any) -> np.ndarray:
+        preds = [np.asarray(m.predict(X, **kwargs), dtype=float) for m in self.models]
+        return np.mean(preds, axis=0)
 
 
 def _quantile_groups(pred: np.ndarray, groups: int) -> np.ndarray:
@@ -382,6 +412,7 @@ async def run_ml_research(
     agg_features: list[str] | None = None,
     model: str = "ridge",
     gbdt_objective: str = "huber",
+    seed_ensemble: int = 3,
     learning_rate: float = 0.05,
     n_estimators: int = 240,
     max_depth: int = 3,
@@ -533,6 +564,14 @@ async def run_ml_research(
         y_hi = float(np.quantile(ytr, 1.0 - winsor))
         ytr = np.clip(ytr, y_lo, y_hi)
 
+    # 重叠标签降权：标签覆盖 horizon 根，相邻样本高度重叠。h>1 时按 1/h 降权训练样本，
+    # 等效增强正则、降低对冗余（重叠）信息的记忆；h=1 时不生效。
+    train_weight = (
+        np.full(len(ytr), 1.0 / float(horizon), dtype=float)
+        if horizon and int(horizon) > 1
+        else None
+    )
+
     # —— 特征相关性去冗余（训练集内） ——
     keep_idx, removed_feats = _filter_high_corr(Xtr, ytr, feature_cols, max_corr)
     feature_cols = [feature_cols[i] for i in keep_idx]
@@ -591,48 +630,67 @@ async def run_ml_research(
         # huber 的 delta 需按标签尺度缩放，否则默认 0.9 远大于收益量级（~1e-2）→ 退化成 l2
         if obj == "huber":
             lgb_params["alpha"] = max(1e-6, float(np.std(ytr)))
-        booster = None
         # 学习曲线用验证集（无验证集时退回测试集，仅展示）；早停只在有独立验证集时启用，避免用测试集早停泄漏。
         eval_X = (Xtr_z, Xval_z) if has_val else (Xtr_z, Xte_z)
         eval_y = (ytr, yval) if has_val else (ytr, yte)
-        try:
-            evals: dict[str, Any] = {}
-            callbacks: list[Any] = [record_evaluation(evals)]
+        n_seeds = max(1, min(10, int(seed_ensemble or 1)))
+        models: list[Any] = []
+        for k in range(n_seeds):
+            params_k = {**lgb_params, "random_state": 7 + k}
+            callbacks: list[Any] = []
+            if k == 0:
+                evals: dict[str, Any] = {}
+                callbacks.append(record_evaluation(evals))
             if has_val:
                 callbacks.append(early_stopping(30, verbose=False))
-            booster = LGBMRegressor(**lgb_params).fit(
-                Xtr_z,
-                ytr,
-                eval_X=eval_X,
-                eval_y=eval_y,
-                eval_names=["train", "oos"],
-                eval_metric="l2",
-                callbacks=callbacks,
-            )
-            # 早停后 sklearn predict / booster.predict 会自动采用 best_iteration，artifact 口径一致
-            best_iteration = int(getattr(booster, "best_iteration_", 0) or 0) or None
-            train_loss = next(iter((evals.get("train") or {}).values()), None)
-            oos_loss = next(iter((evals.get("oos") or {}).values()), None)
-            if train_loss and oos_loss and len(train_loss) == len(oos_loss):
-                learning = {
-                    "rounds": list(range(1, len(train_loss) + 1)),
-                    "train": [round(float(v), 8) for v in train_loss],
-                    "oos": [round(float(v), 8) for v in oos_loss],
-                }
-                if best_iteration:
-                    learning["best_iteration"] = best_iteration
-                    learning["best_oos"] = round(float(oos_loss[best_iteration - 1]), 8)
-        except Exception:  # noqa: BLE001 - 记录失败不影响训练本身
-            booster = None
-        if booster is None:
-            booster = LGBMRegressor(**lgb_params).fit(Xtr_z, ytr)
-        w = booster.feature_importances_.astype(float)
+            try:
+                m = LGBMRegressor(**params_k).fit(
+                    Xtr_z,
+                    ytr,
+                    sample_weight=train_weight,
+                    eval_X=eval_X,
+                    eval_y=eval_y,
+                    eval_names=["train", "oos"],
+                    eval_metric="l2",
+                    callbacks=callbacks or None,
+                )
+                models.append(m)
+                if k == 0:
+                    # 早停后 sklearn predict / booster.predict 会自动采用 best_iteration，artifact 口径一致
+                    best_iteration = int(getattr(m, "best_iteration_", 0) or 0) or None
+                    train_loss = next(iter((evals.get("train") or {}).values()), None)
+                    oos_loss = next(iter((evals.get("oos") or {}).values()), None)
+                    if train_loss and oos_loss and len(train_loss) == len(oos_loss):
+                        learning = {
+                            "rounds": list(range(1, len(train_loss) + 1)),
+                            "train": [round(float(v), 8) for v in train_loss],
+                            "oos": [round(float(v), 8) for v in oos_loss],
+                        }
+                        if best_iteration:
+                            learning["best_iteration"] = best_iteration
+                            learning["best_oos"] = round(
+                                float(oos_loss[best_iteration - 1]), 8
+                            )
+            except Exception:  # noqa: BLE001 - 单个种子失败不影响其它
+                logger.warning("ml.gbdt_seed_failed", seed=k)
+        if not models:
+            # 全部失败：退回无 eval 的普通训练
+            try:
+                models = [
+                    LGBMRegressor(**{**lgb_params, "random_state": 7}).fit(
+                        Xtr_z, ytr, sample_weight=train_weight
+                    )
+                ]
+            except Exception as exc:  # noqa: BLE001
+                return {"found": False, "message": f"LightGBM 训练失败：{exc}"}
+        booster = models[0] if len(models) == 1 else _EnsembleRegressor(models)
+        w = np.mean([m.feature_importances_.astype(float) for m in models], axis=0)
         s = w.sum()
         w = w / s if s > 0 else np.zeros_like(w)
         pred = booster.predict(Xte_z)
-        engine = "lightgbm-gbdt"
+        engine = "lightgbm-gbdt" + (f"x{len(models)}" if len(models) > 1 else "")
     else:
-        w = _ridge(Xtr_z, ytr, alpha)
+        w = _ridge(Xtr_z, ytr, alpha, sample_weight=train_weight)
         pred = Xte_z @ w
         try:
             import sklearn  # noqa: F401
@@ -712,6 +770,7 @@ async def run_ml_research(
             "colsample_bytree": colsample_bytree,
             "best_iteration": best_iteration,
             "objective": gbdt_obj,
+            "seed_ensemble": max(1, min(10, int(seed_ensemble or 1))),
         },
         "features": [
             {
