@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import {
   Boxes,
+  ChartLine,
   Check,
   ChevronDown,
   ChevronRight,
@@ -18,6 +19,7 @@ import {
 import PageHeader from '@/components/ui/PageHeader.vue'
 import Modal from '@/components/ui/Modal.vue'
 import StateView from '@/components/ui/StateView.vue'
+import TrainCharts from '@/views/train/TrainCharts.vue'
 import { useToastStore } from '@/stores/toast'
 import {
   deletePipeline,
@@ -29,6 +31,7 @@ import {
   type PipelineRound,
   type PipelineRun,
 } from '@/api/pipeline'
+import type { MlLearning, MlOosCharts } from '@/api/factor'
 import { fmtStamp, MAJOR_SYMBOLS } from '@/utils/format'
 
 const toast = useToastStore()
@@ -451,6 +454,87 @@ function paramsText(d: PipelineDiagnosis): string {
   return Object.entries(p).map(([k, v]) => `${k}=${v}`).join(' · ')
 }
 
+// —— 轮次卡片折叠（点击标题切换） ——
+const collapsed = reactive<Record<string, boolean>>({})
+function toggleRound(id: string) {
+  collapsed[id] = !collapsed[id]
+}
+function isCollapsed(id: string): boolean {
+  return !!collapsed[id]
+}
+
+// —— 训练详情弹窗 ——
+const detailRound = ref<PipelineRound | null>(null)
+function openDetail(r: PipelineRound) {
+  detailRound.value = r
+}
+function closeDetail() {
+  detailRound.value = null
+}
+function hasTrainCharts(r: PipelineRound | null): boolean {
+  const t = r?.train_result
+  if (!t) return false
+  return (
+    (t.oos_charts?.deciles?.length ?? 0) > 0 ||
+    (t.learning?.train?.length ?? 0) > 1 ||
+    (t.val_charts?.deciles?.length ?? 0) > 0
+  )
+}
+// 弹窗图表数据：无可用图表时返回 null，便于模板 v-if 收窄类型
+const detailCharts = computed<{ oos_charts?: MlOosCharts; learning?: MlLearning } | null>(() => {
+  const t = detailRound.value?.train_result
+  if (!t) return null
+  const has =
+    (t.oos_charts?.deciles?.length ?? 0) > 0 || (t.learning?.train?.length ?? 0) > 1
+  return has ? { oos_charts: t.oos_charts, learning: t.learning } : null
+})
+
+// 训练参数概要：优先用当轮实际生效的 config 快照（含参数调优后的覆盖），历史轮次回退到流水线配置。
+const TRAIN_PARAM_LABELS: Array<[string, string]> = [
+  ['model', '模型'],
+  ['horizon', '预测窗口 h'],
+  ['test_ratio', '测试占比'],
+  ['val_ratio', '验证占比'],
+  ['alpha', 'alpha/L2'],
+  ['max_corr', '相关性上限'],
+  ['winsor', 'Winsor'],
+  ['cost_bps', '成本 bps'],
+  ['learning_rate', '学习率'],
+  ['n_estimators', '树数量'],
+  ['max_depth', '最大深度'],
+  ['num_leaves', '叶子数'],
+  ['subsample', '行采样'],
+  ['colsample_bytree', '列采样'],
+  ['fine_interval', '细粒度底库'],
+  ['agg_features', '聚合特征'],
+]
+function trainParams(r: PipelineRound): Array<{ k: string; label: string; v: string }> {
+  const cfg = (r.train_result?.config ??
+    (activeRun.value?.config as unknown as Record<string, unknown>) ??
+    {}) as Record<string, unknown>
+  const out: Array<{ k: string; label: string; v: string }> = []
+  for (const [k, label] of TRAIN_PARAM_LABELS) {
+    const val = cfg[k]
+    if (val == null || val === '') continue
+    if (Array.isArray(val)) {
+      if (!val.length) continue
+      out.push({ k, label, v: val.join('/') })
+    } else {
+      out.push({ k, label, v: String(val) })
+    }
+  }
+  return out
+}
+function dataVol(r: PipelineRound): string {
+  const t = r.train_result
+  if (!t) return ''
+  const parts: string[] = []
+  if (t.n_train != null) parts.push(`训练 ${t.n_train}`)
+  if (t.n_val) parts.push(`验证 ${t.n_val}`)
+  if (t.n_test != null) parts.push(`测试 ${t.n_test}`)
+  return parts.join(' · ')
+}
+
 onMounted(async () => {
   document.addEventListener('mousedown', onDocClick)
   await loadHistory()
@@ -699,8 +783,18 @@ onBeforeUnmount(() => {
 
             <div v-else class="space-y-3">
               <div v-for="r in rounds" :key="r.id" class="panel overflow-hidden">
-                <!-- 轮次头 -->
-                <div class="flex flex-wrap items-center gap-2 border-b border-border px-4 py-2.5">
+                <!-- 轮次头（点击标题折叠/展开） -->
+                <button
+                  type="button"
+                  class="flex w-full flex-wrap items-center gap-2 border-b border-border px-4 py-2.5 text-left transition-colors hover:bg-surface-2/50"
+                  :aria-expanded="!isCollapsed(r.id)"
+                  @click="toggleRound(r.id)"
+                >
+                  <ChevronDown
+                    :size="14"
+                    class="shrink-0 text-subtle transition-transform"
+                    :class="isCollapsed(r.id) ? '-rotate-90' : ''"
+                  />
                   <span class="flex items-center gap-1.5 text-sm font-semibold text-fg">
                     <span class="flex h-5 w-5 items-center justify-center rounded-md tint-primary text-primary-ink text-[11px]">{{ r.round_no }}</span>
                     第 {{ r.round_no }} 轮
@@ -711,8 +805,9 @@ onBeforeUnmount(() => {
                   <span v-if="r.model_id" class="badge tone-up">已入库</span>
                   <span v-if="r.error" class="badge tone-down">异常</span>
                   <span class="ml-auto text-[11px] text-subtle">{{ fmtStamp(r.created_at) }}</span>
-                </div>
+                </button>
 
+                <div v-show="!isCollapsed(r.id)">
                 <!-- 阶段步骤条 -->
                 <div class="flex flex-wrap items-center gap-x-1 gap-y-1.5 px-4 py-2.5">
                   <template v-for="(s, i) in STAGES" :key="s.key">
@@ -760,6 +855,34 @@ onBeforeUnmount(() => {
                   <div class="rounded-lg bg-surface-2 px-2.5 py-2">
                     <p class="text-[10px] uppercase tracking-wider text-subtle">最大回撤</p>
                     <p class="num text-sm font-semibold text-down">{{ pct(r.backtest_summary?.metrics?.max_drawdown) }}</p>
+                  </div>
+                </div>
+
+                <!-- 训练参数概要 + 数据量 -->
+                <div v-if="r.train_result" class="border-t border-border px-4 py-2.5">
+                  <div class="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px]">
+                    <span class="font-semibold text-fg">训练参数</span>
+                    <span v-if="r.train_result.model" class="text-muted">
+                      模型 <span class="font-mono text-fg">{{ r.train_result.model }}</span>
+                      <span v-if="r.train_result.engine" class="text-subtle">（{{ r.train_result.engine }}）</span>
+                    </span>
+                    <span v-if="r.train_result.interval" class="text-muted">粒度 <span class="font-mono text-fg">{{ r.train_result.interval }}</span></span>
+                    <span v-if="r.train_result.horizon != null" class="text-muted">h=<span class="font-mono text-fg">{{ r.train_result.horizon }}</span></span>
+                    <span v-if="r.train_result.symbols?.length" class="text-muted">标的 <span class="font-mono text-fg">{{ r.train_result.symbols.join('/') }}</span></span>
+                    <span v-if="r.train_result.n_features_kept != null" class="text-muted">特征 <span class="font-mono text-fg">{{ r.train_result.n_features_kept }}</span></span>
+                    <span v-if="dataVol(r)" class="text-muted">数据量 <span class="num text-fg">{{ dataVol(r) }}</span></span>
+                    <button
+                      v-if="hasTrainCharts(r)"
+                      class="btn btn-soft ml-auto !h-7 !px-2.5 text-[11px]"
+                      @click="openDetail(r)"
+                    >
+                      <ChartLine :size="12" />训练详情
+                    </button>
+                  </div>
+                  <div v-if="trainParams(r).length" class="mt-1.5 flex flex-wrap gap-1.5">
+                    <span v-for="p in trainParams(r)" :key="p.k" class="chip !h-6 font-mono text-[10px]">
+                      <span class="text-subtle">{{ p.label }}</span>&nbsp;{{ p.v }}
+                    </span>
                   </div>
                 </div>
 
@@ -819,6 +942,7 @@ onBeforeUnmount(() => {
                   <router-link v-if="r.model_id" to="/models" class="btn btn-soft mt-2.5 !h-7 !px-2.5 text-[11px]">
                     <TrendingUp :size="12" />查看入库模型
                   </router-link>
+                </div>
                 </div>
               </div>
             </div>
@@ -883,6 +1007,64 @@ onBeforeUnmount(() => {
           </button>
         </div>
       </template>
+    </Modal>
+
+    <!-- 训练详情弹窗：训练参数 + 数据量 + 样本外诊断图表 -->
+    <Modal
+      :open="!!detailRound"
+      :title="`训练详情 · 第 ${detailRound?.round_no ?? ''} 轮`"
+      sub="样本外（测试集）诊断图表；验证集指标仅用于调参，此处作对照"
+      width="1080px"
+      @close="closeDetail"
+    >
+      <div v-if="detailRound" class="space-y-3">
+        <div class="grid grid-cols-2 gap-2 sm:grid-cols-4">
+          <div class="rounded-lg bg-surface-2 px-2.5 py-2">
+            <p class="text-[10px] uppercase tracking-wider text-subtle">训练 IC</p>
+            <p class="num text-sm font-semibold text-fg">{{ signed(detailRound.train_result?.train_ic) }}</p>
+          </div>
+          <div class="rounded-lg bg-surface-2 px-2.5 py-2">
+            <p class="text-[10px] uppercase tracking-wider text-subtle">测试 IC</p>
+            <p class="num text-sm font-semibold" :class="tone(detailRound.train_result?.oos_ic)">{{ signed(detailRound.train_result?.oos_ic) }}</p>
+          </div>
+          <div class="rounded-lg bg-surface-2 px-2.5 py-2">
+            <p class="text-[10px] uppercase tracking-wider text-subtle">测试 RankIC</p>
+            <p class="num text-sm font-semibold" :class="tone(detailRound.train_result?.oos_rank_ic)">{{ signed(detailRound.train_result?.oos_rank_ic) }}</p>
+          </div>
+          <div class="rounded-lg bg-surface-2 px-2.5 py-2">
+            <p class="text-[10px] uppercase tracking-wider text-subtle">验证 RankIC</p>
+            <p class="num text-sm font-semibold" :class="tone(detailRound.train_result?.val_rank_ic)">{{ signed(detailRound.train_result?.val_rank_ic) }}</p>
+          </div>
+          <div class="rounded-lg bg-surface-2 px-2.5 py-2">
+            <p class="text-[10px] uppercase tracking-wider text-subtle">过拟合差</p>
+            <p class="num text-sm font-semibold text-fg">{{ num(detailRound.train_result?.overfit_gap) }}</p>
+          </div>
+          <div class="rounded-lg bg-surface-2 px-2.5 py-2">
+            <p class="text-[10px] uppercase tracking-wider text-subtle">命中率</p>
+            <p class="num text-sm font-semibold text-fg">{{ pct(detailRound.train_result?.hit_rate) }}</p>
+          </div>
+          <div class="rounded-lg bg-surface-2 px-2.5 py-2">
+            <p class="text-[10px] uppercase tracking-wider text-subtle">Top−Btm</p>
+            <p class="num text-sm font-semibold" :class="tone(detailRound.train_result?.spread)">{{ signed(detailRound.train_result?.spread, 5) }}</p>
+          </div>
+          <div class="rounded-lg bg-surface-2 px-2.5 py-2">
+            <p class="text-[10px] uppercase tracking-wider text-subtle">特征数</p>
+            <p class="num text-sm font-semibold text-fg">{{ detailRound.train_result?.n_features_kept ?? '—' }}</p>
+          </div>
+        </div>
+
+        <div class="rounded-lg border border-border bg-surface-2/40 px-3 py-2 text-[11px] leading-relaxed">
+          <p class="text-muted">
+            训练参数：<span class="font-mono text-fg">{{ trainParams(detailRound).map((p) => `${p.label}=${p.v}`).join(' · ') || '—' }}</span>
+          </p>
+          <p class="mt-1 text-muted">数据量：<span class="num text-fg">{{ dataVol(detailRound) || '—' }}</span></p>
+        </div>
+
+        <TrainCharts v-if="detailCharts" :result="detailCharts" />
+        <p v-else class="rounded-lg border border-border bg-surface-2/40 px-3 py-4 text-center text-xs text-subtle">
+          本轮没有可用的诊断图表（可能训练未产出模型或样本不足）。
+        </p>
+      </div>
     </Modal>
   </div>
 </template>

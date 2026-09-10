@@ -2,9 +2,10 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import * as echarts from 'echarts'
 import type { ECharts, EChartsOption } from 'echarts'
-import type { MlTrainResult } from '@/api/factor'
+import type { MlLearning, MlOosCharts } from '@/api/factor'
 
-const props = defineProps<{ result: MlTrainResult }>()
+// 只依赖诊断图表字段，便于训练页与流水线轮次详情共用
+const props = defineProps<{ result: { oos_charts?: MlOosCharts; learning?: MlLearning } }>()
 
 const decilesEl = ref<HTMLDivElement | null>(null)
 const scatterEl = ref<HTMLDivElement | null>(null)

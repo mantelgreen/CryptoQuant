@@ -447,7 +447,7 @@ async def run_round(
         status="done",
         factors_generated=[_factor_detail(c) for c in new_codes],
         factors_picked=[_factor_detail(c) for c in picked],
-        train_result=_trim_train(train_resp),
+        train_result=_trim_train(train_resp, active_cfg),
         backtest_summary={
             "metrics": bt.get("metrics"),
             "summary": bt.get("summary"),
@@ -795,8 +795,34 @@ def _learning_summary(train_resp: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def _trim_train(train_resp: dict[str, Any]) -> dict[str, Any]:
-    """把训练结果精简落库（剔除不可 JSON 化的 artifact/booster）。"""
+_TRAIN_CFG_KEYS = (
+    "model",
+    "horizon",
+    "test_ratio",
+    "val_ratio",
+    "alpha",
+    "max_corr",
+    "winsor",
+    "cost_bps",
+    "fine_interval",
+    "agg_features",
+    "learning_rate",
+    "n_estimators",
+    "max_depth",
+    "num_leaves",
+    "subsample",
+    "colsample_bytree",
+)
+
+
+def _trim_train(
+    train_resp: dict[str, Any], cfg: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """把训练结果精简落库（剔除不可 JSON 化的 artifact/booster）。
+
+    cfg 为当轮实际生效的训练配置（含参数调优后的覆盖），落一份 `config` 快照供前端展示
+    「训练参数概要」——避免历史轮次只能看到流水线初始配置。
+    """
     keep = {
         k: train_resp.get(k)
         for k in (
@@ -840,7 +866,12 @@ def _trim_train(train_resp: dict[str, Any]) -> dict[str, Any]:
             "message",
         )
     }
-    return {k: v for k, v in keep.items() if v is not None}
+    out = {k: v for k, v in keep.items() if v is not None}
+    if cfg:
+        out["config"] = {
+            k: cfg.get(k) for k in _TRAIN_CFG_KEYS if cfg.get(k) is not None
+        }
+    return out
 
 
 async def _diagnose(

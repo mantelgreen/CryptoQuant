@@ -1,4 +1,5 @@
 import http from './http'
+import type { MlFeature, MlFeatureFilter, MlLearning, MlOosCharts } from './factor'
 
 export interface PipelineThresholds {
   oos_rank_ic?: number
@@ -31,6 +32,7 @@ export interface PipelineStartPayload {
   model?: 'ridge' | 'gbdt'
   horizon?: number
   test_ratio?: number
+  val_ratio?: number
   alpha?: number
   max_corr?: number | null
   winsor?: number | null
@@ -96,6 +98,16 @@ export interface PipelineRound {
   factors_generated: Array<PipelineFactor> | null
   factors_picked: Array<PipelineFactor> | null
   train_result: {
+    found?: boolean
+    model?: string
+    engine?: string
+    symbols?: string[]
+    interval?: string
+    horizon?: number
+    n_train?: number
+    n_test?: number
+    n_val?: number
+    val_ratio?: number
     oos_ic?: number | null
     oos_rank_ic?: number | null
     train_ic?: number | null
@@ -103,9 +115,26 @@ export interface PipelineRound {
     hit_rate?: number | null
     spread?: number | null
     net_spread?: number | null
+    top_quintile_mean_ret?: number
+    bottom_quintile_mean_ret?: number
+    pred_nunique?: number
+    pred_std?: number
     degenerate?: boolean
     n_features_kept?: number
-    features?: Array<{ code: string; name?: string; coef: number; ic_oos?: number | null; rank_ic_oos?: number | null }>
+    val_ic?: number | null
+    val_rank_ic?: number | null
+    val_hit_rate?: number | null
+    val_spread?: number | null
+    val_net_spread?: number | null
+    val_overfit_gap?: number | null
+    val_degenerate?: boolean
+    features?: MlFeature[]
+    val_features?: MlFeature[]
+    feature_filter?: MlFeatureFilter
+    oos_charts?: MlOosCharts
+    val_charts?: MlOosCharts
+    learning?: MlLearning
+    config?: Record<string, unknown>
     message?: string
   } | null
   backtest_summary: {
@@ -116,6 +145,9 @@ export interface PipelineRound {
       max_drawdown?: number
       win_rate?: number
       num_trades?: number
+      benchmark_return?: number
+      benchmark_max_drawdown?: number
+      excess_return?: number
     }
     equity_points?: Array<{ ts: string; equity: number }>
     summary?: { final_equity?: number | null; bars?: number }
