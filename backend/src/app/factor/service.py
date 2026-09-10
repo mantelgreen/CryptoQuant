@@ -478,6 +478,39 @@ async def run_factor_research_cs_batch(
     return results
 
 
+async def run_cs_backtest_factor(
+    db,
+    *,
+    code: str,
+    symbols: list[str],
+    interval: str,
+    start: datetime,
+    end: datetime,
+    horizon: int = 1,
+    top_q: float = 0.2,
+    cost_bps: float = 15.0,
+    min_names: int = 5,
+) -> dict[str, Any]:
+    """单因子截面多空回测（做多头部/做空尾部，等权、扣成本）。"""
+    from .cross_section import run_cs_backtest
+
+    repo = KlineRepository(db)
+    extras = await build_extras_for_codes(db, [code])
+    return await run_cs_backtest(
+        repo,
+        code,
+        symbols,
+        interval,
+        start,
+        end,
+        horizon=horizon,
+        top_q=top_q,
+        cost_bps=cost_bps,
+        min_names=min_names,
+        extras=extras,
+    )
+
+
 async def verify_factor_expression(
     db,
     *,

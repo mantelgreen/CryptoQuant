@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { Boxes, Copy, FlaskConical, Info, LayoutGrid, List, ListChecks, LoaderCircle, RefreshCw, Search, Send, Sparkles, Trash2, X } from '@lucide/vue'
+import { Boxes, Copy, FlaskConical, Info, LayoutGrid, List, ListChecks, LoaderCircle, RefreshCw, Search, Send, Sparkles, Trash2, TrendingUp, X } from '@lucide/vue'
 import PageHeader from '@/components/ui/PageHeader.vue'
 import HelpDrawer, { type PageHelp } from '@/components/ui/HelpDrawer.vue'
 import Panel from '@/components/ui/Panel.vue'
@@ -16,6 +16,7 @@ import {
   factorMatrix,
   researchFactors,
   researchFactorsCS,
+  csBacktest,
   removeUserFactor,
   getFactorUsage,
   type FactorMeta,
@@ -24,6 +25,7 @@ import {
   type FactorMatrix,
   type FactorUsage,
   type CsMetrics,
+  type CsBacktestResult,
 } from '@/api/factor'
 import EquityChart from '@/components/chart/EquityChart.vue'
 import { pickFactorsByAi, type FactorPickItem, type FactorPick } from '@/api/agent'
@@ -251,6 +253,11 @@ const showCs = ref(false)
 const csRunning = ref(false)
 const csActive = ref<FactorMeta | null>(null)
 const csResult = ref<CsMetrics | null>(null)
+const csBtRunning = ref(false)
+const csBtResult = ref<CsBacktestResult | null>(null)
+const csBtPoints = computed(() =>
+  (csBtResult.value?.equity_points ?? []).map((p) => ({ ts: p.ts, value: p.equity })),
+)
 const csForm = ref({
   symbols: MAJOR_SYMBOLS.join(', '),
   interval: '1d',
@@ -263,6 +270,7 @@ const csForm = ref({
 function openCs(f: FactorMeta) {
   csActive.value = f
   csResult.value = null
+  csBtResult.value = null
   csForm.value = {
     symbols: MAJOR_SYMBOLS.join(', '),
     interval: '1d',
@@ -312,6 +320,42 @@ async function runCs() {
     toast.error('截面研究失败', (e as { message?: string }).message)
   } finally {
     csRunning.value = false
+  }
+}
+
+async function runCsBacktest() {
+  if (!csActive.value || csBtRunning.value) return
+  const syms = parseSymbols(csForm.value.symbols)
+  if (syms.length < 2) {
+    toast.error('标的不足', '截面回测至少需要 2 个标的，建议 ≥ 20 个')
+    return
+  }
+  csBtRunning.value = true
+  const end = new Date()
+  const start = new Date(end.getTime() - csForm.value.days * 24 * 3600 * 1000)
+  try {
+    const r = await csBacktest({
+      code: csActive.value.code,
+      symbols: syms,
+      interval: csForm.value.interval,
+      start: start.toISOString(),
+      end: end.toISOString(),
+      horizon: csForm.value.horizon,
+      top_q: 0.2,
+      cost_bps: 15,
+      min_names: csForm.value.minNames,
+    })
+    csBtResult.value = r
+    if (r.found) {
+      const tr = ((r.metrics?.total_return ?? 0) * 100).toFixed(1)
+      toast.success('截面回测完成', `总收益 ${tr}% · 夏普 ${r.metrics?.sharpe ?? '—'}`)
+    } else {
+      toast.error('回测样本不足', r.message ?? '请先下载更多标的的 K 线')
+    }
+  } catch (e: unknown) {
+    toast.error('截面回测失败', (e as { message?: string }).message)
+  } finally {
+    csBtRunning.value = false
   }
 }
 
@@ -1075,6 +1119,23 @@ onMounted(load)
               <div><p class="text-[10px] text-subtle">期数/标的</p><p class="num text-sm font-semibold text-fg">{{ csResult.n_periods }} / {{ csResult.avg_names }}</p></div>
             </div>
             <p class="mt-2 text-[10px] leading-snug text-subtle">IC/IR 由同一时点跨标的截面排序计算；|t|&gt;2 才较可信，广度越大越可靠（当前平均 {{ csResult.avg_names }} 个标的/期）。</p>
+            <div class="mt-3 border-t border-border pt-3">
+              <button class="btn btn-soft !h-7 !px-2.5 text-[11px]" :disabled="csBtRunning" @click="runCsBacktest">
+                <LoaderCircle v-if="csBtRunning" :size="12" class="animate-spin" />
+                <TrendingUp v-else :size="12" />跑截面多空回测（top/bottom 20%，扣 15bps）
+              </button>
+              <div v-if="csBtResult?.found" class="mt-2">
+                <div class="grid grid-cols-3 gap-2 sm:grid-cols-5">
+                  <div><p class="text-[10px] text-subtle">总收益</p><p class="num text-sm font-semibold" :class="(csBtResult.metrics?.total_return ?? 0) >= 0 ? 'text-up' : 'text-down'">{{ ((csBtResult.metrics?.total_return ?? 0) * 100).toFixed(1) }}%</p></div>
+                  <div><p class="text-[10px] text-subtle">年化</p><p class="num text-sm font-semibold text-fg">{{ ((csBtResult.metrics?.annual_return ?? 0) * 100).toFixed(1) }}%</p></div>
+                  <div><p class="text-[10px] text-subtle">夏普</p><p class="num text-sm font-semibold text-fg">{{ csBtResult.metrics?.sharpe }}</p></div>
+                  <div><p class="text-[10px] text-subtle">最大回撤</p><p class="num text-sm font-semibold text-down">{{ ((csBtResult.metrics?.max_drawdown ?? 0) * 100).toFixed(1) }}%</p></div>
+                  <div><p class="text-[10px] text-subtle">期数</p><p class="num text-sm font-semibold text-fg">{{ csBtResult.n_periods }}</p></div>
+                </div>
+                <div class="mt-2"><EquityChart :points="csBtPoints" :height="170" /></div>
+              </div>
+              <p v-else-if="csBtResult && !csBtResult.found" class="mt-1.5 text-[11px] text-warn">{{ csBtResult.message }}</p>
+            </div>
           </template>
         </div>
         <p v-else class="text-xs leading-relaxed text-subtle">

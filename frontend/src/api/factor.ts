@@ -381,3 +381,37 @@ export async function researchFactorsCS(payload: {
   const { data } = await http.post<{ data: CsMetrics[] }>('/factors/research/cs', payload, { timeout: 180_000 })
   return data.data ?? []
 }
+
+export interface CsBacktestResult {
+  code: string
+  name: string
+  found: boolean
+  message?: string
+  n_periods?: number
+  avg_names?: number
+  metrics?: {
+    total_return: number
+    annual_return: number
+    sharpe: number
+    max_drawdown: number
+    win_rate: number
+    num_trades: number
+    gross_spread_mean: number
+  }
+  equity_points?: Array<{ ts: string; equity: number }>
+}
+
+export async function csBacktest(payload: {
+  code: string
+  symbols: string[]
+  interval: string
+  start: string
+  end: string
+  horizon?: number
+  top_q?: number
+  cost_bps?: number
+  min_names?: number
+}): Promise<CsBacktestResult> {
+  const { data } = await http.post<{ data: CsBacktestResult }>('/factors/cs-backtest', payload, { timeout: 180_000 })
+  return data.data
+}

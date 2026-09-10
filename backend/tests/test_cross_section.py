@@ -6,7 +6,11 @@ from datetime import datetime, timedelta
 import numpy as np
 import pytest
 
-from app.factor.cross_section import cross_sectional_metrics, research_factor_cs
+from app.factor.cross_section import (
+    cross_sectional_metrics,
+    research_factor_cs,
+    run_cs_backtest,
+)
 
 EXTRAS = {"f1": {"name": "mom5", "expression": "close.pct_change(5)", "min_bars": 0}}
 
@@ -87,6 +91,29 @@ async def test_cross_sectional_insufficient_names():
     )
     assert r["found"] is False
     assert "标的" in (r.get("message") or "")
+
+
+@pytest.mark.asyncio
+async def test_cross_sectional_backtest_positive():
+    repo = _FakeRepo(_make_panel())
+    syms = [f"SYM{si:02d}USDT" for si in range(15)]
+    r = await run_cs_backtest(
+        repo,
+        "f1",
+        syms,
+        "1d",
+        datetime(2021, 1, 1),
+        datetime(2022, 1, 1),
+        horizon=1,
+        top_q=0.2,
+        cost_bps=15.0,
+        min_names=5,
+        extras=EXTRAS,
+    )
+    assert r["found"], r
+    assert r["n_periods"] > 100
+    assert r["metrics"]["total_return"] > 0
+    assert len(r["equity_points"]) > 0
 
 
 def test_cross_sectional_metrics_aggregation():

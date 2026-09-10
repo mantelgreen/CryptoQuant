@@ -189,6 +189,122 @@ def cross_sectional_metrics(
     }
 
 
+async def run_cs_backtest(
+    repo: KlineRepository,
+    code: str,
+    symbols: list[str],
+    interval: str,
+    start: datetime,
+    end: datetime,
+    horizon: int = 1,
+    top_q: float = 0.2,
+    cost_bps: float = 15.0,
+    min_names: int = DEFAULT_MIN_NAMES,
+    extras: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """截面多空回测：每 h 根按因子排序，做多头部 top_q、做空尾部 top_q，等权、扣成本。
+
+    - 每 `horizon` 根调仓一次，持有 h 根（避免重叠持仓）；
+    - 收益用 bar t 的因子分预测 t→t+h 的未来收益（无未来函数）；
+    - 成本近似：每期双边换手 ≈ 2·top_q，乘以 cost_bps。
+    返回净值曲线 + 指标（总收益/年化/夏普/最大回撤/胜率/多空毛收益）。
+    """
+    from ..strategy.engine.metrics import BARS_PER_YEAR
+
+    meta = meta_or_extra(code, extras)
+    if meta is None:
+        return {"code": code, "found": False, "message": "unknown_factor"}
+    F, R, used, err = await build_panels(repo, code, symbols, interval, start, end, horizon, extras)
+    if F.empty or len(used) < 2:
+        return {
+            "code": code,
+            "name": meta.get("name", code),
+            "found": False,
+            "message": err or f"可用标的不足（当前 {len(used)} 个）",
+        }
+
+    step = max(1, int(horizon))
+    per: list[dict[str, Any]] = []
+    for i in range(0, len(F.index) - 1, step):
+        t = F.index[i]
+        pair = pd.concat([F.loc[t], R.loc[t]], axis=1).dropna()
+        if len(pair) < min_names:
+            continue
+        fv = pair.iloc[:, 0].to_numpy(dtype=float)
+        rv = pair.iloc[:, 1].to_numpy(dtype=float)
+        k = max(1, int(round(len(pair) * top_q)))
+        order = np.argsort(fv)
+        longs = order[-k:]
+        shorts = order[:k]
+        long_ret = float(rv[longs].mean())
+        short_ret = float(rv[shorts].mean())
+        gross = long_ret - short_ret
+        cost = (2.0 * top_q) * (float(cost_bps) / 1e4)
+        per.append(
+            {
+                "ts": pd.Timestamp(t).to_pydatetime().isoformat(),
+                "gross": round(gross, 6),
+                "net": round(gross - cost, 6),
+                "long": round(long_ret, 6),
+                "short": round(short_ret, 6),
+                "n": len(pair),
+            }
+        )
+    if not per:
+        return {
+            "code": code,
+            "name": meta.get("name", code),
+            "found": False,
+            "message": f"每期可用标的需 ≥ {min_names} 个（请先下载更多标的）",
+        }
+
+    rets = np.asarray([p["net"] for p in per], dtype=float)
+    equity = np.cumprod(1.0 + rets)
+    total = float(equity[-1] - 1.0)
+    std = float(rets.std(ddof=1)) if len(rets) > 1 else 0.0
+    ppy = float(BARS_PER_YEAR.get(interval, 365.0)) / step
+    sharpe = float(rets.mean() / std * math.sqrt(ppy)) if std > 0 else 0.0
+    peak = np.maximum.accumulate(equity)
+    mdd = float((equity / peak - 1.0).min())
+    win = float(np.mean(rets > 0))
+    periods = max(1, len(equity) - 1)
+    ann = float(equity[-1] ** (ppy / periods) - 1.0) if equity[-1] > 0 else -1.0
+
+    # 抽稀净值点
+    if len(per) > 500:
+        idx = np.unique(np.round(np.linspace(0, len(per) - 1, 500)).astype(int))
+    else:
+        idx = np.arange(len(per))
+    equity_points = [
+        {"ts": per[i]["ts"], "equity": round(float(equity[i]), 4)} for i in idx
+    ]
+
+    return {
+        "code": code,
+        "name": meta.get("name", code),
+        "found": True,
+        "mode": "cross_sectional_backtest",
+        "interval": interval,
+        "symbols": used,
+        "horizon": horizon,
+        "top_q": top_q,
+        "cost_bps": cost_bps,
+        "n_periods": len(per),
+        "avg_names": round(float(np.mean([p["n"] for p in per])), 2),
+        "metrics": {
+            "total_return": round(total, 6),
+            "annual_return": round(ann, 6),
+            "sharpe": round(sharpe, 3),
+            "max_drawdown": round(mdd, 6),
+            "win_rate": round(win, 4),
+            "num_trades": len(per),
+            "gross_spread_mean": round(float(np.mean([p["gross"] for p in per])), 6),
+        },
+        "equity_points": equity_points,
+        "series": per[:500],
+    }
+
+
 async def research_factor_cs(
     repo: KlineRepository,
     code: str,

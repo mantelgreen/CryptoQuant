@@ -22,6 +22,7 @@ from ...factor.service import (
     list_factor_catalog,
     list_saved_models,
     persist_trained_model,
+    run_cs_backtest_factor,
     run_factor_matrix,
     run_factor_research_batch,
     run_factor_research_cs_batch,
@@ -61,6 +62,18 @@ class ResearchCsReq(BaseModel):
     horizon: int = Field(default=1, ge=1, le=10)
     min_names: int = Field(default=5, ge=2, le=200)
     neutralize: bool = False
+
+
+class CsBacktestReq(BaseModel):
+    code: str = Field(..., min_length=1, max_length=200)
+    symbols: list[str] = Field(..., min_length=2, max_length=200)
+    interval: str = Field(..., pattern=r"^(3m|15m|30m|1h|2h|4h|6h|12h|1d|3d|1w)$")
+    start: datetime
+    end: datetime
+    horizon: int = Field(default=1, ge=1, le=10)
+    top_q: float = Field(default=0.2, gt=0.0, lt=0.5)
+    cost_bps: float = Field(default=15.0, ge=0.0, le=1000.0)
+    min_names: int = Field(default=5, ge=2, le=200)
 
 
 class VerifyReq(BaseModel):
@@ -255,6 +268,28 @@ async def research_cross_sectional(
         horizon=req.horizon,
         min_names=req.min_names,
         neutralize=req.neutralize,
+    )
+    return {"code": "OK", "message": "ok", "data": data}
+
+
+@router.post("/cs-backtest")
+async def cross_sectional_backtest(
+    req: CsBacktestReq = Body(...),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """单因子截面多空回测：做多头部 / 做空尾部（等权、扣成本），返回净值与指标。"""
+    _check_window(req.start, req.end)
+    data = await run_cs_backtest_factor(
+        db,
+        code=req.code,
+        symbols=[s.upper() for s in req.symbols],
+        interval=req.interval,
+        start=req.start,
+        end=req.end,
+        horizon=req.horizon,
+        top_q=req.top_q,
+        cost_bps=req.cost_bps,
+        min_names=req.min_names,
     )
     return {"code": "OK", "message": "ok", "data": data}
 
