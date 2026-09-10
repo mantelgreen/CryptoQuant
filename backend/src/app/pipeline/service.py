@@ -279,14 +279,10 @@ async def run_round(
     # 1. gen
     await mark("gen", stage_idx=0, message="生成因子")
     new_codes = await _gen_factors(db, cfg, prev_diag)
-    pool = list(
-        dict.fromkeys(
-            [
-                *([c for c in (run.get("factor_pool") or []) if isinstance(c, str)]),
-                *new_codes,
-            ]
-        )
-    )
+    # 新因子前置：挑选阶段只取候选前 40 条，前置可保证本轮新因子一定进入挑选视野，
+    # 不被历史累积的因子池挤出（研究阶段仍对整池计算 IC）。
+    prev_pool = [c for c in (run.get("factor_pool") or []) if isinstance(c, str)]
+    pool = list(dict.fromkeys([*new_codes, *prev_pool]))
     await rrun.update_status(
         run_id, status="running", factor_pool=pool, current_round=round_no
     )
@@ -481,6 +477,39 @@ async def run_round(
 # =============================================================================
 
 
+# 生成因子时的“探索角度”。每轮每个因子换一个角度，避免同质化——无论用户是否给了研究目标，
+# 角度都会注入（用户目标只是主题，不是“只准写同一种表达式”）。
+_GEN_ANGLES = (
+    "动量/趋势延续：用与其它因子不同的回看周期（短/中/长）",
+    "均值回归/超买超卖：乖离率、偏离度、超买超卖后的修复",
+    "波动率结构：波动放大或收缩、ATR/已实现波动率的变化",
+    "量能/流动性：量比、量价背离、主动买卖不平衡",
+    "微观结构/形态：影线、跳空、K 线实体占比、振幅",
+    "相对位置/跨周期强弱：相对均线或长周期分位的强弱",
+    "尾部/极值：创新高/新低、分位突破、极值聚集度",
+    "条件组合：趋势+量能+波动等多条件的组合信号",
+)
+
+
+def _build_gen_prompt(
+    base: str, angle: str, negative: str, round_exprs: list[str]
+) -> str:
+    """拼装因子生成提示词：主题（用户目标或随机灵感）+ 指定角度 + 本轮互斥 + 上一轮负反馈。
+
+    关键点是「角度」与「本轮已生成表达式」会被显式注入，强制模型换思路、不要与同轮其它因子重复。
+    """
+    parts: list[str] = []
+    if base.strip():
+        parts.append(base.strip())
+    parts.append(f"请从「{angle}」这一角度切入，实现方式要明显区别于其它角度。")
+    if round_exprs:
+        recent = "；".join(e[:90] for e in round_exprs[-4:])
+        parts.append(f"本轮已生成下列因子，务必换不同思路、不得重复或近似：{recent}")
+    if negative:
+        parts.append(negative)
+    return " ".join(parts)
+
+
 async def _gen_factors(
     db: AsyncSession, cfg: dict[str, Any], prev_diag: dict[str, Any] | None
 ) -> list[str]:
@@ -497,28 +526,36 @@ async def _gen_factors(
         drops = prev_diag.get("drop") or []
         names = [d.get("name") or d.get("code") for d in drops if d]
         if names:
-            negative = (
-                "（上一轮以下因子思路已被证伪，请务必换方向，不要重复：{}）".format(
-                    "、".join(names[:6])
-                )
+            negative = "（上一轮以下因子思路已被证伪，请务必换方向，不要重复：{}）".format(
+                "、".join(names[:6])
             )
 
     existing = await UserFactorRepository(db).list()
     existing_expr = {_norm_expr(r.get("expression")) for r in existing}
 
     new_codes: list[str] = []
-    for _ in range(n):
+    round_exprs: list[str] = []
+    # 保底成功数：最多尝试 2n 次（上限 10），达标 n 个即停，避免第 1 轮因失败/去重不足 2 个而废轮。
+    target = n
+    max_try = max(n, min(n * 2, 10))
+    tries = 0
+    while len(new_codes) < target and tries < max_try:
+        tries += 1
+        angle = _GEN_ANGLES[(tries - 1) % len(_GEN_ANGLES)]
         try:
+            # 有研究目标 → 以目标为主题（不额外随机灵感）；无目标 → 随机灵感提供主题。
             if objective:
-                prompt = objective + (" " + negative if negative else "")
+                base = objective
             else:
                 idea = await generate_factor_idea(db, model_id=model_id)
-                prompt = idea.get("idea", "") + (" " + negative if negative else "")
+                base = idea.get("idea", "")
+            prompt = _build_gen_prompt(base, angle, negative, round_exprs)
             draft = await generate_factor_draft(db, prompt, model_id=model_id)
             expr = (draft.get("code") or "").strip()
             if not draft.get("verified") or not expr:
                 continue
-            if _norm_expr(expr) in existing_expr:
+            ne = _norm_expr(expr)
+            if ne in existing_expr:
                 continue
             fid = await join_user_factor(
                 db,
@@ -528,11 +565,16 @@ async def _gen_factors(
                 source_model=draft.get("model"),
                 tags=["AI", "pipeline"],
             )
-            existing_expr.add(_norm_expr(expr))
+            existing_expr.add(ne)
+            round_exprs.append(expr)
             new_codes.append(fid)
         except Exception as exc:  # noqa: BLE001
             logger.warning("pipeline.gen_factor_failed", error=str(exc))
             continue
+    if len(new_codes) < target:
+        logger.info(
+            "pipeline.gen_shortfall", target=target, got=len(new_codes), tries=tries
+        )
     return new_codes
 
 
