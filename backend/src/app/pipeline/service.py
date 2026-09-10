@@ -172,6 +172,7 @@ def _normalize_config(cfg: dict[str, Any]) -> dict[str, Any]:
     out["min_child_samples"] = max(
         5, min(200, int(cfg.get("min_child_samples") or 20))
     )
+    out["seed_ensemble"] = max(1, min(10, int(cfg.get("seed_ensemble") or 3)))
     # 回测择时参数：score 滚动分位窗口 + 进出场分位（可配，默认 60/0.8/0.2）
     out["bt_window"] = max(20, min(240, int(cfg.get("bt_window") or 60)))
     out["bt_enter_q"] = max(0.5, min(0.95, float(cfg.get("bt_enter_q") or 0.8)))
@@ -678,6 +679,7 @@ async def _train(
         max_depth=int(cfg.get("max_depth") or 3),
         num_leaves=int(cfg.get("num_leaves") or 7),
         min_child_samples=int(cfg.get("min_child_samples") or 20),
+        seed_ensemble=int(cfg.get("seed_ensemble") or 3),
         subsample=float(cfg.get("subsample") or 0.9),
         colsample_bytree=float(cfg.get("colsample_bytree") or 0.9),
     )
@@ -886,6 +888,7 @@ _TRAIN_CFG_KEYS = (
     "max_depth",
     "num_leaves",
     "min_child_samples",
+    "seed_ensemble",
     "subsample",
     "colsample_bytree",
 )

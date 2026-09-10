@@ -65,8 +65,12 @@ class PipelineStartReq(BaseModel):
     max_depth: int = Field(default=3, ge=-1, le=32)
     num_leaves: int = Field(default=7, ge=2, le=256)
     min_child_samples: int = Field(default=20, ge=5, le=200)
+    seed_ensemble: int = Field(default=3, ge=1, le=10)
     subsample: float = Field(default=0.9, ge=0.1, le=1.0)
     colsample_bytree: float = Field(default=0.9, ge=0.1, le=1.0)
+    bt_window: int = Field(default=60, ge=20, le=240)
+    bt_enter_q: float = Field(default=0.8, ge=0.5, le=0.95)
+    bt_exit_q: float = Field(default=0.2, ge=0.05, le=0.5)
     thresholds: dict[str, float | int] = Field(default_factory=dict)
     stop_on_excellent: bool = True
 

@@ -87,6 +87,7 @@ const cfg = ref({
   maxDepth: 3,
   numLeaves: 7,
   minChildSamples: 20,
+  seedEnsemble: 3,
   subsample: 0.9,
   colsample: 0.9,
 })
@@ -217,6 +218,7 @@ async function run() {
     max_depth: cfg.value.maxDepth,
     num_leaves: cfg.value.numLeaves,
     min_child_samples: cfg.value.minChildSamples,
+    seed_ensemble: cfg.value.seedEnsemble,
     subsample: cfg.value.subsample,
     colsample_bytree: cfg.value.colsample,
   }
@@ -306,6 +308,7 @@ function reviewConfig(): Record<string, unknown> {
     max_depth: cfg.value.maxDepth,
     num_leaves: cfg.value.numLeaves,
     min_child_samples: cfg.value.minChildSamples,
+    seed_ensemble: cfg.value.seedEnsemble,
     subsample: cfg.value.subsample,
     colsample_bytree: cfg.value.colsample,
   }
@@ -673,6 +676,10 @@ onMounted(async () => {
               <div class="field">
                 <label class="label" for="t-mcs">最小叶子样本 <Tip text="min_child_samples：单个叶子最少样本数，小样本/弱信号下调大（如 30~50）可显著降过拟合" /></label>
                 <input id="t-mcs" v-model.number="cfg.minChildSamples" type="number" min="5" max="200" step="5" class="input font-mono" />
+              </div>
+              <div class="field">
+                <label class="label" for="t-seed">集成种子数 <Tip text="LightGBM 多随机种子平均预测，降低单模型方差；1 表示关闭（仅对 LightGBM 生效）" /></label>
+                <input id="t-seed" v-model.number="cfg.seedEnsemble" type="number" min="1" max="10" step="1" class="input font-mono" />
               </div>
               <div class="field">
                 <label class="label" for="t-ss">行采样 <Tip text="subsample：每轮训练随机用多少比例样本，防过拟合" /></label>

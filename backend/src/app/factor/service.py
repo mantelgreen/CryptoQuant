@@ -515,6 +515,7 @@ async def train_factor_model(
     max_depth: int = 3,
     num_leaves: int = 7,
     min_child_samples: int = 20,
+    seed_ensemble: int = 3,
     subsample: float = 0.9,
     colsample_bytree: float = 0.9,
 ) -> dict[str, Any]:
@@ -575,6 +576,7 @@ async def train_factor_model_full(
     max_depth: int = 3,
     num_leaves: int = 7,
     min_child_samples: int = 20,
+    seed_ensemble: int = 3,
     subsample: float = 0.9,
     colsample_bytree: float = 0.9,
 ) -> dict[str, Any]:
@@ -607,6 +609,7 @@ async def train_factor_model_full(
         max_depth=max_depth,
         num_leaves=num_leaves,
         min_child_samples=min_child_samples,
+        seed_ensemble=seed_ensemble,
         subsample=subsample,
         colsample_bytree=colsample_bytree,
         extras=extras,
@@ -729,6 +732,7 @@ async def persist_trained_model(
     max_depth: int = 3,
     num_leaves: int = 7,
     min_child_samples: int = 20,
+    seed_ensemble: int = 3,
     subsample: float = 0.9,
     colsample_bytree: float = 0.9,
 ) -> dict[str, Any]:
@@ -757,6 +761,7 @@ async def persist_trained_model(
         max_depth=max_depth,
         num_leaves=num_leaves,
         min_child_samples=min_child_samples,
+        seed_ensemble=seed_ensemble,
         subsample=subsample,
         colsample_bytree=colsample_bytree,
     )

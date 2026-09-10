@@ -90,6 +90,7 @@ class MlTrainReq(BaseModel):
     max_depth: int = Field(default=3, ge=-1, le=32)
     num_leaves: int = Field(default=7, ge=2, le=256)
     min_child_samples: int = Field(default=20, ge=5, le=200)
+    seed_ensemble: int = Field(default=3, ge=1, le=10)
     subsample: float = Field(default=0.9, ge=0.1, le=1.0)
     colsample_bytree: float = Field(default=0.9, ge=0.1, le=1.0)
 
@@ -256,6 +257,7 @@ async def ml_train(
         max_depth=req.max_depth,
         num_leaves=req.num_leaves,
         min_child_samples=req.min_child_samples,
+        seed_ensemble=req.seed_ensemble,
         subsample=req.subsample,
         colsample_bytree=req.colsample_bytree,
     )
@@ -295,6 +297,7 @@ async def ml_save_model(
             max_depth=req.max_depth,
             num_leaves=req.num_leaves,
             min_child_samples=req.min_child_samples,
+            seed_ensemble=req.seed_ensemble,
             subsample=req.subsample,
             colsample_bytree=req.colsample_bytree,
         )

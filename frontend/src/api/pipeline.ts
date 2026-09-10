@@ -46,8 +46,12 @@ export interface PipelineStartPayload {
   max_depth?: number
   num_leaves?: number
   min_child_samples?: number
+  seed_ensemble?: number
   subsample?: number
   colsample_bytree?: number
+  bt_window?: number
+  bt_enter_q?: number
+  bt_exit_q?: number
   thresholds?: PipelineThresholds
   stop_on_excellent?: boolean
   save_quality_factors?: boolean

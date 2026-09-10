@@ -216,6 +216,7 @@ export async function trainMl(payload: {
   max_depth?: number
   num_leaves?: number
   min_child_samples?: number
+  seed_ensemble?: number
   subsample?: number
   colsample_bytree?: number
 }): Promise<MlTrainResult> {
@@ -328,6 +329,7 @@ export interface MlTrainArgs {
   max_depth?: number
   num_leaves?: number
   min_child_samples?: number
+  seed_ensemble?: number
   subsample?: number
   colsample_bytree?: number
 }

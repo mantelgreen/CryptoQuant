@@ -100,6 +100,10 @@ const form = reactive({
   horizon: 1,
   testRatio: 0.25,
   alpha: 1,
+  seedEnsemble: 3,
+  btWindow: 60,
+  btEnterQ: 0.8,
+  btExitQ: 0.2,
   stopOnExcellent: true,
   saveQuality: true,
 })
@@ -220,6 +224,10 @@ async function start() {
       horizon,
       test_ratio: form.testRatio,
       alpha: form.alpha,
+      seed_ensemble: clampInt(form.seedEnsemble, 1, 10, 3),
+      bt_window: clampInt(form.btWindow, 20, 240, 60),
+      bt_enter_q: form.btEnterQ,
+      bt_exit_q: form.btExitQ,
       stop_on_excellent: form.stopOnExcellent,
       save_quality_factors: form.saveQuality,
     }
@@ -698,6 +706,28 @@ onBeforeUnmount(() => {
             <div class="field">
               <label class="label" for="pipeline-horizon">预测窗口 h</label>
               <input id="pipeline-horizon" v-model.number="form.horizon" type="number" min="1" max="10" class="input font-mono" />
+            </div>
+          </div>
+
+          <div class="grid grid-cols-2 gap-2.5">
+            <div class="field">
+              <label class="label" for="pipeline-seed">集成种子数</label>
+              <input id="pipeline-seed" v-model.number="form.seedEnsemble" type="number" min="1" max="10" class="input font-mono" />
+            </div>
+            <div class="field">
+              <label class="label" for="pipeline-btw">回测分位窗口</label>
+              <input id="pipeline-btw" v-model.number="form.btWindow" type="number" min="20" max="240" class="input font-mono" />
+            </div>
+          </div>
+
+          <div class="grid grid-cols-2 gap-2.5">
+            <div class="field">
+              <label class="label" for="pipeline-bte">入场分位</label>
+              <input id="pipeline-bte" v-model.number="form.btEnterQ" type="number" min="0.5" max="0.95" step="0.05" class="input font-mono" />
+            </div>
+            <div class="field">
+              <label class="label" for="pipeline-btx">离场分位</label>
+              <input id="pipeline-btx" v-model.number="form.btExitQ" type="number" min="0.05" max="0.5" step="0.05" class="input font-mono" />
             </div>
           </div>
 
