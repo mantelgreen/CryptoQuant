@@ -160,6 +160,8 @@ export interface MlLearning {
   rounds: number[]
   train: number[]
   oos: number[]
+  best_iteration?: number
+  best_oos?: number
 }
 
 export interface MlTrainResult {

@@ -120,6 +120,7 @@ export interface PipelineRound {
     pred_nunique?: number
     pred_std?: number
     degenerate?: boolean
+    best_iteration?: number
     n_features_kept?: number
     val_ic?: number | null
     val_rank_ic?: number | null

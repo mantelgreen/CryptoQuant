@@ -282,6 +282,7 @@ function learningOption(): EChartsOption {
   const m = Math.min(rounds.length, train.length, oos.length)
   const primary = cssVar('--color-primary')
   const ai = cssVar('--color-ai')
+  const best = l?.best_iteration && l.best_iteration > 0 ? l.best_iteration : null
   return {
     animationDuration: 400,
     grid: { left: 12, right: 16, top: 26, bottom: 4, containLabel: true },
@@ -339,6 +340,22 @@ function learningOption(): EChartsOption {
         showSymbol: false,
         lineStyle: { width: 1.6, color: ai },
         itemStyle: { color: ai },
+        ...(best
+          ? {
+              markLine: {
+                silent: true,
+                symbol: 'none',
+                lineStyle: { color: ai, type: 'dashed' as const, width: 1 },
+                label: {
+                  formatter: `best #${best}`,
+                  color: ai,
+                  fontSize: 9,
+                  position: 'insideEndTop' as const,
+                },
+                data: [{ xAxis: best }],
+              },
+            }
+          : {}),
       },
     ],
   }
@@ -434,10 +451,11 @@ onBeforeUnmount(() => {
       <div class="mb-2 flex items-baseline justify-between gap-2">
         <p class="text-[11px] font-semibold uppercase tracking-wider text-subtle">LightGBM 训练曲线</p>
         <p class="num text-[10px] text-muted">
+          <template v-if="learning.best_iteration">早停 @ #{{ learning.best_iteration }}（OOS {{ learning.best_oos != null ? learning.best_oos.toExponential(2) : '—' }}）· </template>
           OOS 末段 {{ learning.oos?.[learning.oos.length - 1] != null ? learning.oos[learning.oos.length - 1].toExponential(2) : '—' }}
         </p>
       </div>
-      <p class="mb-1 text-[10px] leading-snug text-subtle">每 boosting 轮的 MSE。OOS 曲线先降后升（或与 train 拉开差距）的位置即过拟合拐点。</p>
+      <p class="mb-1 text-[10px] leading-snug text-subtle">每 boosting 轮的 MSE。虚线即早停选中的最优轮（此后 OOS 开始变差）；train 与 OOS 拉开的距离就是过拟合程度。</p>
       <div ref="learnEl" class="h-52 w-full" />
     </section>
   </div>

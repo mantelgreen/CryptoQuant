@@ -558,9 +558,10 @@ async def run_ml_research(
         num_leaves_v = min(num_leaves_v, 2 ** max_depth_v)
 
     learning: dict[str, Any] | None = None
+    best_iteration: int | None = None
     if model_name == "gbdt":
         try:
-            from lightgbm import LGBMRegressor, record_evaluation
+            from lightgbm import LGBMRegressor, early_stopping, record_evaluation
         except ImportError as exc:  # pragma: no cover
             return {"found": False, "message": "未安装 lightgbm（pip install lightgbm）"}
         lgb_params: dict[str, Any] = {
@@ -568,18 +569,24 @@ async def run_ml_research(
             "learning_rate": float(learning_rate),
             "max_depth": max_depth_v,
             "num_leaves": num_leaves_v,
-            # 收益量级 ~1e-3，lambda_l2 需按此缩放到温和区间（alpha=1 → 1e-3），否则会把叶子值压向 0
-            "lambda_l2": max(0.0, float(alpha)) * 1e-3,
+            # L2 正则用 sklearn 参数 reg_lambda（原 lambda_l2 是原生别名，且 alpha*1e-3 实际≈关闭）。
+            # 叶子 hessian 之和 ≥ min_child_samples(默认20)，alpha=1 时收缩约 5%，温和有效。
+            "reg_lambda": max(0.0, float(alpha)),
             "subsample": min(1.0, max(0.1, float(subsample))),
+            # LightGBM 需 bagging_freq>0 才启用行采样，否则 subsample 是空操作
+            "subsample_freq": 1,
             "colsample_bytree": min(1.0, max(0.1, float(colsample_bytree))),
             "random_state": 7,
         }
         booster = None
-        # 学习曲线用验证集（无验证集时退回测试集），仅用于诊断，不参与早停
+        # 学习曲线用验证集（无验证集时退回测试集，仅展示）；早停只在有独立验证集时启用，避免用测试集早停泄漏。
         eval_X = (Xtr_z, Xval_z) if has_val else (Xtr_z, Xte_z)
         eval_y = (ytr, yval) if has_val else (ytr, yte)
-        try:  # 记录每轮 train/oos 损失做学习曲线（仅用于展示，不参与早停）
+        try:
             evals: dict[str, Any] = {}
+            callbacks: list[Any] = [record_evaluation(evals)]
+            if has_val:
+                callbacks.append(early_stopping(30, verbose=False))
             booster = LGBMRegressor(**lgb_params).fit(
                 Xtr_z,
                 ytr,
@@ -587,8 +594,10 @@ async def run_ml_research(
                 eval_y=eval_y,
                 eval_names=["train", "oos"],
                 eval_metric="l2",
-                callbacks=[record_evaluation(evals)],
+                callbacks=callbacks,
             )
+            # 早停后 sklearn predict / booster.predict 会自动采用 best_iteration，artifact 口径一致
+            best_iteration = int(getattr(booster, "best_iteration_", 0) or 0) or None
             train_loss = next(iter((evals.get("train") or {}).values()), None)
             oos_loss = next(iter((evals.get("oos") or {}).values()), None)
             if train_loss and oos_loss and len(train_loss) == len(oos_loss):
@@ -597,6 +606,9 @@ async def run_ml_research(
                     "train": [round(float(v), 8) for v in train_loss],
                     "oos": [round(float(v), 8) for v in oos_loss],
                 }
+                if best_iteration:
+                    learning["best_iteration"] = best_iteration
+                    learning["best_oos"] = round(float(oos_loss[best_iteration - 1]), 8)
         except Exception:  # noqa: BLE001 - 记录失败不影响训练本身
             booster = None
         if booster is None:
@@ -681,9 +693,11 @@ async def run_ml_research(
             "n_estimators": n_estimators,
             "max_depth": max_depth_v,
             "num_leaves": num_leaves_v,
-            "lambda_l2": max(0.0, float(alpha)) * 1e-3,
+            "reg_lambda": max(0.0, float(alpha)),
             "subsample": subsample,
+            "subsample_freq": 1,
             "colsample_bytree": colsample_bytree,
+            "best_iteration": best_iteration,
         },
         "features": [
             {
@@ -737,6 +751,7 @@ async def run_ml_research(
         "pred_std": _r(test["pred_std"], 8),
         "degenerate": test["degenerate"],
         "flip": pred_flip,
+        "best_iteration": best_iteration,
         "features": univariate,
         "oos_charts": oos_charts,
     }

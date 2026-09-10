@@ -75,7 +75,7 @@ const cfg = ref({
   model: 'ridge',
   alpha: 1,
   maxCorr: 0.85,
-  winsor: null as number | null,
+  winsor: 0.01 as number | null,
   costBps: 0,
   fineInterval: null as string | null,
   aggFeatures: ['rv', 'vol_imb', 'taker_ratio'],

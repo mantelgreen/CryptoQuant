@@ -155,6 +155,9 @@ def _normalize_config(cfg: dict[str, Any]) -> dict[str, Any]:
     # 验证集比例：调参/因子精筛只在验证集上做，测试集仅最终报告一次（默认 0.15）
     vr = cfg.get("val_ratio")
     out["val_ratio"] = max(0.0, min(0.4, float(0.15 if vr is None else vr)))
+    # 稳健化 Winsorize：默认 1%（加密厚尾收益），抑制离群值对 L2/相关性过滤的扰动；显式传 0 可关闭
+    wv = cfg.get("winsor")
+    out["winsor"] = float(wv) if wv is not None else 0.01
     out["model"] = cfg.get("model") or "ridge"
     out["thresholds"] = th
     out["stop_on_excellent"] = bool(cfg.get("stop_on_excellent", True))
@@ -892,6 +895,7 @@ def _trim_train(
             "pred_std",
             "degenerate",
             "flip",
+            "best_iteration",
             "features",
             "feature_filter",
             "oos_charts",
