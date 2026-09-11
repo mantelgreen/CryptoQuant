@@ -55,3 +55,21 @@ def test_select_score_falls_back_to_oos():
 
 def test_select_score_none_when_missing():
     assert _select_score({}) is None
+
+
+def test_run_mode_defaults_to_rounds():
+    cfg = _normalize_config(_base_cfg())
+    assert cfg["run_mode"] == "rounds"
+    assert cfg["interval_min"] == 60
+
+
+def test_run_mode_schedule_and_interval():
+    cfg = _normalize_config(_base_cfg(run_mode="schedule", interval_min=15))
+    assert cfg["run_mode"] == "schedule"
+    assert cfg["interval_min"] == 15
+
+
+def test_run_mode_invalid_falls_back():
+    cfg = _normalize_config(_base_cfg(run_mode="weird", interval_min=99999))
+    assert cfg["run_mode"] == "rounds"
+    assert cfg["interval_min"] == 1440

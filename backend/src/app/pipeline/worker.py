@@ -1,6 +1,7 @@
 """AI 流水线 ARQ 任务：一轮一个 job，跑完自行入队下一轮（规避 ARQ 30 分钟 job_timeout）。"""
 from __future__ import annotations
 
+from datetime import timedelta
 from uuid import UUID
 
 from ..core.config import get_settings
@@ -47,7 +48,9 @@ async def run_pipeline_round_task(ctx, run_id: str, round_no: int):  # noqa: ARG
             return
 
         max_rounds = int((run["config"] or {}).get("max_rounds") or 1)
-        if round_no >= max_rounds:
+        run_mode = str((run["config"] or {}).get("run_mode") or "rounds").lower()
+        # 固定轮次模式：跑满 max_rounds 即结束；定时任务模式无轮次上限（靠停止/优秀终止）
+        if run_mode != "schedule" and round_no >= max_rounds:
             await rrun.update_status(run["id"], status="finished", current_round=round_no)
             await publish_progress(run_id, status="finished", round_no=round_no)
             return
@@ -59,11 +62,16 @@ async def run_pipeline_round_task(ctx, run_id: str, round_no: int):  # noqa: ARG
 
         redis = await create_pool(RedisSettings.from_dsn(settings.REDIS_URL))
         try:
+            defer: dict[str, object] = {}
+            if run_mode == "schedule":
+                interval_min = int((run["config"] or {}).get("interval_min") or 60)
+                defer["_defer_by"] = timedelta(minutes=max(1, interval_min))
             await redis.enqueue_job(
                 "run_pipeline_round_task",
                 run_id,
                 round_no + 1,
                 _queue_name=settings.JOB_QUEUE_DATA,
+                **defer,
             )
         finally:
             await redis.aclose()

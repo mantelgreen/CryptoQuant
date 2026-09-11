@@ -95,7 +95,6 @@ const form = reactive({
   backtestEnd: localDate(new Date()),
   factorCount: 4,
   maxPick: 6,
-  maxRounds: 5,
   model: 'ridge',
   horizon: 1,
   testRatio: 0.25,
@@ -175,7 +174,13 @@ function onDocClick(e: MouseEvent) {
   if (symRef.value && !symRef.value.contains(e.target as Node)) symOpen.value = false
 }
 
-async function start() {
+// —— 启动弹窗：固定轮次 / 定时任务 ——
+const startOpen = ref(false)
+const startMode = ref<'rounds' | 'schedule'>('rounds')
+const startRounds = ref(5)
+const startInterval = ref(60)
+
+function openStart() {
   if (starting.value || running.value) return
   const syms = (Array.isArray(form.researchSymbols) ? form.researchSymbols : [])
     .map((s) => String(s).trim().toUpperCase())
@@ -184,10 +189,6 @@ async function start() {
     toast.error('请选择研究标的', '至少选择一个交易对，如 BTCUSDT')
     return
   }
-  const factorCount = clampInt(form.factorCount, 1, 5, 4)
-  const maxPick = clampInt(form.maxPick, 2, 12, 6)
-  const maxRounds = clampInt(form.maxRounds, 1, 20, 5)
-  const horizon = clampInt(form.horizon, 1, 10, 1)
   if (!form.researchStart || !form.researchEnd || !form.backtestStart || !form.backtestEnd) {
     toast.error('时间窗口不完整', '研究/回测的起止日期都需要填写')
     return
@@ -204,6 +205,19 @@ async function start() {
     toast.error('回测窗口未晚于研究窗口', '强制样本外：回测起点须不早于研究结束（避免未来函数）')
     return
   }
+  startOpen.value = true
+}
+
+async function confirmStart() {
+  if (starting.value || running.value) return
+  const syms = (Array.isArray(form.researchSymbols) ? form.researchSymbols : [])
+    .map((s) => String(s).trim().toUpperCase())
+    .filter(Boolean)
+  const factorCount = clampInt(form.factorCount, 1, 5, 4)
+  const maxPick = clampInt(form.maxPick, 2, 12, 6)
+  const horizon = clampInt(form.horizon, 1, 10, 1)
+  const maxRounds = clampInt(startRounds.value, 1, 200, 5)
+  const intervalMin = clampInt(startInterval.value, 1, 1440, 60)
   starting.value = true
   try {
     const payload = {
@@ -219,7 +233,9 @@ async function start() {
       backtest_end: isoOf(form.backtestEnd, true),
       factor_count_per_round: factorCount,
       max_pick: maxPick,
+      run_mode: startMode.value,
       max_rounds: maxRounds,
+      interval_min: intervalMin,
       model: form.model as 'ridge' | 'gbdt',
       horizon,
       test_ratio: form.testRatio,
@@ -232,6 +248,7 @@ async function start() {
       save_quality_factors: form.saveQuality,
     }
     const { run_id } = await startPipeline(payload)
+    startOpen.value = false
     toast.success('流水线已启动', `run ${run_id.slice(0, 8)} · 后台自动执行，右侧可看进度`)
     selectedTab.value = 'active'
     await loadDetail(run_id)
@@ -333,7 +350,12 @@ function connectSse() {
       }
       if (!msg.run_id || msg.run_id !== id) return
       if (msg.status && activeRun.value && activeRun.value.id === id) {
-        activeRun.value.status = msg.status as PipelineRun['status']
+        const terminal = ['succeeded', 'finished', 'failed', 'stopped']
+        const cur = activeRun.value.status
+        // 已到终态（如用户点了停止）后，忽略迟到的 running 进度事件，避免状态被改回运行中
+        if (!(terminal.includes(cur) && !terminal.includes(msg.status))) {
+          activeRun.value.status = msg.status as PipelineRun['status']
+        }
       }
       if (typeof msg.round_no === 'number') liveRound.value = msg.round_no
       if (msg.phase) livePhase.value = msg.phase
@@ -610,6 +632,14 @@ function dataVol(r: PipelineRound): string {
   return parts.join(' · ')
 }
 
+/** 轮次显示：固定轮次模式显示 x/y，定时任务模式显示「轮次 x · 每 N 分钟」。 */
+function roundLabel(run: PipelineRun | null): string {
+  if (!run) return ''
+  const c = run.config ?? {}
+  if (c.run_mode === 'schedule') return `轮次 ${run.current_round} · 每 ${c.interval_min ?? 60} 分钟`
+  return `轮次 ${run.current_round}/${c.max_rounds ?? '—'}`
+}
+
 onMounted(async () => {
   document.addEventListener('mousedown', onDocClick)
   await loadHistory()
@@ -746,7 +776,7 @@ onBeforeUnmount(() => {
             </div>
           </div>
 
-          <div class="grid grid-cols-3 gap-2.5">
+          <div class="grid grid-cols-2 gap-2.5">
             <div class="field">
               <label class="label" for="pipeline-factor-count">每轮因子数</label>
               <input id="pipeline-factor-count" v-model.number="form.factorCount" type="number" min="1" max="5" class="input font-mono" />
@@ -754,10 +784,6 @@ onBeforeUnmount(() => {
             <div class="field">
               <label class="label" for="pipeline-max-pick">进模型因子上限</label>
               <input id="pipeline-max-pick" v-model.number="form.maxPick" type="number" min="2" max="12" class="input font-mono" />
-            </div>
-            <div class="field">
-              <label class="label" for="pipeline-max-rounds">流水线轮次</label>
-              <input id="pipeline-max-rounds" v-model.number="form.maxRounds" type="number" min="1" max="20" class="input font-mono" />
             </div>
           </div>
 
@@ -807,7 +833,7 @@ onBeforeUnmount(() => {
           </label>
         </div>
 
-        <button id="pipeline-start" class="btn btn-primary mt-5 w-full" :disabled="starting || running" @click="start">
+        <button id="pipeline-start" class="btn btn-primary mt-5 w-full" :disabled="starting || running" @click="openStart">
           <LoaderCircle v-if="starting" :size="15" class="animate-spin" />
           <Play v-else :size="15" />
           {{ starting ? '启动中…' : running ? '流水线运行中' : '启动 AI 流水线' }}
@@ -857,7 +883,7 @@ onBeforeUnmount(() => {
                   <span class="badge" :class="statusMeta(activeRun.status).tone">{{ statusMeta(activeRun.status).label }}</span>
                 </div>
                 <p class="mt-1 text-xs text-subtle">
-                  轮次 {{ activeRun.current_round }}/{{ activeRun.config.max_rounds }}
+                  {{ roundLabel(activeRun) }}
                   <template v-if="running && livePhase"> · 当前阶段 {{ STAGES.find((s) => s.key === livePhase)?.label }}</template>
                   <template v-if="activeRun.error"> · <span class="text-down">{{ activeRun.error }}</span></template>
                 </p>
@@ -1066,7 +1092,7 @@ onBeforeUnmount(() => {
                     <span class="badge" :class="statusMeta(r.status).tone">{{ statusMeta(r.status).label }}</span>
                   </span>
                   <span class="mt-0.5 block text-xs text-subtle">
-                    轮次 {{ r.current_round }}/{{ r.config.max_rounds }}
+                    {{ roundLabel(r) }}
                     <template v-if="r.best_metrics"> · 最佳夏普 {{ num(r.best_metrics.sharpe, 2) }}</template>
                     · {{ fmtStamp(r.created_at) }}
                   </span>
@@ -1086,6 +1112,57 @@ onBeforeUnmount(() => {
         </div>
       </section>
     </div>
+
+    <!-- 启动流水线弹窗：固定轮次 / 定时任务 -->
+    <Modal
+      :open="startOpen"
+      title="启动 AI 流水线"
+      sub="选择运行方式：固定轮次跑完即止，或定时任务按间隔持续运行"
+      width="480px"
+      @close="startOpen = false"
+    >
+      <div class="space-y-3">
+        <div class="grid grid-cols-2 gap-2">
+          <button
+            class="rounded-lg border px-3 py-2.5 text-left transition-colors"
+            :class="startMode === 'rounds' ? 'border-primary tint-faint' : 'border-border'"
+            @click="startMode = 'rounds'"
+          >
+            <span class="block text-sm font-semibold text-fg">固定轮次</span>
+            <span class="mt-0.5 block text-[11px] text-subtle">跑满设定轮次后自动结束</span>
+          </button>
+          <button
+            class="rounded-lg border px-3 py-2.5 text-left transition-colors"
+            :class="startMode === 'schedule' ? 'border-primary tint-faint' : 'border-border'"
+            @click="startMode = 'schedule'"
+          >
+            <span class="block text-sm font-semibold text-fg">定时任务</span>
+            <span class="mt-0.5 block text-[11px] text-subtle">按间隔持续运行，直到手动停止</span>
+          </button>
+        </div>
+
+        <div v-if="startMode === 'rounds'" class="field">
+          <label class="label" for="start-rounds">轮次</label>
+          <input id="start-rounds" v-model.number="startRounds" type="number" min="1" max="200" class="input font-mono" />
+          <p class="mt-1 text-[11px] text-subtle">流水线最多执行多少轮自进化（1~200）。</p>
+        </div>
+        <div v-else class="field">
+          <label class="label" for="start-interval">间隔时间（分钟）</label>
+          <input id="start-interval" v-model.number="startInterval" type="number" min="1" max="1440" class="input font-mono" />
+          <p class="mt-1 text-[11px] text-subtle">每轮结束后等待该间隔再跑下一轮；可随时停止。</p>
+        </div>
+      </div>
+      <template #footer>
+        <div class="flex items-center justify-end gap-2">
+          <button class="btn btn-ghost" :disabled="starting" @click="startOpen = false">取消</button>
+          <button class="btn btn-primary" :disabled="starting" @click="confirmStart">
+            <LoaderCircle v-if="starting" :size="14" class="animate-spin" />
+            <Play v-else :size="14" />
+            {{ starting ? '启动中…' : '开始执行任务' }}
+          </button>
+        </div>
+      </template>
+    </Modal>
 
     <!-- 删除流水线确认弹窗 -->
     <Modal

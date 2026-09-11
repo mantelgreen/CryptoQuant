@@ -72,9 +72,14 @@ class PipelineRunRepository:
             values["started_at"] = datetime.utcnow()
         if status in ("succeeded", "finished", "failed", "stopped"):
             values["finished_at"] = datetime.utcnow()
-        await self.db.execute(
-            self._t.update().where(self._t.c.id == rid).values(**values)
-        )
+        stmt = self._t.update().where(self._t.c.id == rid)
+        if status == "running":
+            # 运行中的轮次会多次写 running；若期间用户点了停止（已置终态），
+            # 不能被这些 running 更新覆盖回 running，否则停止失效、无法重新启动。
+            stmt = stmt.where(
+                self._t.c.status.notin_(("stopped", "failed", "succeeded", "finished"))
+            )
+        await self.db.execute(stmt.values(**values))
         await self.db.commit()
 
     async def set_best(

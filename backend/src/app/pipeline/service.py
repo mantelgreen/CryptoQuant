@@ -129,7 +129,7 @@ def _validate_config(cfg: dict[str, Any]) -> None:
             "backtest_window_must_follow_research_window（强制样本外：回测起点须晚于训练结束）"
         )
     mr = int(cfg.get("max_rounds") or 1)
-    if mr < 1 or mr > 20:
+    if mr < 1 or mr > 200:
         raise BadRequest("max_rounds_out_of_range")
 
 
@@ -160,6 +160,11 @@ def _normalize_config(cfg: dict[str, Any]) -> dict[str, Any]:
     )
     out["max_pick"] = max(2, min(12, int(cfg.get("max_pick") or 6)))
     out["max_rounds"] = int(cfg.get("max_rounds") or 5)
+    # 运行模式：rounds=固定轮次；schedule=定时任务（每 interval_min 分钟一轮，直到停止/优秀）
+    rm = (cfg.get("run_mode") or "rounds").strip().lower()
+    out["run_mode"] = rm if rm in ("rounds", "schedule") else "rounds"
+    im = cfg.get("interval_min")
+    out["interval_min"] = max(1, min(1440, int(60 if im is None else im)))
     # 验证集比例：调参/因子精筛只在验证集上做；测试集默认不切（0），真正的样本外评价用回测窗
     vr = cfg.get("val_ratio")
     out["val_ratio"] = max(0.0, min(0.4, float(0.15 if vr is None else vr)))
@@ -278,6 +283,9 @@ async def run_round(
     cfg = run["config"]
     th = cfg.get("thresholds") or DEFAULT_THRESHOLDS
     max_rounds = int(cfg.get("max_rounds") or 1)
+    # 定时任务模式没有固定轮次上限：给进度条一个动态分母，避免过早打满 100%
+    if (cfg.get("run_mode") or "rounds") == "schedule":
+        max_rounds = max(max_rounds, round_no + 10)
     run_id = run["id"]
     rid_str = str(run_id)
     rrun = PipelineRunRepository(db)

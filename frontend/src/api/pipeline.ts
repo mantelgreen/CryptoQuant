@@ -28,7 +28,9 @@ export interface PipelineStartPayload {
   backtest_end: string
   factor_count_per_round?: number
   max_pick?: number
+  run_mode?: 'rounds' | 'schedule'
   max_rounds?: number
+  interval_min?: number
   model?: 'ridge' | 'gbdt'
   gbdt_objective?: 'regression' | 'regression_l1' | 'huber'
   horizon?: number

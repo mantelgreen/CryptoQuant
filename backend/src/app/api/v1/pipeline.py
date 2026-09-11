@@ -45,7 +45,9 @@ class PipelineStartReq(BaseModel):
     backtest_end: datetime
     factor_count_per_round: int = Field(default=4, ge=1, le=5)
     max_pick: int = Field(default=6, ge=2, le=12)
-    max_rounds: int = Field(default=5, ge=1, le=20)
+    run_mode: str = Field(default="rounds", pattern=r"^(rounds|schedule)$")
+    max_rounds: int = Field(default=5, ge=1, le=200)
+    interval_min: int = Field(default=60, ge=1, le=1440)
     model: str = Field(default="ridge", pattern=r"^(ridge|gbdt)$")
     gbdt_objective: str = Field(default="huber", pattern=r"^(regression|regression_l1|huber)$")
     horizon: int = Field(default=1, ge=1, le=10)
