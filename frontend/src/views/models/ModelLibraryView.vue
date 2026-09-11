@@ -214,11 +214,11 @@ const paperLoading = ref(false)
 const paperDetail = ref<{ id: string; detail?: SimDetail; busy: boolean } | null>(null)
 const paperDetailId = ref<string | null>(null)
 
-const newPaper = ref({ symbol: 'BTCUSDT', interval: '1d', enter: 0.02, exit: -0.02 })
+const newPaper = ref({ symbol: 'BTCUSDT', interval: '1d', window: 60, enter_q: 0.8, exit_q: 0.2 })
 
 async function openPaper(m: MlModelRow) {
   paperModel.value = m
-  newPaper.value = { symbol: m.symbols?.[0] ?? 'BTCUSDT', interval: m.interval, enter: 0.02, exit: -0.02 }
+  newPaper.value = { symbol: m.symbols?.[0] ?? 'BTCUSDT', interval: m.interval, window: 60, enter_q: 0.8, exit_q: 0.2 }
   paperDetail.value = null
   paperDetailId.value = null
   paperOpen.value = true
@@ -274,8 +274,9 @@ async function submitPaper() {
       symbol: newPaper.value.symbol.trim().toUpperCase(),
       interval: newPaper.value.interval,
       model_id: m.id,
-      enter: newPaper.value.enter,
-      exit: newPaper.value.exit,
+      window: newPaper.value.window,
+      enter_q: newPaper.value.enter_q,
+      exit_q: newPaper.value.exit_q,
     })
     toast.success('模拟盘账户已创建', `${acct.name} · 到「模拟交易」或定时任务驱动自动决策`)
     await loadPaperAccounts()
@@ -590,18 +591,22 @@ onMounted(load)
               </select>
             </div>
             <div class="field">
-              <label class="label" for="pp-enter">入场分阈值</label>
-              <input id="pp-enter" v-model.number="newPaper.enter" type="number" step="0.01" class="input font-mono" />
+              <label class="label" for="pp-window">滚动窗口</label>
+              <input id="pp-window" v-model.number="newPaper.window" type="number" step="1" min="20" max="240" class="input font-mono" />
             </div>
             <div class="field">
-              <label class="label" for="pp-exit">离场分阈值</label>
-              <input id="pp-exit" v-model.number="newPaper.exit" type="number" step="0.01" class="input font-mono" />
+              <label class="label" for="pp-enter-q">入场分位</label>
+              <input id="pp-enter-q" v-model.number="newPaper.enter_q" type="number" step="0.05" min="0.5" max="0.95" class="input font-mono" />
+            </div>
+            <div class="field">
+              <label class="label" for="pp-exit-q">离场分位</label>
+              <input id="pp-exit-q" v-model.number="newPaper.exit_q" type="number" step="0.05" min="0.05" max="0.5" class="input font-mono" />
             </div>
           </div>
           <button class="btn btn-primary mt-3 w-full" :disabled="creatingPaper" @click="submitPaper">
             <LoaderCircle v-if="creatingPaper" :size="14" class="animate-spin" />{{ creatingPaper ? '创建中…' : '创建账户' }}
           </button>
-          <p class="mt-2 text-[11px] text-subtle">得分 &gt; 入场阈值做多、&lt; 离场阈值平仓；由「定时任务」周期性驱动（也可在模拟交易页手动触发一次）。</p>
+          <p class="mt-2 text-[11px] text-subtle">与回测同一套规则：score 高于滚动入场分位做多、低于离场分位平仓；由「定时任务」周期性驱动（也可在模拟交易页手动触发一次）。</p>
         </div>
 
         <!-- 已有账户绩效 -->

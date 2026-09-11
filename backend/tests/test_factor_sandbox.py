@@ -267,3 +267,58 @@ def test_validate_expression_constant_warning(df):
     assert ok is True
     assert errors == []
     assert any("恒定" in w for w in warnings)
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        # 全局统计（无窗口）会跨时间使用未来信息 → 必须拒绝
+        "close.mean()",
+        "close.std()",
+        "volume.sum()",
+        "close.min()",
+        "close.max()",
+        "(close - open).mean()",
+        "close.quantile(0.5)",
+        "close.rank()",
+    ],
+)
+def test_global_reduction_rejected(df, expr):
+    with pytest.raises(SandboxError):
+        safe_eval_expr(expr, df)
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        # 限定在滚动/指数窗口上的统计是允许的（因果）
+        "close.rolling(20).mean()",
+        "close.rolling(20).std()",
+        "volume.rolling(20).sum()",
+        "high.rolling(20).max()",
+        "low.rolling(20).min()",
+        "close.ewm(span=12).mean()",
+        "close.expanding(60).mean()",
+        "close.rolling(20).mean() / close - 1",
+    ],
+)
+def test_windowed_reduction_allowed(df, expr):
+    _ok(expr, df)
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        # 起点依赖的累计运算会导致训练/回测窗口口径不一致 → 拒绝
+        "close.cumsum()",
+        "close.cummax()",
+        "close.cummin()",
+        "close.cumprod()",
+        # 依赖累计起点的内置指标不再注入
+        "obv",
+        "vwap",
+    ],
+)
+def test_cumulative_rejected(df, expr):
+    with pytest.raises(SandboxError):
+        safe_eval_expr(expr, df)

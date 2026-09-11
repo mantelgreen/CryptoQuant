@@ -15,13 +15,27 @@ import numpy as np
 import pandas as pd
 
 COLUMNS = {"open", "high", "low", "close", "volume", "quote_volume"}
+# 注意：cumsum/cummax/cummin/cumprod 被移除——它们的值依赖序列起点，训练/回测/打分的
+# 窗口起点不同会导致同一时刻取值不同（train/serve skew），应改用 rolling(...) 形式。
 CALLABLE_ATTRS = {
     "shift", "diff", "rolling", "mean", "std", "pct_change", "abs", "clip",
-    "rank", "sum", "cumsum", "cummax", "cummin", "cumprod", "fillna", "skew",
-    "ewm", "min", "max", "ffill", "bfill", "var", "median",
+    "rank", "sum", "fillna", "skew",
+    "ewm", "expanding", "min", "max", "ffill", "bfill", "var", "median",
     "quantile", "round", "pow",
 }
 ALLOWED_KW = {"window", "min_periods", "periods", "span", "alpha", "center", "com", "q", "lower", "upper", "ddof"}
+# 统计量（会跨样本聚合）只能作用在滚动/指数窗口上，否则引入未来函数（look-ahead）。
+REDUCTION_ATTRS = {"mean", "std", "sum", "min", "max", "median", "var", "skew", "quantile", "rank"}
+_WINDOW_RECEIVERS = {"rolling", "ewm", "expanding"}
+
+
+def _is_windowed_receiver(node: ast.AST) -> bool:
+    """判断某个方法的调用对象是否是滚动/指数窗口链（rolling/ewm/expanding）。"""
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in _WINDOW_RECEIVERS
+    )
 
 
 def _asb(x: Any) -> Any:
@@ -253,7 +267,7 @@ def _expand_column_ma(expr: str, allowed: set[str]) -> str:
 def _indicator_series(df: pd.DataFrame) -> dict[str, pd.Series]:
     """常用技术指标序列（标准默认参数），注入沙箱 env 供表达式直接引用。
 
-    命名即变量：macd / rsi / atr / obv / boll_upper / sma_20 / ema_20 等，
+    命名即变量：macd / rsi / atr / boll_upper / sma_20 / ema_20 等，
     让模型无需手工用链式方法重算这些高频指标。
     """
     close = df["close"]
@@ -284,9 +298,6 @@ def _indicator_series(df: pd.DataFrame) -> dict[str, pd.Series]:
     tr = pd.concat([high - low, (high - prev).abs(), (low - prev).abs()], axis=1).max(axis=1)
     out["atr"] = tr.rolling(14).mean()
 
-    # OBV
-    out["obv"] = (np.sign(close.diff()).fillna(0) * volume).cumsum()
-
     # 布林带 (20, 2)
     mid = close.rolling(20).mean()
     std = close.rolling(20).std()
@@ -294,9 +305,8 @@ def _indicator_series(df: pd.DataFrame) -> dict[str, pd.Series]:
     out["boll_upper"] = mid + 2 * std
     out["boll_lower"] = mid - 2 * std
 
-    # VWAP（窗口内累计）
+    # 典型价（供 CCI 使用）
     typical = (high + low + close) / 3
-    out["vwap"] = (typical * volume).cumsum() / volume.cumsum().replace(0, np.nan)
 
     # KDJ / 随机指标 (14, 3, 3)
     ll = low.rolling(14).min()
@@ -329,7 +339,7 @@ def _indicator_series(df: pd.DataFrame) -> dict[str, pd.Series]:
 INDICATOR_NAMES: frozenset[str] = frozenset(
     {
         "macd", "macd_signal", "macd_hist",
-        "rsi", "atr", "obv", "vwap",
+        "rsi", "atr",
         "boll_mid", "boll_upper", "boll_lower",
         "stoch_k", "stoch_d", "stoch_j",
         "wr", "roc", "cci",
@@ -478,6 +488,13 @@ class _Checker(ast.NodeVisitor):
                 raise SandboxError(
                     f"方法 {func.attr if isinstance(func, ast.Attribute) else '?'} 不在白名单，"
                     "支持：shift/rolling/mean/std/abs/...（请用 K 线列+白名单方法的链式写法）"
+                )
+            # 全局统计（无窗口）会跨时间使用未来信息，必须限定在滚动/指数窗口上。
+            if func.attr in REDUCTION_ATTRS and not _is_windowed_receiver(func.value):
+                raise SandboxError(
+                    f"{func.attr}() 必须作用在滚动窗口上，例如 close.rolling(20).{func.attr}() "
+                    f"或 close.ewm(span=12).{func.attr}()；直接对整个序列做全局统计会引入"
+                    "未来函数（look-ahead），导致回测虚高。请改用滚动/指数窗口。"
                 )
             for a in node.args:
                 if not isinstance(a, ast.Constant) or not isinstance(a.value, (int, float)):

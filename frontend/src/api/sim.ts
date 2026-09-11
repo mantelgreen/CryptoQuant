@@ -108,6 +108,16 @@ export interface AutoTickResult {
   score?: number
   message?: string
   qty?: number
+  rule?: {
+    type: 'quantile' | 'absolute'
+    window?: number
+    enter_q?: number
+    exit_q?: number
+    q_hi?: number | null
+    q_lo?: number | null
+    enter?: number
+    exit?: number
+  }
   order?: { fill_price: number; fee: number; cash: number; equity: number }
 }
 export async function createAutoAccount(payload: {
@@ -115,8 +125,9 @@ export async function createAutoAccount(payload: {
   symbol: string
   interval: string
   model_id: string
-  enter?: number
-  exit?: number
+  window?: number
+  enter_q?: number
+  exit_q?: number
 }): Promise<SimAccount> {
   const { data } = await http.post<{ data: SimAccount }>('/sim/auto/accounts', payload)
   return data.data

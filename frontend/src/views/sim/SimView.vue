@@ -67,7 +67,7 @@ const autoOpen = ref(false)
 const autoModels = ref<MlModelRow[]>([])
 const autoLoading = ref(false)
 const autoBusy = ref(false)
-const autoForm = ref({ name: '', model_id: '', enter: 0.03, exit: -0.03 })
+const autoForm = ref({ name: '', model_id: '', window: 60, enter_q: 0.8, exit_q: 0.2 })
 
 async function openAuto() {
   autoOpen.value = true
@@ -97,8 +97,9 @@ async function submitAuto() {
       symbol: sym,
       interval: m.interval,
       model_id: m.id,
-      enter: autoForm.value.enter,
-      exit: autoForm.value.exit,
+      window: autoForm.value.window,
+      enter_q: autoForm.value.enter_q,
+      exit_q: autoForm.value.exit_q,
     })
     toast.success('策略自动账户已创建', `${acct.name}（${m.interval} · ${m.name}）`)
     autoOpen.value = false
@@ -117,8 +118,10 @@ async function tickSelected() {
   autoTickBusy.value = true
   try {
     const r = await tickAutoAccount(activeId.value)
-    if (r.action === 'hold' || r.action === 'skip') toast.info('自动决策', `${r.action} · score ${r.score ?? r.message ?? ''}`)
-    else toast.success(r.action === 'open' ? '自动开仓' : '自动平仓', `成交 @ ${r.order?.fill_price}`)
+    if (r.action === 'hold' || r.action === 'skip') {
+      const th = r.rule?.type === 'quantile' ? ` · 分位 ${r.rule.q_lo}~${r.rule.q_hi}` : ''
+      toast.info('自动决策', `${r.action} · score ${r.score ?? r.message ?? ''}${th}`)
+    } else toast.success(r.action === 'open' ? '自动开仓' : '自动平仓', `成交 @ ${r.order?.fill_price}`)
     await loadDetail()
     await loadAccounts()
   } catch (e: unknown) {
@@ -452,10 +455,13 @@ onMounted(loadAccounts)
         </div>
         <div class="mt-4 grid grid-cols-3 gap-3">
           <div class="field sm:col-span-1"><label class="label" for="an-name">账户名</label><input id="an-name" v-model="autoForm.name" class="input font-mono" maxlength="80" /></div>
-          <div class="field"><label class="label" for="an-enter">入场分（score&gt;）</label><input id="an-enter" v-model.number="autoForm.enter" type="number" step="0.01" class="input font-mono" /></div>
-          <div class="field"><label class="label" for="an-exit">离场分（score&lt;）</label><input id="an-exit" v-model.number="autoForm.exit" type="number" step="0.01" class="input font-mono" /></div>
+          <div class="field"><label class="label" for="an-window">滚动窗口</label><input id="an-window" v-model.number="autoForm.window" type="number" step="1" min="20" max="240" class="input font-mono" /></div>
+          <div class="field"><label class="label" for="an-enter-q">入场分位</label><input id="an-enter-q" v-model.number="autoForm.enter_q" type="number" step="0.05" min="0.5" max="0.95" class="input font-mono" /></div>
         </div>
-        <p class="mt-2 text-[11px] text-subtle">账户会以“执行一次自动决策”打分开/平仓（现价撮合、0.1% 手续费）。正式接入 beat 定时后可自动循环。</p>
+        <div class="mt-3 grid grid-cols-3 gap-3">
+          <div class="field"><label class="label" for="an-exit-q">离场分位</label><input id="an-exit-q" v-model.number="autoForm.exit_q" type="number" step="0.05" min="0.05" max="0.5" class="input font-mono" /></div>
+        </div>
+        <p class="mt-2 text-[11px] text-subtle">与回测同一套规则：score 高于滚动 enter_q 分位做多、低于 exit_q 分位平仓（现价撮合、0.1% 手续费）。</p>
       </template>
       <template #footer>
         <div class="flex justify-end gap-2">

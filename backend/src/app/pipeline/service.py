@@ -114,6 +114,8 @@ def _validate_config(cfg: dict[str, Any]) -> None:
     syms = [s.strip().upper() for s in (cfg.get("research_symbols") or []) if s.strip()]
     if not syms:
         raise BadRequest("research_symbols_required")
+    if not (cfg.get("research_interval") or "").strip():
+        raise BadRequest("research_interval_required")
     rs = _parse_dt(cfg["research_start"])
     re_ = _parse_dt(cfg["research_end"])
     bs = _parse_dt(cfg["backtest_start"])
@@ -141,9 +143,14 @@ def _normalize_config(cfg: dict[str, Any]) -> dict[str, Any]:
     out["backtest_symbol"] = (cfg.get("backtest_symbol") or "").strip().upper() or out[
         "research_symbols"
     ][0]
-    out["backtest_interval"] = cfg.get("backtest_interval") or cfg.get(
-        "research_interval"
-    )
+    # 回测必须与训练同粒度：模型特征（滚动窗口）绑定 interval，换粒度会让因子口径漂移。
+    # 因此忽略用户单独设置的回测粒度，强制跟随研究粒度（仅告警提示）。
+    ri = (cfg.get("research_interval") or "").strip()
+    out["research_interval"] = ri
+    bi = (cfg.get("backtest_interval") or "").strip()
+    if bi and bi != ri:
+        logger.warning("pipeline.backtest_interval_overridden", requested=bi, forced=ri)
+    out["backtest_interval"] = ri
     out["research_start"] = _parse_dt(cfg["research_start"]).isoformat()
     out["research_end"] = _parse_dt(cfg["research_end"]).isoformat()
     out["backtest_start"] = _parse_dt(cfg["backtest_start"]).isoformat()
@@ -166,6 +173,10 @@ def _normalize_config(cfg: dict[str, Any]) -> dict[str, Any]:
     fnn = (cfg.get("feature_norm") or "global").strip().lower()
     out["feature_norm"] = fnn if fnn in ("global", "expanding") else "global"
     out["model"] = cfg.get("model") or "ridge"
+    # 因子相关性去冗余阈值：默认 0.8（与单机训练一致），避免多重共线性因子直接进模型。
+    # 显式传 1.0 可关闭；LLM 诊断也可通过 _PARAM_KEYS 覆盖。
+    mc = cfg.get("max_corr")
+    out["max_corr"] = float(mc) if mc is not None else 0.8
     # gbdt 目标函数：默认 huber（对厚尾稳健），可选 regression(l2)/regression_l1
     go = (cfg.get("gbdt_objective") or "huber").strip().lower()
     out["gbdt_objective"] = go if go in ("regression", "regression_l1", "huber") else "huber"
@@ -346,7 +357,8 @@ async def run_round(
 
     best_score = None
     if run.get("best_metrics"):
-        best_score = (run["best_metrics"] or {}).get("sharpe")
+        # 用「验证集」指标选最优模型，避免在回测 holdout 上做 best-of-N 选择造成乐观偏差。
+        best_score = (run["best_metrics"] or {}).get("sel_score")
 
     # 参数调优循环：仅在「验证集」上判定是否达标并给诊断，测试集不参与调参（防泄漏/多重检验）。
     # 复用同一批已选因子（不重新生成/研究），开销可控；仍不理想则本轮停止、进入下一轮。
@@ -386,7 +398,7 @@ async def run_round(
 
     # 6. evaluate：测试集 + 回测，最终判定（测试集只在此处用一次）
     await mark("evaluate", stage_idx=5, message="效果评估")
-    grade, excellent, score, checks = evaluate_round(train_resp, bt, th)
+    grade, excellent, _score, checks = evaluate_round(train_resp, bt, th)
 
     if grade == "ok" and train_resp.get("found") and "artifact" in train_resp:
         # 入库（使用调优后的最终参数）
@@ -420,15 +432,19 @@ async def run_round(
             "params_applied": {k: active_cfg.get(k) for k in applied_param_keys},
         }
         next_pool = picked
-        # 更新 best / stall
-        if best_score is None or score > best_score:
+        # 更新 best / stall：以验证集指标（val_rank_ic，缺省退回 oos_rank_ic）排序，
+        # 回测指标仅作展示，不参与跨轮选择（防止在回测 holdout 上过拟合）。
+        sel_score = _select_score(train_resp)
+        if best_score is None or (sel_score is not None and sel_score > best_score):
             await rrun.set_best(
                 run_id,
                 model_id=model_id,
                 metrics={
-                    "sharpe": score,
-                    "total_return": (bt.get("metrics") or {}).get("total_return"),
+                    "sel_score": sel_score,
+                    "val_rank_ic": train_resp.get("val_rank_ic"),
                     "oos_rank_ic": train_resp.get("oos_rank_ic"),
+                    "sharpe": (bt.get("metrics") or {}).get("sharpe"),
+                    "total_return": (bt.get("metrics") or {}).get("total_return"),
                 },
             )
             new_stall = 0
@@ -771,6 +787,17 @@ def _ml_ok(train_resp: dict[str, Any], th: dict[str, Any], *, val: bool = False)
         and (hit is not None and float(hit) >= float(th["hit_rate"]))
         and (gap is None or float(gap) < float(th["overfit_gap"]))
     )
+
+
+def _select_score(train_resp: dict[str, Any]) -> float | None:
+    """跨轮选最优模型的排序分：优先验证集 RankIC（无验证集时退回测试集 RankIC）。"""
+    v = train_resp.get("val_rank_ic")
+    if v is None:
+        v = train_resp.get("oos_rank_ic")
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
 
 
 def evaluate_round(

@@ -90,7 +90,6 @@ const form = reactive({
   researchStart: daysAgo(700),
   researchEnd: daysAgo(180),
   backtestSymbol: 'BTCUSDT',
-  backtestInterval: '1d',
   backtestStart: daysAgo(180),
   backtestEnd: localDate(new Date()),
   factorCount: 4,
@@ -214,7 +213,7 @@ async function start() {
       research_start: isoOf(form.researchStart),
       research_end: isoOf(form.researchEnd),
       backtest_symbol: form.backtestSymbol || syms[0],
-      backtest_interval: form.backtestInterval,
+      backtest_interval: form.researchInterval,
       backtest_start: isoOf(form.backtestStart),
       backtest_end: isoOf(form.backtestEnd, true),
       factor_count_per_round: factorCount,
@@ -663,9 +662,8 @@ onBeforeUnmount(() => {
             </div>
             <div class="field">
               <label class="label" for="pipeline-backtest-interval">回测粒度</label>
-              <select id="pipeline-backtest-interval" v-model="form.backtestInterval" class="select font-mono">
-                <option value="15m">15m</option><option value="30m">30m</option><option value="1h">1h</option><option value="4h">4h</option><option value="1d">1d</option>
-              </select>
+              <input id="pipeline-backtest-interval" :value="form.researchInterval" class="input font-mono" readonly disabled />
+              <p class="mt-1 text-[11px] text-subtle">跟随研究粒度（模型特征绑定 interval，换粒度会导致因子口径漂移）</p>
             </div>
           </div>
 

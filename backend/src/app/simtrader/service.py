@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
+import pandas as pd
 from sqlalchemy import and_, delete, desc, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -344,6 +345,43 @@ async def account_detail(db: AsyncSession, account: dict[str, Any]) -> dict[str,
         "total_equity": round(equity, 2),
     }
 
+def _decide_signal(
+    scores: pd.Series, cfg: dict[str, Any]
+) -> tuple[bool, bool, dict[str, Any]]:
+    """按账户配置给出「是否入场 / 是否离场」信号。
+
+    默认与回测模板 ml_score 完全一致：score 高于滚动 enter_q 分位入场、低于 exit_q 分位离场
+    （因果滚动分位，无未来函数）。仅历史遗留账户（只配了绝对 enter/exit、无 enter_q/exit_q）
+    才退回绝对阈值，保证老账户行为不变。
+    """
+    last = float(scores.iloc[-1])
+    legacy_abs = ("enter" in cfg or "exit" in cfg) and (
+        "enter_q" not in cfg and "exit_q" not in cfg
+    )
+    if legacy_abs:
+        enter = float(cfg.get("enter", 0.02) or 0.02)
+        exit_ = float(cfg.get("exit", -0.02) or -0.02)
+        return last > enter, last < exit_, {"type": "absolute", "enter": enter, "exit": exit_}
+
+    window = max(20, min(240, int(cfg.get("window") or 60)))
+    enter_q = max(0.5, min(0.95, float(cfg.get("enter_q") or 0.8)))
+    exit_q = max(0.05, min(0.5, float(cfg.get("exit_q") or 0.2)))
+    roll = scores.rolling(window, min_periods=max(2, window // 2))
+    q_hi = roll.quantile(enter_q).iloc[-1]
+    q_lo = roll.quantile(exit_q).iloc[-1]
+    enter_signal = bool(pd.notna(q_hi) and last > float(q_hi))
+    exit_signal = bool(pd.notna(q_lo) and last < float(q_lo))
+    rule = {
+        "type": "quantile",
+        "window": window,
+        "enter_q": enter_q,
+        "exit_q": exit_q,
+        "q_hi": None if pd.isna(q_hi) else round(float(q_hi), 6),
+        "q_lo": None if pd.isna(q_lo) else round(float(q_lo), 6),
+    }
+    return enter_signal, exit_signal, rule
+
+
 async def run_auto_tick(db: AsyncSession, account: dict[str, Any]) -> dict[str, Any]:
     """策略自动账户：用保存的 ML 模型对最新 K 线打分，触发开/平仓（模拟盘，纸面）。"""
     from uuid import UUID as _UUID
@@ -371,25 +409,32 @@ async def run_auto_tick(db: AsyncSession, account: dict[str, Any]) -> dict[str, 
     scored = await score_with_model(
         KlineRepository(db), model, interval, symbol, start, end
     )
-    last = scored.get("last_score")
-    if last is None:
+    points = scored.get("points") or []
+    if not points:
         return {"action": "skip", "message": scored.get("message", "无可用打分")}
+    scores = pd.Series([float(p["score"]) for p in points], dtype=float)
+    last = float(scores.iloc[-1])
 
     orders = await SimOrderRepository(db).all_filled(account["id"])
     pos = _positions_from_orders(orders).get(symbol, {})
     qty = float(pos.get("qty", 0.0))
     cash = float(account["current_cash"])
-    enter = float(cfg.get("enter", 0.02) or 0.02)
-    exit_ = float(cfg.get("exit", -0.02) or -0.02)
 
-    if qty <= 1e-9 and last > enter:
+    enter_signal, exit_signal, rule = _decide_signal(scores, cfg)
+
+    if qty <= 1e-9 and enter_signal:
         price = await current_price(symbol)
         if price <= 0:
             return {"action": "skip", "message": "无法取到现价"}
         buy_qty = (cash * 0.95) / price
         result = await place_market_order(db, account, symbol, "buy", buy_qty)
-        return {"action": "open", "score": round(last, 6), "order": result}
-    if qty > 1e-9 and last < exit_:
+        return {"action": "open", "score": round(last, 6), "rule": rule, "order": result}
+    if qty > 1e-9 and exit_signal:
         result = await place_market_order(db, account, symbol, "sell", qty)
-        return {"action": "close", "score": round(last, 6), "order": result}
-    return {"action": "hold", "score": round(last, 6), "qty": round(qty, 6)}
+        return {"action": "close", "score": round(last, 6), "rule": rule, "order": result}
+    return {
+        "action": "hold",
+        "score": round(last, 6),
+        "qty": round(qty, 6),
+        "rule": rule,
+    }

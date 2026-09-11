@@ -492,6 +492,13 @@ async def run_ml_research(
             frame[acode] = agg_series.get(acode, pd.Series(np.nan, index=df.index))
         fdf = pd.DataFrame(frame)
         cols = valid + agg_codes
+        # 计算失败/被 min_bars 跳过的因子用 NaN 列补齐，保证各标的风量维度一致；
+        # 整列 NaN 会在下方 dropna 后被剔除，而不是直接 KeyError 崩掉整轮训练。
+        missing_cols = [c for c in cols if c not in fdf.columns]
+        if missing_cols:
+            logger.warning("ml.feature_unavailable", symbol=sym, missing=missing_cols)
+            for c in missing_cols:
+                fdf[c] = np.nan
         if fn == "expanding":
             # 逐标的做因果 expanding 标准化（只用 ≤t 信息），适配 regime 漂移
             for c in cols:
@@ -938,6 +945,15 @@ async def score_with_model(
             continue
     if not series:
         return {"found": False, "message": "无法在标的/粒度上计算模型特征"}
+
+    # 严格校验：模型训练用到的特征必须全部可算，否则静默丢特征会让线性模型给出错误分数
+    # （gbdt 本就要求全特征，这里让两种模型口径一致、失败可见）。
+    missing = [f["code"] for f in feats if f["code"] not in series]
+    if missing:
+        return {
+            "found": False,
+            "message": "以下模型特征无法在当前标的/粒度上计算，无法打分：" + "、".join(missing[:5]),
+        }
 
     fdf = pd.DataFrame(series).dropna()
 

@@ -8,9 +8,11 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from ...core.logging import get_logger
 from ...factor.registry import compute_factor as _compute_factor, get_factors as _get_factors
 from ...factor.sandbox import safe_eval_expr
 
+logger = get_logger(__name__)
 RegistryType = dict[str, dict]
 
 
@@ -57,13 +59,19 @@ def _standardize(val: pd.Series, f: dict) -> pd.Series:
 
 
 def _ml_linear_score(df: pd.DataFrame, feats: list[dict]) -> pd.Series:
-    score = pd.Series(0.0, index=df.index)
+    """线性模型打分：要求全部特征可算，任一缺失则整体不打分（返回 0），
+    避免用“残缺特征集”给出与训练不一致的分数。"""
     available = set(_get_factors().keys())
+    vals: dict[str, pd.Series] = {}
     for f in feats:
         val = _feature_series(df, f, available)
         if val is None:
-            continue
-        score += float(f.get("coef", 0.0) or 0.0) * _standardize(val, f)
+            logger.warning("strategy.ml_feature_missing", code=f.get("code"))
+            return pd.Series(0.0, index=df.index)
+        vals[f["code"]] = val
+    score = pd.Series(0.0, index=df.index)
+    for f in feats:
+        score += float(f.get("coef", 0.0) or 0.0) * _standardize(vals[f["code"]], f)
     return score
 
 
@@ -80,7 +88,8 @@ def _ml_tree_score(df: pd.DataFrame, feats: list[dict], booster) -> pd.Series:
     fdf = pd.DataFrame(series)
     cols = [f["code"] for f in feats if f["code"] in fdf.columns]
     if len(cols) < len(feats):
-        # 有特征完全算不出来，树模型无法打分（与线性容忍缺失不同）
+        # 有特征完全算不出来，树模型无法打分（与线性模型一致：整体不打分）
+        logger.warning("strategy.ml_feature_missing", codes=[f["code"] for f in feats if f["code"] not in fdf.columns])
         return pd.Series(0.0, index=df.index)
     fmap = {f["code"]: f for f in feats}
     z = fdf[cols].copy()

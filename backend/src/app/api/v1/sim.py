@@ -38,8 +38,13 @@ class AutoAccountReq(BaseModel):
     symbol: str = Field(..., min_length=2, max_length=20)
     interval: str = Field(..., pattern=r"^(15m|30m|1h|4h|1d)$")
     model_id: str = Field(..., min_length=1)
-    enter: float = Field(default=0.02)
-    exit: float = Field(default=-0.02)
+    # 与回测一致的「滚动分位」择时规则（score 高于 enter_q 分位做多、低于 exit_q 分位平仓）
+    window: int = Field(default=60, ge=20, le=240)
+    enter_q: float = Field(default=0.8, ge=0.5, le=0.95)
+    exit_q: float = Field(default=0.2, ge=0.05, le=0.5)
+    # 兼容历史客户端的绝对阈值（仅在未提供分位参数时生效）
+    enter: float | None = Field(default=None)
+    exit: float | None = Field(default=None)
     lookback: float | None = Field(default=None, ge=7)
     cadence_min: int | None = Field(default=None, ge=1, le=1440)
     enabled: bool = True
@@ -114,12 +119,17 @@ async def create_auto_account(
         "symbol": req.symbol.upper(),
         "interval": req.interval,
         "model_id": req.model_id,
-        "enter": req.enter,
-        "exit": req.exit,
+        "window": req.window,
+        "enter_q": req.enter_q,
+        "exit_q": req.exit_q,
         "enabled": req.enabled,
         "cadence_min": req.cadence_min or (30 if req.interval.endswith("d") else 5),
         "last_run_at": None,
     }
+    if req.enter is not None:
+        cfg["enter"] = req.enter
+    if req.exit is not None:
+        cfg["exit"] = req.exit
     if req.lookback:
         cfg["lookback"] = req.lookback
     acct = await repo.create(name=req.name.strip(), account_type="strategy", config=cfg)
