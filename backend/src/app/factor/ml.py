@@ -167,6 +167,24 @@ def _clip_bounds(a: np.ndarray, q: float) -> tuple[np.ndarray, np.ndarray]:
     return lo, hi
 
 
+def _winsor_bounds(a: np.ndarray, q: float) -> tuple[np.ndarray, np.ndarray]:
+    """逐列 winsorize 边界；分位区间退化的列返回 NaN（表示不裁剪）。
+
+    稀疏信号因子（如 >99% 取同一值）的 q 与 1-q 分位可能相等，若照常钳制会把整列
+    压成常数，树模型无法分裂、学习曲线变水平直线。这里把退化列标为 NaN 跳过裁剪。
+    """
+    lo, hi = _clip_bounds(a, q)
+    degenerate = lo >= hi
+    return np.where(degenerate, np.nan, lo), np.where(degenerate, np.nan, hi)
+
+
+def _apply_winsor(a: np.ndarray, lo: np.ndarray, hi: np.ndarray) -> np.ndarray:
+    """按逐列边界裁剪；边界为 NaN 的列不裁剪（保持原值）。"""
+    eff_lo = np.where(np.isnan(lo), -np.inf, lo)
+    eff_hi = np.where(np.isnan(hi), np.inf, hi)
+    return np.clip(a, eff_lo, eff_hi)
+
+
 def _round_sig(v: Any, sig: int = 6) -> float:
     """按有效数字舍入（而非定点小数位）。
 
@@ -601,11 +619,11 @@ async def run_ml_research(
     if winsor is not None and 0.0 < winsor < 0.5:
         # expanding 模式下特征已标准化，不再做特征钳制（避免与推理口径不一致）；标签仍稳健化
         if fn != "expanding":
-            clip_low, clip_high = _clip_bounds(Xtr, winsor)
-            Xtr = np.clip(Xtr, clip_low, clip_high)
-            Xte = np.clip(Xte, clip_low, clip_high)
+            clip_low, clip_high = _winsor_bounds(Xtr, winsor)
+            Xtr = _apply_winsor(Xtr, clip_low, clip_high)
+            Xte = _apply_winsor(Xte, clip_low, clip_high)
             if has_val:
-                Xval = np.clip(Xval, clip_low, clip_high)
+                Xval = _apply_winsor(Xval, clip_low, clip_high)
         y_lo = float(np.quantile(ytr, winsor))
         y_hi = float(np.quantile(ytr, 1.0 - winsor))
         ytr = np.clip(ytr, y_lo, y_hi)
@@ -841,7 +859,9 @@ async def run_ml_research(
                 ),
                 **(
                     {"clip_low": float(clip_low[i]), "clip_high": float(clip_high[i])}
-                    if clip_low is not None and clip_high is not None
+                    if clip_low is not None
+                    and clip_high is not None
+                    and not np.isnan(clip_low[i])
                     else {}
                 ),
                 **({"expression": extras[code]["expression"]} if extras and code in extras else {}),

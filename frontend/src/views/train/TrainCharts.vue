@@ -51,6 +51,11 @@ const scatter = computed(() => props.result.oos_charts?.scatter ?? [])
 const deciles = computed(() => props.result.oos_charts?.deciles ?? [])
 const nav = computed(() => props.result.oos_charts?.nav)
 const learning = computed(() => props.result.learning)
+const learnGain = computed(() => {
+  const t = learning.value?.train
+  if (!t || t.length < 2 || !t[0]) return null
+  return (t[0] - t[t.length - 1]) / t[0]
+})
 
 const scatterR = computed(() => {
   const p = scatter.value
@@ -456,6 +461,9 @@ onBeforeUnmount(() => {
         </p>
       </div>
       <p class="mb-1 text-[10px] leading-snug text-subtle">每 boosting 轮的 MSE。虚线即早停选中的最优轮（此后 OOS 开始变差）；train 与 OOS 拉开的距离就是过拟合程度。</p>
+      <p v-if="learnGain != null && learnGain < 0.05" class="mb-1 rounded-md border border-warn/40 bg-warn/5 px-2 py-1 text-[10px] leading-snug text-warn">
+        训练损失几乎无下降（{{ (learnGain * 100).toFixed(1) }}%）：模型未能从这些因子上学到有效信号——通常是因子无预测力、样本不足，或因子被裁剪成了常数。
+      </p>
       <div ref="learnEl" class="h-52 w-full" />
     </section>
   </div>
