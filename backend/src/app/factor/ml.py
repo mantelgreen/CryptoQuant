@@ -320,6 +320,29 @@ def _iso_ts(x: Any) -> str:
     return pd.Timestamp(x).to_pydatetime().isoformat()
 
 
+def _append_samples(
+    store: list[dict[str, Any]],
+    sub: pd.DataFrame,
+    cols: list[str],
+    symbol: str,
+    lo: int,
+    hi: int,
+    limit: int,
+) -> None:
+    """把 [lo, hi) 区间的样本（因子原始值 + 标签）追加进 store，最多 limit 条。
+
+    用于在流水线结果里展示训练集/测试集的前若干条样本，方便核对因子取值与标签。
+    """
+    for i in range(lo, min(hi, len(sub))):
+        if len(store) >= limit:
+            return
+        row: dict[str, Any] = {"symbol": symbol, "ts": _iso_ts(sub.index[i])}
+        for c in cols:
+            row[c] = _round_sig(sub[c].iloc[i])
+        row["label"] = _round_sig(sub["label"].iloc[i])
+        store.append(row)
+
+
 def _build_oos_diag(
     ts: np.ndarray,
     pred: np.ndarray,
@@ -471,6 +494,7 @@ async def run_ml_research(
     colsample_bytree: float = 0.9,
     extras: dict[str, dict] | None = None,
     return_artifact: bool = False,
+    sample_limit: int = 0,
 ) -> dict[str, Any]:
     """训练多因子（内置或用户表达式因子），返回样本外评价。extras 提供用户因子 code→{expression,...}。"""
     fn = feature_norm if feature_norm in ("global", "expanding") else "global"
@@ -504,6 +528,9 @@ async def run_ml_research(
     used_symbols: list[str] = []
     feature_cols: list[str] = []
     test_windows: list[dict[str, Any]] = []
+    sample_cols: list[str] = valid + agg_codes
+    sample_train: list[dict[str, Any]] = []
+    sample_test: list[dict[str, Any]] = []
 
     for sym in symbols:
         df = await _load_frame(repo, sym, interval, start, end)
@@ -562,6 +589,10 @@ async def run_ml_research(
                 n_val = 0
         if not use_val:
             tr_end = max(1, te_start - purge)
+
+        if sample_limit > 0:
+            _append_samples(sample_train, sub, sample_cols, sym, 0, tr_end, sample_limit)
+            _append_samples(sample_test, sub, sample_cols, sym, te_start, n, sample_limit)
 
         Xtr_parts.append(X[:tr_end])
         ytr_parts.append(y[:tr_end])
@@ -928,6 +959,10 @@ async def run_ml_research(
         )
     if learning is not None:
         resp["learning"] = learning
+    if sample_limit > 0:
+        resp["sample_columns"] = [*sample_cols, "label"]
+        resp["sample_train"] = sample_train
+        resp["sample_test"] = sample_test
     if return_artifact:
         resp["artifact"] = artifact
     return resp

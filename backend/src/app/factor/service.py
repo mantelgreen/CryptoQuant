@@ -648,6 +648,7 @@ async def train_factor_model_full(
     seed_ensemble: int = 3,
     subsample: float = 0.9,
     colsample_bytree: float = 0.9,
+    sample_limit: int = 0,
 ) -> dict[str, Any]:
     """训练多因子模型并返回含 artifact 的完整结果（供流水线回测/入库复用，避免二次训练）。"""
     from .ml import run_ml_research
@@ -683,6 +684,7 @@ async def train_factor_model_full(
         colsample_bytree=colsample_bytree,
         extras=extras,
         return_artifact=True,
+        sample_limit=sample_limit,
     )
 
 

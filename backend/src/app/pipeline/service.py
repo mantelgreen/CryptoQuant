@@ -698,6 +698,7 @@ async def _train(
         seed_ensemble=int(cfg.get("seed_ensemble") or 3),
         subsample=float(cfg.get("subsample") or 0.9),
         colsample_bytree=float(cfg.get("colsample_bytree") or 0.9),
+        sample_limit=100,
     )
 
 
@@ -970,6 +971,9 @@ def _trim_train(
             "val_features",
             "val_charts",
             "learning",
+            "sample_columns",
+            "sample_train",
+            "sample_test",
             "message",
         )
     }

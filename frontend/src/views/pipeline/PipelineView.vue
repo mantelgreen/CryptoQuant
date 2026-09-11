@@ -13,6 +13,7 @@ import {
   Play,
   RefreshCw,
   Square,
+  TableProperties,
   Trash2,
   TrendingUp,
 } from '@lucide/vue'
@@ -496,6 +497,48 @@ const detailCharts = computed<{ oos_charts?: MlOosCharts; learning?: MlLearning 
   return has ? { oos_charts: t.oos_charts, learning: t.learning } : null
 })
 
+// —— 样本数据弹窗 ——
+const sampleRound = ref<PipelineRound | null>(null)
+const sampleTab = ref<'train' | 'test'>('train')
+function hasSamples(r: PipelineRound | null): boolean {
+  const t = r?.train_result
+  return !!t && ((t.sample_train?.length ?? 0) > 0 || (t.sample_test?.length ?? 0) > 0)
+}
+function openSamples(r: PipelineRound) {
+  sampleRound.value = r
+  sampleTab.value = (r.train_result?.sample_train?.length ?? 0) > 0 ? 'train' : 'test'
+}
+function closeSamples() {
+  sampleRound.value = null
+}
+const sampleColumns = computed<string[]>(() => {
+  const t = sampleRound.value?.train_result
+  const cols = t?.sample_columns
+  if (cols?.length) return cols
+  const rows = sampleTab.value === 'train' ? t?.sample_train : t?.sample_test
+  const first = rows?.[0]
+  return first ? Object.keys(first).filter((k) => k !== 'symbol' && k !== 'ts') : []
+})
+const sampleRows = computed<Array<Record<string, number | string>>>(() => {
+  const t = sampleRound.value?.train_result
+  const rows = sampleTab.value === 'train' ? t?.sample_train : t?.sample_test
+  return rows ?? []
+})
+function fmtSampleCell(v: number | string | undefined): string {
+  if (v == null) return '—'
+  if (typeof v !== 'number') return String(v)
+  if (v === 0) return '0'
+  const abs = Math.abs(v)
+  if (abs >= 1e-3 && abs < 1e5) return v.toFixed(6).replace(/\.?0+$/, '')
+  return v.toExponential(4)
+}
+function factorLabel(code: string): string {
+  if (code === 'label') return '标签(未来收益)'
+  const r = sampleRound.value
+  const f = [...(r?.factors_picked ?? []), ...(r?.factors_generated ?? [])].find((x) => x.code === code)
+  return f?.name || code
+}
+
 // 训练参数概要：优先用当轮实际生效的 config 快照（含参数调优后的覆盖），历史轮次回退到流水线配置。
 const TRAIN_PARAM_LABELS: Array<[string, string]> = [
   ['model', '模型'],
@@ -899,13 +942,22 @@ onBeforeUnmount(() => {
                     <span v-if="r.train_result.symbols?.length" class="text-muted">标的 <span class="font-mono text-fg">{{ r.train_result.symbols.join('/') }}</span></span>
                     <span v-if="r.train_result.n_features_kept != null" class="text-muted">特征 <span class="font-mono text-fg">{{ r.train_result.n_features_kept }}</span></span>
                     <span v-if="dataVol(r)" class="text-muted">数据量 <span class="num text-fg">{{ dataVol(r) }}</span></span>
-                    <button
-                      v-if="hasTrainCharts(r)"
-                      class="btn btn-soft ml-auto !h-7 !px-2.5 text-[11px]"
-                      @click="openDetail(r)"
-                    >
-                      <ChartLine :size="12" />训练详情
-                    </button>
+                    <div class="ml-auto flex gap-1.5">
+                      <button
+                        v-if="hasSamples(r)"
+                        class="btn btn-soft !h-7 !px-2.5 text-[11px]"
+                        @click="openSamples(r)"
+                      >
+                        <TableProperties :size="12" />样本数据
+                      </button>
+                      <button
+                        v-if="hasTrainCharts(r)"
+                        class="btn btn-soft !h-7 !px-2.5 text-[11px]"
+                        @click="openDetail(r)"
+                      >
+                        <ChartLine :size="12" />训练详情
+                      </button>
+                    </div>
                   </div>
                   <div v-if="trainParams(r).length" class="mt-1.5 flex flex-wrap gap-1.5">
                     <span v-for="p in trainParams(r)" :key="p.k" class="chip !h-6 font-mono text-[10px]">
@@ -1092,6 +1144,69 @@ onBeforeUnmount(() => {
         <p v-else class="rounded-lg border border-border bg-surface-2/40 px-3 py-4 text-center text-xs text-subtle">
           本轮没有可用的诊断图表（可能训练未产出模型或样本不足）。
         </p>
+      </div>
+    </Modal>
+
+    <!-- 样本数据弹窗：训练集 / 测试集前 100 条 -->
+    <Modal
+      :open="!!sampleRound"
+      :title="`样本数据 · 第 ${sampleRound?.round_no ?? ''} 轮`"
+      sub="因子原始值（未标准化）与未来收益标签；各取前 100 条，表格可横向滚动"
+      width="1080px"
+      @close="closeSamples"
+    >
+      <div v-if="sampleRound" class="space-y-3">
+        <div class="flex flex-wrap items-center gap-2">
+          <button
+            class="btn !h-7 !px-3 text-[11px]"
+            :class="sampleTab === 'train' ? 'btn-primary' : 'btn-soft'"
+            @click="sampleTab = 'train'"
+          >
+            训练集（{{ sampleRound.train_result?.sample_train?.length ?? 0 }}）
+          </button>
+          <button
+            class="btn !h-7 !px-3 text-[11px]"
+            :class="sampleTab === 'test' ? 'btn-primary' : 'btn-soft'"
+            @click="sampleTab = 'test'"
+          >
+            测试集（{{ sampleRound.train_result?.sample_test?.length ?? 0 }}）
+          </button>
+          <span class="ml-auto text-[11px] text-subtle">
+            共 {{ sampleRows.length }} 条 · {{ sampleColumns.length }} 列
+          </span>
+        </div>
+        <div v-if="!sampleRows.length" class="rounded-lg border border-border bg-surface-2/40 px-3 py-6 text-center text-xs text-subtle">
+          本轮没有可展示的样本（可能是历史运行，或训练样本不足）。
+        </div>
+        <div v-else class="max-h-[60vh] overflow-auto rounded-lg border border-border">
+          <table class="w-full border-collapse text-[11px]">
+            <thead class="sticky top-0 z-10 bg-surface-2">
+              <tr>
+                <th class="whitespace-nowrap border-b border-border px-2 py-1.5 text-left font-semibold text-subtle">时间</th>
+                <th
+                  v-for="c in sampleColumns"
+                  :key="c"
+                  class="whitespace-nowrap border-b border-border px-2 py-1.5 text-right font-semibold text-subtle"
+                >
+                  {{ factorLabel(c) }}
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="(row, i) in sampleRows" :key="i" class="odd:bg-surface-2/30">
+                <td class="whitespace-nowrap px-2 py-1 font-mono text-muted">{{ fmtStamp(String(row.ts)) }}</td>
+                <td
+                  v-for="c in sampleColumns"
+                  :key="c"
+                  class="num whitespace-nowrap px-2 py-1 text-right text-fg"
+                  :class="c === 'label' ? 'font-semibold' : ''"
+                >
+                  {{ fmtSampleCell(row[c]) }}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
       </div>
     </Modal>
   </div>

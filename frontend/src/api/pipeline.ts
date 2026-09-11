@@ -142,6 +142,9 @@ export interface PipelineRound {
     oos_charts?: MlOosCharts
     val_charts?: MlOosCharts
     learning?: MlLearning
+    sample_columns?: string[]
+    sample_train?: Array<Record<string, number | string>>
+    sample_test?: Array<Record<string, number | string>>
     config?: Record<string, unknown>
     message?: string
   } | null
