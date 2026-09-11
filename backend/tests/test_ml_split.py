@@ -93,3 +93,18 @@ async def test_internal_test_when_requested():
     assert r["found"] is True
     assert r["n_test"] > 0
     assert r["n_train"] > 0 and r["n_val"] > 0
+
+
+async def test_factor_diag_and_usable_count():
+    r = await _train(_df())
+    assert r["n_usable"] >= r["n_train"] + r["n_val"]
+    diag = r.get("factor_diag") or []
+    assert len(diag) == 3
+    keys = {"code", "name", "n", "nan", "std", "min", "max", "ic", "rank_ic"}
+    for d in diag:
+        assert keys <= set(d)
+        assert d["n"] > 0
+    # mom30 有 30 根预热缺失，mom10 有 10 根
+    by_code = {d["code"]: d for d in diag}
+    assert by_code["f2"]["nan"] == 30
+    assert by_code["f1"]["nan"] == 10

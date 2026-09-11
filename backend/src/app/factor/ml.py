@@ -544,6 +544,10 @@ async def run_ml_research(
     sample_cols: list[str] = valid + agg_codes
     sample_train: list[dict[str, Any]] = []
     sample_test: list[dict[str, Any]] = []
+    # 因子诊断：逐因子在原始窗口（含 NaN）与对齐样本上的取值分布 / IC
+    diag_raw: dict[str, list[np.ndarray]] = {}
+    diag_pair: dict[str, list[tuple[np.ndarray, np.ndarray]]] = {}
+    n_usable_total = 0
 
     for sym in symbols:
         df = await _load_frame(repo, sym, interval, start, end)
@@ -580,6 +584,12 @@ async def run_ml_research(
         sub = fdf[[*cols, "label"]].dropna()
         if len(sub) < 60:
             continue
+        n_usable_total += len(sub)
+        for c in cols:
+            diag_raw.setdefault(c, []).append(fdf[c].to_numpy(dtype=float))
+            diag_pair.setdefault(c, []).append(
+                (sub[c].to_numpy(dtype=float), sub["label"].to_numpy(dtype=float))
+            )
         X = sub[cols].to_numpy(dtype=float)
         y = sub["label"].to_numpy(dtype=float)
         n = len(sub)
@@ -870,6 +880,34 @@ async def run_ml_research(
         _univariate_block(Xval_z, yval, feature_cols, w, extras) if has_val else None
     )
 
+    # —— 逐因子诊断：原始窗口取值分布（含 NaN）+ 对齐样本上的 IC / RankIC ——
+    factor_diag: list[dict[str, Any]] = []
+    for c in sample_cols:
+        raws = diag_raw.get(c)
+        if not raws:
+            continue
+        raw = np.concatenate(raws)
+        finite = raw[np.isfinite(raw)]
+        pairs = diag_pair.get(c) or []
+        fx = np.concatenate([p[0] for p in pairs]) if pairs else np.array([])
+        ly = np.concatenate([p[1] for p in pairs]) if pairs else np.array([])
+        ic = _pearson_arr(fx, ly) if fx.size else float("nan")
+        ric = _spearman(fx, ly) if fx.size else float("nan")
+        factor_diag.append(
+            {
+                "code": c,
+                "name": _AGG_NAMES.get(c) or (meta_or_extra(c, extras) or {}).get("name", c),
+                "n": int(finite.size),
+                "nan": int(raw.size - finite.size),
+                "std": _round_sig(float(np.std(finite))) if finite.size else 0.0,
+                "min": _round_sig(float(np.min(finite))) if finite.size else 0.0,
+                "max": _round_sig(float(np.max(finite))) if finite.size else 0.0,
+                "ic": _r(ic, 5),
+                "rank_ic": _r(ric, 5),
+            }
+        )
+    factor_diag.sort(key=lambda d: abs(d["ic"] or 0.0), reverse=True)
+
     # —— 样本外诊断图表：散点 / 十分位单调性 / 分层净值（逐样本 pred·actual·时间） ——
     oos_charts: dict[str, Any] = {}
     if te_time.size == yte.size and yte.size > 0:
@@ -989,6 +1027,8 @@ async def run_ml_research(
         resp["sample_columns"] = [*sample_cols, "label"]
         resp["sample_train"] = sample_train
         resp["sample_test"] = sample_test
+    resp["n_usable"] = int(n_usable_total)
+    resp["factor_diag"] = factor_diag
     if return_artifact:
         resp["artifact"] = artifact
     return resp

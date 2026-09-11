@@ -977,6 +977,8 @@ def _trim_train(
             "val_features",
             "val_charts",
             "learning",
+            "n_usable",
+            "factor_diag",
             "sample_columns",
             "sample_train",
             "sample_test",

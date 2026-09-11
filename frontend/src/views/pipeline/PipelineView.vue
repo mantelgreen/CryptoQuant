@@ -498,16 +498,27 @@ const detailCharts = computed<{ oos_charts?: MlOosCharts; learning?: MlLearning 
   return has ? { oos_charts: oc, learning: t.learning } : null
 })
 
-// —— 样本数据弹窗 ——
+// —— 样本/因子诊断弹窗 ——
 const sampleRound = ref<PipelineRound | null>(null)
-const sampleTab = ref<'train' | 'test'>('train')
+const sampleTab = ref<'train' | 'test' | 'diag'>('train')
 function hasSamples(r: PipelineRound | null): boolean {
   const t = r?.train_result
-  return !!t && ((t.sample_train?.length ?? 0) > 0 || (t.sample_test?.length ?? 0) > 0)
+  return (
+    !!t &&
+    ((t.sample_train?.length ?? 0) > 0 ||
+      (t.sample_test?.length ?? 0) > 0 ||
+      (t.factor_diag?.length ?? 0) > 0)
+  )
 }
 function openSamples(r: PipelineRound) {
   sampleRound.value = r
-  sampleTab.value = (r.train_result?.sample_train?.length ?? 0) > 0 ? 'train' : 'test'
+  const t = r.train_result
+  sampleTab.value =
+    (t?.sample_train?.length ?? 0) > 0
+      ? 'train'
+      : (t?.sample_test?.length ?? 0) > 0
+        ? 'test'
+        : 'diag'
 }
 function closeSamples() {
   sampleRound.value = null
@@ -516,22 +527,35 @@ const sampleColumns = computed<string[]>(() => {
   const t = sampleRound.value?.train_result
   const cols = t?.sample_columns
   if (cols?.length) return cols
-  const rows = sampleTab.value === 'train' ? t?.sample_train : t?.sample_test
+  const rows = sampleTab.value === 'test' ? t?.sample_test : t?.sample_train
   const first = rows?.[0]
   return first ? Object.keys(first).filter((k) => k !== 'symbol' && k !== 'ts') : []
 })
 const sampleRows = computed<Array<Record<string, number | string>>>(() => {
   const t = sampleRound.value?.train_result
-  const rows = sampleTab.value === 'train' ? t?.sample_train : t?.sample_test
+  const rows = sampleTab.value === 'test' ? t?.sample_test : t?.sample_train
   return rows ?? []
+})
+const factorDiag = computed(() => sampleRound.value?.train_result?.factor_diag ?? [])
+const sampleStats = computed(() => {
+  const t = sampleRound.value?.train_result
+  if (!t) return null
+  const nTrain = t.n_train ?? 0
+  const nVal = t.n_val ?? 0
+  const nTest = t.n_test ?? 0
+  const total = t.n_usable ?? nTrain + nVal + nTest
+  const share = (n: number) => (total > 0 ? `${((n / total) * 100).toFixed(0)}%` : '—')
+  return { total, nTrain, nVal, nTest, trainShare: share(nTrain), valShare: share(nVal), testShare: share(nTest) }
 })
 function fmtSampleCell(v: number | string | undefined): string {
   if (v == null) return '—'
-  if (typeof v !== 'number') return String(v)
-  if (v === 0) return '0'
-  const abs = Math.abs(v)
-  if (abs >= 1e-3 && abs < 1e5) return v.toFixed(6).replace(/\.?0+$/, '')
-  return v.toExponential(4)
+  if (typeof v !== 'string') {
+    if (v === 0) return '0'
+    const abs = Math.abs(v)
+    if (abs >= 1e-3 && abs < 1e5) return v.toFixed(6).replace(/\.?0+$/, '')
+    return v.toExponential(4)
+  }
+  return v
 }
 function factorLabel(code: string): string {
   if (code === 'label') return '标签(未来收益)'
@@ -949,7 +973,7 @@ onBeforeUnmount(() => {
                         class="btn btn-soft !h-7 !px-2.5 text-[11px]"
                         @click="openSamples(r)"
                       >
-                        <TableProperties :size="12" />样本数据
+                        <TableProperties :size="12" />数据诊断
                       </button>
                       <button
                         v-if="hasTrainCharts(r)"
@@ -1148,11 +1172,11 @@ onBeforeUnmount(() => {
       </div>
     </Modal>
 
-    <!-- 样本数据弹窗：训练集 / 测试集前 100 条 -->
+    <!-- 数据诊断弹窗：样本数据（训练/测试集前 100 条）+ 样本量 + 因子诊断 -->
     <Modal
       :open="!!sampleRound"
-      :title="`样本数据 · 第 ${sampleRound?.round_no ?? ''} 轮`"
-      sub="因子原始值（未标准化）与未来收益标签；各取前 100 条，表格可横向滚动"
+      :title="`数据诊断 · 第 ${sampleRound?.round_no ?? ''} 轮`"
+      sub="样本量拆分、因子原始值分布与 IC；样本各取前 100 条，表格可横向滚动"
       width="1080px"
       @close="closeSamples"
     >
@@ -1172,42 +1196,109 @@ onBeforeUnmount(() => {
           >
             测试集（{{ sampleRound.train_result?.sample_test?.length ?? 0 }}）
           </button>
-          <span class="ml-auto text-[11px] text-subtle">
+          <button
+            class="btn !h-7 !px-3 text-[11px]"
+            :class="sampleTab === 'diag' ? 'btn-primary' : 'btn-soft'"
+            @click="sampleTab = 'diag'"
+          >
+            因子诊断（{{ factorDiag.length }}）
+          </button>
+          <span v-if="sampleTab !== 'diag'" class="ml-auto text-[11px] text-subtle">
             共 {{ sampleRows.length }} 条 · {{ sampleColumns.length }} 列
           </span>
         </div>
-        <div v-if="!sampleRows.length" class="rounded-lg border border-border bg-surface-2/40 px-3 py-6 text-center text-xs text-subtle">
-          本轮没有可展示的样本（可能是历史运行，或训练样本不足）。
-        </div>
-        <div v-else class="max-h-[60vh] overflow-auto rounded-lg border border-border">
-          <table class="w-full border-collapse text-[11px]">
-            <thead class="sticky top-0 z-10 bg-surface-2">
-              <tr>
-                <th class="whitespace-nowrap border-b border-border px-2 py-1.5 text-left font-semibold text-subtle">时间</th>
-                <th
-                  v-for="c in sampleColumns"
-                  :key="c"
-                  class="whitespace-nowrap border-b border-border px-2 py-1.5 text-right font-semibold text-subtle"
-                >
-                  {{ factorLabel(c) }}
-                </th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="(row, i) in sampleRows" :key="i" class="odd:bg-surface-2/30">
-                <td class="whitespace-nowrap px-2 py-1 font-mono text-muted">{{ fmtStamp(String(row.ts)) }}</td>
-                <td
-                  v-for="c in sampleColumns"
-                  :key="c"
-                  class="num whitespace-nowrap px-2 py-1 text-right text-fg"
-                  :class="c === 'label' ? 'font-semibold' : ''"
-                >
-                  {{ fmtSampleCell(row[c]) }}
-                </td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
+
+        <!-- 因子诊断 -->
+        <template v-if="sampleTab === 'diag'">
+          <div v-if="sampleStats" class="grid grid-cols-2 gap-2 sm:grid-cols-4">
+            <div class="rounded-lg bg-surface-2 px-2.5 py-2">
+              <p class="text-[10px] uppercase tracking-wider text-subtle">可用样本</p>
+              <p class="num text-sm font-semibold text-fg">{{ sampleStats.total }}</p>
+            </div>
+            <div class="rounded-lg bg-surface-2 px-2.5 py-2">
+              <p class="text-[10px] uppercase tracking-wider text-subtle">训练集</p>
+              <p class="num text-sm font-semibold text-fg">{{ sampleStats.nTrain }} <span class="text-[10px] text-subtle">{{ sampleStats.trainShare }}</span></p>
+            </div>
+            <div class="rounded-lg bg-surface-2 px-2.5 py-2">
+              <p class="text-[10px] uppercase tracking-wider text-subtle">验证集</p>
+              <p class="num text-sm font-semibold text-fg">{{ sampleStats.nVal }} <span class="text-[10px] text-subtle">{{ sampleStats.valShare }}</span></p>
+            </div>
+            <div class="rounded-lg bg-surface-2 px-2.5 py-2">
+              <p class="text-[10px] uppercase tracking-wider text-subtle">测试集</p>
+              <p class="num text-sm font-semibold text-fg">{{ sampleStats.nTest }} <span class="text-[10px] text-subtle">{{ sampleStats.testShare }}</span></p>
+            </div>
+          </div>
+          <div v-if="!factorDiag.length" class="rounded-lg border border-border bg-surface-2/40 px-3 py-6 text-center text-xs text-subtle">
+            本轮没有因子诊断数据（可能是历史运行）。
+          </div>
+          <div v-else class="max-h-[58vh] overflow-auto rounded-lg border border-border">
+            <table class="w-full border-collapse text-[11px]">
+              <thead class="sticky top-0 z-10 bg-surface-2">
+                <tr>
+                  <th class="whitespace-nowrap border-b border-border px-2 py-1.5 text-left font-semibold text-subtle">因子</th>
+                  <th class="whitespace-nowrap border-b border-border px-2 py-1.5 text-right font-semibold text-subtle">有效</th>
+                  <th class="whitespace-nowrap border-b border-border px-2 py-1.5 text-right font-semibold text-subtle">缺失</th>
+                  <th class="whitespace-nowrap border-b border-border px-2 py-1.5 text-right font-semibold text-subtle">std</th>
+                  <th class="whitespace-nowrap border-b border-border px-2 py-1.5 text-right font-semibold text-subtle">min</th>
+                  <th class="whitespace-nowrap border-b border-border px-2 py-1.5 text-right font-semibold text-subtle">max</th>
+                  <th class="whitespace-nowrap border-b border-border px-2 py-1.5 text-right font-semibold text-subtle">IC</th>
+                  <th class="whitespace-nowrap border-b border-border px-2 py-1.5 text-right font-semibold text-subtle">RankIC</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="d in factorDiag" :key="d.code" class="odd:bg-surface-2/30">
+                  <td class="whitespace-nowrap px-2 py-1 text-fg" :title="d.code">{{ d.name }}</td>
+                  <td class="num px-2 py-1 text-right text-muted">{{ d.n }}</td>
+                  <td class="num px-2 py-1 text-right" :class="d.nan > 0 ? 'text-warn' : 'text-muted'">{{ d.nan }}</td>
+                  <td class="num whitespace-nowrap px-2 py-1 text-right text-muted">{{ fmtSampleCell(d.std) }}</td>
+                  <td class="num whitespace-nowrap px-2 py-1 text-right text-muted">{{ fmtSampleCell(d.min) }}</td>
+                  <td class="num whitespace-nowrap px-2 py-1 text-right text-muted">{{ fmtSampleCell(d.max) }}</td>
+                  <td class="num px-2 py-1 text-right font-semibold" :class="tone(d.ic)">{{ d.ic ?? '—' }}</td>
+                  <td class="num px-2 py-1 text-right font-semibold" :class="tone(d.rank_ic)">{{ d.rank_ic ?? '—' }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="text-[10px] leading-snug text-subtle">
+            有效/缺失为该因子在原始研究窗的取值统计（缺失多来自滚动窗口预热）；IC/RankIC 为因子与未来收益的对齐样本相关。
+          </p>
+        </template>
+
+        <!-- 样本表 -->
+        <template v-else>
+          <div v-if="!sampleRows.length" class="rounded-lg border border-border bg-surface-2/40 px-3 py-6 text-center text-xs text-subtle">
+            本轮没有可展示的样本（可能是历史运行，或训练样本不足）。
+          </div>
+          <div v-else class="max-h-[60vh] overflow-auto rounded-lg border border-border">
+            <table class="w-full border-collapse text-[11px]">
+              <thead class="sticky top-0 z-10 bg-surface-2">
+                <tr>
+                  <th class="whitespace-nowrap border-b border-border px-2 py-1.5 text-left font-semibold text-subtle">时间</th>
+                  <th
+                    v-for="c in sampleColumns"
+                    :key="c"
+                    class="whitespace-nowrap border-b border-border px-2 py-1.5 text-right font-semibold text-subtle"
+                  >
+                    {{ factorLabel(c) }}
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="(row, i) in sampleRows" :key="i" class="odd:bg-surface-2/30">
+                  <td class="whitespace-nowrap px-2 py-1 font-mono text-muted">{{ fmtStamp(String(row.ts)) }}</td>
+                  <td
+                    v-for="c in sampleColumns"
+                    :key="c"
+                    class="num whitespace-nowrap px-2 py-1 text-right text-fg"
+                    :class="c === 'label' ? 'font-semibold' : ''"
+                  >
+                    {{ fmtSampleCell(row[c]) }}
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </template>
       </div>
     </Modal>
   </div>
