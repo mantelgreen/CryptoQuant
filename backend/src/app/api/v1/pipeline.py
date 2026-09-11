@@ -49,7 +49,7 @@ class PipelineStartReq(BaseModel):
     model: str = Field(default="ridge", pattern=r"^(ridge|gbdt)$")
     gbdt_objective: str = Field(default="huber", pattern=r"^(regression|regression_l1|huber)$")
     horizon: int = Field(default=1, ge=1, le=10)
-    test_ratio: float = Field(default=0.25, ge=0.15, le=0.5)
+    test_ratio: float = Field(default=0.0, ge=0.0, le=0.5)
     val_ratio: float = Field(default=0.15, ge=0.0, le=0.4)
     alpha: float = Field(default=1.0, ge=0.0, le=50.0)
     max_corr: float | None = Field(default=0.8, ge=0.0, lt=1.0)

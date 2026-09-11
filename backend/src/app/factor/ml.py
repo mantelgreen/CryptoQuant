@@ -406,6 +406,19 @@ def _eval_block(pred: np.ndarray, y: np.ndarray, cost_bps: float) -> dict[str, A
 
     IC / RankIC / 方向命中率 / Top−Bottom 价差 / 模型退化体检。
     """
+    if len(pred) == 0 or len(y) == 0:
+        return {
+            "ic": float("nan"),
+            "rank_ic": float("nan"),
+            "hit": float("nan"),
+            "top_mean": float("nan"),
+            "btm_mean": float("nan"),
+            "spread": float("nan"),
+            "net_spread": float("nan"),
+            "pred_nunique": 0,
+            "pred_std": 0.0,
+            "degenerate": False,
+        }
     ic = _pearson_arr(pred, y)
     rank_ic = _spearman(pred, y)
     nz = np.abs(y) > 1e-12
@@ -572,8 +585,10 @@ async def run_ml_research(
         n = len(sub)
         # 时间序切分：train | (purge) | val | (purge) | test。测试集只在最终评估用一次；
         # 验证集用于方向校准/调参/因子精筛；purge 留 horizon 根缓冲避免标签重叠泄漏。
+        # test_ratio=0（流水线默认）表示不在研究窗内再切测试集：研究窗全部用于训练/验证，
+        # 真正的样本外评价交给独立的回测窗（强制晚于研究窗），避免白白浪费 25% 训练样本。
         purge = max(1, horizon)
-        n_test = max(30, int(n * test_ratio))
+        n_test = max(30, int(n * test_ratio)) if test_ratio and test_ratio > 0 else 0
         use_val = bool(val_ratio and val_ratio > 0)
         n_val = max(30, int(n * val_ratio)) if use_val else 0
         if use_val and n - n_test - n_val < 60:
@@ -607,16 +622,17 @@ async def run_ml_research(
         used_symbols.append(sym)
         te_time_parts.append(np.asarray(sub.index[te_start:], dtype="datetime64[ns]"))
         # 记录该标的本轮切出的真实测试段时间窗（末段 n_test 根），供模型库展示测试集
-        idx = sub.index
-        test_windows.append(
-            {
-                "symbol": sym,
-                "interval": interval,
-                "start": pd.Timestamp(idx[te_start]).to_pydatetime().isoformat(),
-                "end": pd.Timestamp(idx[-1]).to_pydatetime().isoformat(),
-                "bars": int(len(idx) - te_start),
-            }
-        )
+        if n_test > 0:
+            idx = sub.index
+            test_windows.append(
+                {
+                    "symbol": sym,
+                    "interval": interval,
+                    "start": pd.Timestamp(idx[te_start]).to_pydatetime().isoformat(),
+                    "end": pd.Timestamp(idx[-1]).to_pydatetime().isoformat(),
+                    "bars": int(len(idx) - te_start),
+                }
+            )
         if not feature_cols:
             feature_cols = cols
 
@@ -790,7 +806,7 @@ async def run_ml_research(
         w = np.mean([m.feature_importances_.astype(float) for m in models], axis=0)
         s = w.sum()
         w = w / s if s > 0 else np.zeros_like(w)
-        pred = booster.predict(Xte_z)
+        pred = booster.predict(Xte_z) if len(Xte_z) else np.array([])
         engine = "lightgbm-gbdt" + (f"x{len(models)}" if len(models) > 1 else "")
     else:
         w = _ridge(Xtr_z, ytr, alpha, sample_weight=train_weight)
@@ -809,7 +825,11 @@ async def run_ml_research(
     else:
         pred_train = booster.predict(Xtr_z)
         pred_val = booster.predict(Xval_z) if has_val else np.array([])
-    pred = Xte_z @ w if model_name == "ridge" else booster.predict(Xte_z)
+    pred = (
+        Xte_z @ w
+        if model_name == "ridge"
+        else (booster.predict(Xte_z) if len(Xte_z) else np.array([]))
+    )
 
     pred_flip = 1.0
     raw_rank = _spearman(pred_train, ytr)
@@ -839,7 +859,13 @@ async def run_ml_research(
             return None
         return round(fv, n) if not math.isnan(fv) else None
 
-    univariate = _univariate_block(Xte_z, yte, feature_cols, w, extras)
+    # 特征单因子诊断：优先用测试集，其次验证集，最后训练集（无测试集时仍有意义）
+    if yte.size:
+        univariate = _univariate_block(Xte_z, yte, feature_cols, w, extras)
+    elif has_val:
+        univariate = _univariate_block(Xval_z, yval, feature_cols, w, extras)
+    else:
+        univariate = _univariate_block(Xtr_z, ytr, feature_cols, w, extras)
     val_univariate = (
         _univariate_block(Xval_z, yval, feature_cols, w, extras) if has_val else None
     )

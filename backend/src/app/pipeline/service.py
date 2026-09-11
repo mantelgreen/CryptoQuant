@@ -160,9 +160,11 @@ def _normalize_config(cfg: dict[str, Any]) -> dict[str, Any]:
     )
     out["max_pick"] = max(2, min(12, int(cfg.get("max_pick") or 6)))
     out["max_rounds"] = int(cfg.get("max_rounds") or 5)
-    # 验证集比例：调参/因子精筛只在验证集上做，测试集仅最终报告一次（默认 0.15）
+    # 验证集比例：调参/因子精筛只在验证集上做；测试集默认不切（0），真正的样本外评价用回测窗
     vr = cfg.get("val_ratio")
     out["val_ratio"] = max(0.0, min(0.4, float(0.15 if vr is None else vr)))
+    tr = cfg.get("test_ratio")
+    out["test_ratio"] = max(0.0, min(0.5, float(0.0 if tr is None else tr)))
     # 稳健化 Winsorize：默认 1%（加密厚尾收益），抑制离群值对 L2/相关性过滤的扰动；显式传 0 可关闭
     wv = cfg.get("winsor")
     out["winsor"] = float(wv) if wv is not None else 0.01
@@ -679,7 +681,8 @@ async def _train(
         start=_parse_dt(cfg["research_start"]),
         end=_parse_dt(cfg["research_end"]),
         horizon=int(cfg.get("horizon") or 1),
-        test_ratio=float(cfg.get("test_ratio") or 0.25),
+        # 流水线默认 test_ratio=0：研究窗全部用于训练/验证，样本外评价交给回测窗（避免浪费 25% 训练样本）
+        test_ratio=float(cfg["test_ratio"]) if cfg.get("test_ratio") is not None else 0.0,
         val_ratio=float(cfg.get("val_ratio") or 0.0),
         alpha=float(cfg.get("alpha") or 1.0),
         max_corr=cfg.get("max_corr"),
@@ -748,7 +751,7 @@ async def _persist(
         resp=train_resp,
         start=_parse_dt(cfg["research_start"]),
         end=_parse_dt(cfg["research_end"]),
-        test_ratio=float(cfg.get("test_ratio") or 0.25),
+        test_ratio=float(cfg["test_ratio"]) if cfg.get("test_ratio") is not None else 0.0,
         winsor=cfg.get("winsor"),
         cost_bps=float(cfg.get("cost_bps") or 0.0),
     )
@@ -804,7 +807,10 @@ def _select_score(train_resp: dict[str, Any]) -> float | None:
 def evaluate_round(
     train_resp: dict[str, Any], bt: dict[str, Any], th: dict[str, Any]
 ) -> tuple[str, bool, float, dict[str, Any]]:
-    ml_ok = _ml_ok(train_resp, th, val=False)
+    # 研究窗内未切测试集时（流水线默认 test_ratio=0），模型层用验证集指标判定；
+    # 真正的样本外仍由独立回测窗把关（bt_ok）。
+    has_test = train_resp.get("oos_rank_ic") is not None or train_resp.get("oos_ic") is not None
+    ml_ok = _ml_ok(train_resp, th, val=not has_test)
     bm = bt.get("metrics") or {}
     tr = bm.get("total_return")
     excess = bm.get("excess_return")

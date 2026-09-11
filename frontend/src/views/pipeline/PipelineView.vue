@@ -492,9 +492,10 @@ function hasTrainCharts(r: PipelineRound | null): boolean {
 const detailCharts = computed<{ oos_charts?: MlOosCharts; learning?: MlLearning } | null>(() => {
   const t = detailRound.value?.train_result
   if (!t) return null
-  const has =
-    (t.oos_charts?.deciles?.length ?? 0) > 0 || (t.learning?.train?.length ?? 0) > 1
-  return has ? { oos_charts: t.oos_charts, learning: t.learning } : null
+  // 流水线默认不切研究窗内测试集 → 回退用验证集诊断图
+  const oc = (t.oos_charts?.deciles?.length ?? 0) > 0 ? t.oos_charts : t.val_charts
+  const has = (oc?.deciles?.length ?? 0) > 0 || (t.learning?.train?.length ?? 0) > 1
+  return has ? { oos_charts: oc, learning: t.learning } : null
 })
 
 // —— 样本数据弹窗 ——
