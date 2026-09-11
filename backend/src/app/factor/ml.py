@@ -167,6 +167,21 @@ def _clip_bounds(a: np.ndarray, q: float) -> tuple[np.ndarray, np.ndarray]:
     return lo, hi
 
 
+def _round_sig(v: Any, sig: int = 6) -> float:
+    """按有效数字舍入（而非定点小数位）。
+
+    加密货币高频收益的 MSE 常小到 1e-10 量级，若用 round(v, 8) 会被直接抹成 0，
+    导致学习曲线变成一条水平直线。按有效数字保留相对精度即可避免。
+    """
+    try:
+        fv = float(v)
+    except (TypeError, ValueError):
+        return 0.0
+    if fv == 0.0 or not math.isfinite(fv):
+        return fv
+    return float(f"{fv:.{sig}g}")
+
+
 def _std_feature(s: pd.Series, f: dict[str, Any]) -> pd.Series:
     """按模型保存的标准化口径对单列特征做稳健标准化（打分时与训练一致）。
 
@@ -314,7 +329,7 @@ def _build_oos_diag(
     # 1) 散点（抽稀到 max_scatter 内）
     for i in _downsample_idx(n, max_scatter):
         out["scatter"].append(
-            {"ts": _iso_ts(t[i]), "pred": round(float(p[i]), 6), "actual": round(float(a[i]), 6)}
+            {"ts": _iso_ts(t[i]), "pred": _round_sig(p[i]), "actual": _round_sig(a[i])}
         )
 
     # 2) 十分位单调性：分组数随样本量自适应（10 → 5 → 2），保证每桶非空
@@ -328,8 +343,8 @@ def _build_oos_diag(
         out["deciles"].append(
             {
                 "label": f"D{gi + 1}",
-                "mean_actual": round(float(a[mask].mean()), 6),
-                "mean_pred": round(float(p[mask].mean()), 6),
+                "mean_actual": _round_sig(a[mask].mean()),
+                "mean_pred": _round_sig(p[mask].mean()),
                 "n": int(mask.sum()),
             }
         )
@@ -704,14 +719,12 @@ async def run_ml_research(
                     if train_loss and oos_loss and len(train_loss) == len(oos_loss):
                         learning = {
                             "rounds": list(range(1, len(train_loss) + 1)),
-                            "train": [round(float(v), 8) for v in train_loss],
-                            "oos": [round(float(v), 8) for v in oos_loss],
+                            "train": [_round_sig(v) for v in train_loss],
+                            "oos": [_round_sig(v) for v in oos_loss],
                         }
                         if best_iteration:
                             learning["best_iteration"] = best_iteration
-                            learning["best_oos"] = round(
-                                float(oos_loss[best_iteration - 1]), 8
-                            )
+                            learning["best_oos"] = _round_sig(oos_loss[best_iteration - 1])
             except Exception:  # noqa: BLE001 - 单个种子失败不影响其它
                 logger.warning("ml.gbdt_seed_failed", seed=k)
         if not models:

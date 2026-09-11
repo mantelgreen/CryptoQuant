@@ -321,7 +321,7 @@ function learningOption(): EChartsOption {
         color: cssVar('--chart-axis'),
         fontSize: 10,
         fontFamily: 'JetBrains Mono Variable, monospace',
-        formatter: (v: number) => v.toExponential(0),
+        formatter: (v: number) => v.toExponential(1),
       },
     },
     series: [
