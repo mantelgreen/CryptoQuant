@@ -1,7 +1,10 @@
 # CryptoQuant · 数字币量化交易策略研究平台
 
-> 一个面向数字币的「数据 → 因子 → 策略 → 回测 → 模拟盘 → LLM 复盘」一站式研究平台。  
-> 当前进度：M0 设计+骨架 ✅ · M1 数据闭环（下载/定时/增量/CA/beat）大部分 ✅ · M1.5 实时行情 WS + 回测 SSE ✅ · M2 策略研究（模板/回测/指标卡）进行中 · 因子/AI 域为设计预览。
+> 搞模釜AgentSteamer智能体平台空闲时间换脑用的产物，你可以把它当成玩具，也可以当成因子研究学习平台
+> 模釜官网：<https://www.agentsteamer.com> 官方 Blog：<https://blog.agentsteamer.com>
+
+> 一个面向数字币的「数据 → 因子挖掘 -> 模型训练 → 回测 → 模拟盘 → LLM 复盘」一站式AI因子挖掘研究平台。  
+> 没有实盘
 
 ## 目录
 - [项目结构](#项目结构)
@@ -14,13 +17,6 @@
 ## 项目结构
 ```
 .
-├── doc/                          # 设计文档
-│   ├── 01-竞品对比分析.md
-│   ├── 02-币安API限制与下载最佳实践.md
-│   ├── 03-系统设计方案-v1.md
-│   ├── 04-系统设计方案-v2-review.md
-│   ├── 05-M1端到端验证手册.md
-│   └── 06-需求理解与设计方案核查.md
 ├── backend/                      # FastAPI 后端（包名 app）
 │   ├── src/app/                  # 业务包
 │   ├── alembic/                  # 迁移（0001 建表 / 0002 Continuous Aggregates）
@@ -131,31 +127,15 @@ npm run dev
 .\scripts\stop.ps1     # 停止全部
 ```
 
-## 设计文档
-
-| 文件 | 说明 |
-|---|---|
-| `doc/01-竞品对比分析.md` | TradingView / Binance / Coinglass / BigQuant / 米筐 / VectorBT / QuantConnect 等对比 |
-| `doc/02-币安API限制与下载最佳实践.md` | 限速 / 熔断 / 分页 / 增量续传策略 |
-| `doc/03-系统设计方案-v1.md` | 架构 / 技术栈 / 模块 / 数据模型 / API / 队列 |
-| `doc/04-系统设计方案-v2-review.md` | v1 review 版：权限矩阵 / 错误码 / 信息架构 / 工具 Schema / SQL / 路由表 / M0 清单 |
-| `doc/05-M1端到端验证手册.md` | M1 验收步骤（下载→worker→查库→前端→WS） |
-| `doc/06-需求理解与设计方案核查.md` | 需求拆解 / 覆盖度矩阵 / 扩充需求 EX1~EX11 |
-
 ## 里程碑
 
 | 里程碑 | 内容 | 状态 |
 |---|---|---|
 | **M0 设计 + 骨架** | 4+2 份设计文档 + 后端骨架 + DB 初始化 + 看板拉 ticker demo | ✅ |
-| M1 数据闭环 | 下载任务 / 定时(beat) / 增量续传 / Continuous Aggregates / 实时行情 WS / 回测进度 SSE | 🟡 后端大部分完成，CA/beat 已建 |
-| M2 策略 + 因子 v1 | 策略模板 / 向量化回测引擎 / 指标卡+资金曲线前端 / 因子研究 | 🟡 策略研究端到端 ✅；因子域开发中 |
-| M3 Agent v1 | FactorAgent / StrategyAgent / TraderAgent + pgvector + Token 用量页 | 🔴 未开始（UI 已出设计预览） |
-| M4 模拟盘 + 三路对比 | manual / strategy / llm 三账户 + 净值对比 | 🔴 未开始 |
+| M1 数据闭环 | 下载任务 / 定时(beat) / 增量续传 / Continuous Aggregates / 实时行情 WS / 回测进度 SSE | ✅ 后端完成，CA/beat 已建 |
+| M2 策略 + 因子 v1 | 策略模板 / 向量化回测引擎 / 指标卡+资金曲线前端 / 因子研究 | ✅ 策略研究端到端  |
+| M3 Agent v1 | FactorAgent / StrategyAgent / TraderAgent + pgvector + Token 用量页 | 🟡部分完成 |
+| M4 模拟盘 + 三路对比 | manual / strategy / llm 三账户 + 净值对比 | 🟡部分完成 |
 | M5 完善 | 主题 / 移动 / 监控告警 / 文档站 | 🟡 明暗主题已完成 |
 
-## 下一步
 
-- [ ] M1 收尾：下载任务取消/续传、订单簿 REST 缓存层
-- [ ] M2：因子研究后端（registry / IC / ML 多因子回测），替换因子页示例数据
-- [ ] M2：策略编辑器（代码版）+ 事件引擎/vectorbt 通道
-- [ ] M3：AgentScope 接入 + pgvector 检索 + Token 用量页
