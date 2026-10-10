@@ -1,6 +1,8 @@
 """策略模板 / 回测引擎 / 指标 单测（纯函数，不依赖 DB）。"""
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -63,6 +65,37 @@ def test_buy_and_hold_matches_benchmark() -> None:
     assert res["metrics"]["num_trades"] >= 1
 
 
+def test_evaluation_window_keeps_warmup_but_reports_only_holdout() -> None:
+    df = _trend_df(80)
+    cutoff = df.index[50]
+    res = run_backtest_vectorized(
+        df,
+        "buy_and_hold",
+        {},
+        cfg=BacktestConfig(fee_rate=0.0, slippage_bps=0.0),
+        evaluation_start=cutoff,
+    )
+
+    assert len(res["equity"]) == len(df) - 50
+    assert res["equity"].index[0] == cutoff
+    assert res["metrics"]["total_return"] == pytest.approx(
+        res["equity"].iloc[-1] / 100_000 - 1, abs=1e-6
+    )
+    first_holdout_return = df["open"].iloc[51] / df["open"].iloc[50] - 1
+    assert res["equity"].iloc[0] == pytest.approx(100_000 * (1 + first_holdout_return))
+
+
+def test_evaluation_start_after_data_is_rejected() -> None:
+    df = _trend_df(20)
+    with pytest.raises(ValueError, match="evaluation_start_after_data"):
+        run_backtest_vectorized(
+            df,
+            "buy_and_hold",
+            {},
+            evaluation_start=df.index[-1] + pd.Timedelta(days=1),
+        )
+
+
 def test_sma_cross_runs_and_no_nan() -> None:
     df = _trend_df(400)
     res = run_backtest_vectorized(
@@ -102,3 +135,16 @@ def test_compute_metrics_shape() -> None:
     m = res["metrics"]
     for k in ["total_return", "annual_return", "volatility", "sharpe", "sortino", "calmar", "max_drawdown"]:
         assert np.isfinite(m[k]), k
+
+
+def test_compute_metrics_produces_strict_json_for_unbounded_ratios() -> None:
+    equity = pd.Series([100.0, 110.0, 121.0])
+    metrics = compute_metrics(
+        equity,
+        "1d",
+        trades=[{"pnl": 1.0}],
+    )
+
+    assert metrics["sortino"] is None
+    assert metrics["profit_factor"] is None
+    json.dumps(metrics, allow_nan=False)

@@ -160,6 +160,7 @@ export interface PipelineRound {
     sample_train?: Array<Record<string, number | string>>
     sample_test?: Array<Record<string, number | string>>
     config?: Record<string, unknown>
+    artifact_ref?: string
     message?: string
   } | null
   backtest_summary: {
@@ -175,7 +176,13 @@ export interface PipelineRound {
       excess_return?: number
     }
     equity_points?: Array<{ ts: string; equity: number }>
-    summary?: { final_equity?: number | null; bars?: number }
+    summary?: {
+      symbol?: string
+      interval?: string
+      final_equity?: number | null
+      bars?: number
+      params?: { window?: number; enter_q?: number; exit_q?: number }
+    }
   } | null
   diagnosis: PipelineDiagnosis | null
   model_id: string | null
@@ -185,6 +192,39 @@ export interface PipelineRound {
 
 export async function startPipeline(payload: PipelineStartPayload): Promise<{ run_id: string; status: string }> {
   const { data } = await http.post<{ data: { run_id: string; status: string } }>('/pipeline/start', payload)
+  return data.data
+}
+
+export async function rerunPipeline(id: string): Promise<{ run_id: string; status: string }> {
+  const { data } = await http.post<{ data: { run_id: string; status: string } }>(`/pipeline/${id}/rerun`)
+  return data.data
+}
+
+export async function savePipelineRoundModel(id: string, roundNo: number): Promise<{ model_id: string; already_saved: boolean }> {
+  const { data } = await http.post<{ data: { model_id: string; already_saved: boolean } }>(`/pipeline/${id}/rounds/${roundNo}/save-model`)
+  return data.data
+}
+
+export interface PipelineBacktestRerunPayload {
+  symbol: string
+  start: string
+  end: string
+  window: number
+  enter_q: number
+  exit_q: number
+}
+
+export interface PipelineBacktestResult {
+  found: boolean
+  message?: string
+  metrics?: Record<string, number | null>
+  summary?: { symbol?: string; interval?: string; bars?: number; final_equity?: number | null; params?: { window?: number; enter_q?: number; exit_q?: number } }
+  equity_points?: Array<{ ts: string; equity: number }>
+  n_trades?: number
+}
+
+export async function rerunPipelineRoundBacktest(id: string, roundNo: number, payload: PipelineBacktestRerunPayload): Promise<PipelineBacktestResult> {
+  const { data } = await http.post<{ data: PipelineBacktestResult }>(`/pipeline/${id}/rounds/${roundNo}/backtest`, payload)
   return data.data
 }
 

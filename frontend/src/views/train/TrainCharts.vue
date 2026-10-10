@@ -56,6 +56,11 @@ const learnGain = computed(() => {
   if (!t || t.length < 2 || !t[0]) return null
   return (t[0] - t[t.length - 1]) / t[0]
 })
+const learnBestGain = computed(() => {
+  const oos = learning.value?.oos
+  if (!oos || oos.length < 2 || !oos[0]) return null
+  return (oos[0] - Math.min(...oos)) / oos[0]
+})
 
 const scatterR = computed(() => {
   const p = scatter.value
@@ -326,7 +331,7 @@ function learningOption(): EChartsOption {
         color: cssVar('--chart-axis'),
         fontSize: 10,
         fontFamily: 'JetBrains Mono Variable, monospace',
-        formatter: (v: number) => v.toExponential(1),
+        formatter: (v: number) => v.toExponential(3),
       },
     },
     series: [
@@ -455,14 +460,15 @@ onBeforeUnmount(() => {
     <section v-if="learning && (learning.train?.length ?? 0) > 1" class="panel p-3">
       <div class="mb-2 flex items-baseline justify-between gap-2">
         <p class="text-[11px] font-semibold uppercase tracking-wider text-subtle">LightGBM 训练曲线</p>
-        <p class="num text-[10px] text-muted">
-          <template v-if="learning.best_iteration">早停 @ #{{ learning.best_iteration }}（OOS {{ learning.best_oos != null ? learning.best_oos.toExponential(2) : '—' }}）· </template>
-          OOS 末段 {{ learning.oos?.[learning.oos.length - 1] != null ? learning.oos[learning.oos.length - 1].toExponential(2) : '—' }}
-        </p>
+        <div class="num text-[10px] text-muted">
+          <span v-if="learnGain != null">训练下降 {{ (learnGain * 100).toFixed(2) }}%</span>
+          <span v-if="learnBestGain != null"> · 验证最佳下降 {{ (learnBestGain * 100).toFixed(3) }}%</span>
+          <span v-if="learning.best_iteration"> · 早停 #{{ learning.best_iteration }}</span>
+        </div>
       </div>
-      <p class="mb-1 text-[10px] leading-snug text-subtle">每 boosting 轮的 MSE。虚线即早停选中的最优轮（此后 OOS 开始变差）；train 与 OOS 拉开的距离就是过拟合程度。</p>
+      <p class="mb-1 text-[10px] leading-snug text-subtle">每轮训练与验证 MSE；验证最佳下降量按首轮验证损失计算，坐标保留 3 位有效数字。虚线为早停选中的轮次。</p>
       <p v-if="learnGain != null && learnGain < 0.05" class="mb-1 rounded-md border border-warn/40 bg-warn/5 px-2 py-1 text-[10px] leading-snug text-warn">
-        训练损失几乎无下降（{{ (learnGain * 100).toFixed(1) }}%）：模型未能从这些因子上学到有效信号——通常是因子无预测力、样本不足，或因子被裁剪成了常数。
+        训练损失下降有限（{{ (learnGain * 100).toFixed(2) }}%）：本轮模型拟合增益较弱。若样本量充足，应优先核对因子与未来收益的对齐/预测力，并检查有效特征是否过少或树参数约束过强。
       </p>
       <div ref="learnEl" class="h-52 w-full" />
     </section>

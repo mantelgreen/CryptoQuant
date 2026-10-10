@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..core.json_sanitize import json_safe
 from ..data.models.orm import pipeline_rounds_table, pipeline_runs_table
 
 
@@ -21,7 +22,11 @@ class PipelineRunRepository:
         rid = uuid4()
         await self.db.execute(
             self._t.insert().values(
-                id=rid, name=name, config=config, status="pending", factor_pool=[]
+                id=rid,
+                name=name,
+                config=json_safe(config),
+                status="pending",
+                factor_pool=[],
             )
         )
         await self.db.commit()
@@ -61,7 +66,7 @@ class PipelineRunRepository:
         if best_model_id is not None:
             values["best_model_id"] = best_model_id
         if best_metrics is not None:
-            values["best_metrics"] = best_metrics
+            values["best_metrics"] = json_safe(best_metrics)
         if factor_pool is not None:
             values["factor_pool"] = factor_pool
         if stall_count is not None:
@@ -88,7 +93,7 @@ class PipelineRunRepository:
         await self.db.execute(
             self._t.update()
             .where(self._t.c.id == rid)
-            .values(best_model_id=model_id, best_metrics=metrics, stall_count=0)
+            .values(best_model_id=model_id, best_metrics=json_safe(metrics), stall_count=0)
         )
         await self.db.commit()
 
@@ -157,15 +162,15 @@ class PipelineRoundRepository:
         if status is not None:
             values["status"] = status
         if factors_generated is not None:
-            values["factors_generated"] = factors_generated
+            values["factors_generated"] = json_safe(factors_generated)
         if factors_picked is not None:
-            values["factors_picked"] = factors_picked
+            values["factors_picked"] = json_safe(factors_picked)
         if train_result is not None:
-            values["train_result"] = train_result
+            values["train_result"] = json_safe(train_result)
         if backtest_summary is not None:
-            values["backtest_summary"] = backtest_summary
+            values["backtest_summary"] = json_safe(backtest_summary)
         if diagnosis is not None:
-            values["diagnosis"] = diagnosis
+            values["diagnosis"] = json_safe(diagnosis)
         if model_id is not None:
             values["model_id"] = model_id
         if error is not None:

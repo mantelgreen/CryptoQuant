@@ -31,6 +31,9 @@ async def run_pipeline_round_task(ctx, run_id: str, round_no: int):  # noqa: ARG
             result = await run_round(session, run, round_no)
         except Exception as exc:  # noqa: BLE001
             logger.error("pipeline.round_failed", run_id=run_id, round_no=round_no, error=str(exc))
+            # A failed statement leaves the AsyncSession transaction aborted; clear it
+            # before writing the run's terminal status so the original failure is retained.
+            await session.rollback()
             await rrun.update_status(run["id"], status="failed", error=str(exc))
             await publish_progress(run_id, status="failed", round_no=round_no, error=str(exc))
             return

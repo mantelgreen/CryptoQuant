@@ -6,12 +6,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
-import numpy as np
 import pandas as pd
 
-from .metrics import compute_metrics, drawdown_series
+from .metrics import compute_metrics
 from .templates import run_template
 
 
@@ -23,12 +23,14 @@ class BacktestConfig:
     allow_short: bool = False
 
 
-def _apply_fees_slippage(position: pd.Series, price: pd.Series, cfg: BacktestConfig) -> pd.Series:
-    """目标仓位到实际执行：次根价格 + 手续费 + 滑点。
-
-    返回已扣除摩擦的收益率序列（按 bar）。
-    """
-    pos = position.reindex(price.index).fillna(0.0)
+def _apply_fees_slippage(
+    position: pd.Series,
+    open_price: pd.Series,
+    close_price: pd.Series,
+    cfg: BacktestConfig,
+) -> pd.Series:
+    """开盘执行目标仓位，持有至下一根开盘（最后一根持有至收盘）。"""
+    pos = position.reindex(open_price.index).fillna(0.0)
     if cfg.allow_short:
         pos = pos.clip(-1, 1)
     else:
@@ -37,10 +39,14 @@ def _apply_fees_slippage(position: pd.Series, price: pd.Series, cfg: BacktestCon
     # 目标仓位 diff = 换手（每根 bar 需要买卖的比例）
     trade = pos.diff().fillna(pos.iloc[0])
     cost_per_trade = cfg.fee_rate + cfg.slippage_bps / 10_000
-    # 收益：仓位 * 价格变动率 - 换手成本
-    ret = pos.shift(1).fillna(0.0) * price.pct_change().fillna(0.0) - trade.abs() * cost_per_trade
-    # 首根按初始仓位开仓，同样计成本
-    ret.iloc[0] = -abs(pos.iloc[0]) * cost_per_trade
+    # 仓位在本根 open 成交，赚取本根 open→下根 open 收益；末根以 close 结算。
+    next_open_return = open_price.shift(-1).div(open_price).sub(1.0)
+    if len(next_open_return):
+        next_open_return.iloc[-1] = close_price.iloc[-1] / open_price.iloc[-1] - 1.0
+    ret = pos * next_open_return.fillna(0.0) - trade.abs() * cost_per_trade
+    # 期末按最后收盘价平仓，避免未计退出手续费而高估净收益。
+    if len(ret):
+        ret.iloc[-1] -= abs(float(pos.iloc[-1])) * cost_per_trade
     return ret
 
 
@@ -50,6 +56,7 @@ def run_backtest_vectorized(
     params: dict[str, Any] | None = None,
     cfg: BacktestConfig | None = None,
     interval: str = "1d",
+    evaluation_start: datetime | pd.Timestamp | None = None,
 ) -> dict[str, Any]:
     """执行一次向量化回测。
 
@@ -63,34 +70,67 @@ def run_backtest_vectorized(
     # 目标仓位信号
     target = run_template(template_id, df, params)
 
-    price = df["close"]
-    pos = target.reindex(price.index).fillna(0.0)
+    # 模板用完整 K 线算信号，信号在收盘后可用；下一根 open 才能成交。
+    full_index = pd.DatetimeIndex(df.index)
+    signal = target.reindex(df.index).fillna(0.0)
+    fill_signal = signal.shift(1)
+    pos = fill_signal.fillna(0.0)
     if cfg.allow_short:
         pos = pos.clip(-1, 1)
     else:
         pos = pos.clip(0, 1)
 
+    if evaluation_start is not None:
+        cutoff = pd.Timestamp(evaluation_start)
+        if full_index.tz is None and cutoff.tzinfo is not None:
+            cutoff = cutoff.tz_localize(None)
+        elif full_index.tz is not None and cutoff.tzinfo is None:
+            cutoff = cutoff.tz_localize(full_index.tz)
+        elif full_index.tz is not None and cutoff.tzinfo is not None:
+            cutoff = cutoff.tz_convert(full_index.tz)
+        mask = full_index >= cutoff
+        if not mask.any():
+            raise ValueError("evaluation_start_after_data")
+        df = df.loc[mask]
+        signal = signal.loc[df.index]
+        fill_signal = fill_signal.loc[df.index]
+        pos = pos.loc[df.index]
+
+    price = df["open"]
+    close = df["close"]
+
     # 收益序列（含摩擦）
-    rets = _apply_fees_slippage(pos, price, cfg)
+    rets = _apply_fees_slippage(pos, price, close, cfg)
 
     equity = cfg.initial_cash * (1 + rets).cumprod()
     equity.index = pd.to_datetime(df.index)
 
     # 从仓位 diff 提取成交记录（含触发信号值与摊薄成本估算的已实现 PnL）
-    trades = _extract_trades(pos, target, price, df.index, cfg, params.get("symbol", ""))
+    trades = _extract_trades(
+        pos, fill_signal, price, close, df.index, cfg, params.get("symbol", "")
+    )
 
+    turnover_fraction = pos.diff().abs().fillna(abs(float(pos.iloc[0])) if len(pos) else 0.0)
+    if len(turnover_fraction):
+        turnover_fraction.iloc[-1] += abs(float(pos.iloc[-1]))
+    capital_before_trade = equity.shift(1).fillna(cfg.initial_cash)
+    traded_notional = float((turnover_fraction * capital_before_trade).sum())
     metrics = compute_metrics(
         equity=equity,
         interval=interval,
         trades=trades,
-        trade_notional=float((trades[0].get("notional", 0) if trades else 0) * 2) if trades else 0.0,
+        trade_notional=traded_notional,
+        initial_equity=cfg.initial_cash,
     )
 
-    dd = drawdown_series(equity)
+    dd = equity / equity.cummax().clip(lower=cfg.initial_cash) - 1.0
+    bar_returns = equity.pct_change().fillna(0.0)
+    if len(bar_returns):
+        bar_returns.iloc[0] = equity.iloc[0] / cfg.initial_cash - 1.0
 
     return {
         "equity": equity,
-        "returns": equity.pct_change().fillna(0.0),
+        "returns": bar_returns,
         "drawdown": dd,
         "metrics": metrics,
         "trades": trades,
@@ -116,6 +156,7 @@ def _extract_trades(
     pos: pd.Series,
     target: pd.Series,
     price: pd.Series,
+    close_price: pd.Series,
     idx: pd.DatetimeIndex,
     cfg: BacktestConfig,
     symbol: str,
@@ -202,5 +243,26 @@ def _extract_trades(
             "position": round(next_pos, 6),
             "basis": round(basis, 8),
             "reason": _leg_reason(prev_pos, next_pos),
+        })
+
+    # 回测区间末按最后收盘价强制平仓，与收益序列中的期末退出费用一致。
+    if len(pos) and abs(float(pos.iloc[-1])) >= eps:
+        px = float(close_price.iloc[-1])
+        qty = abs(float(pos.iloc[-1]))
+        fee = px * qty * cfg.fee_rate
+        realized = _close_realized(px, qty)
+        trades.append({
+            "ts": str(pd.to_datetime(idx[-1])),
+            "symbol": symbol,
+            "side": "sell" if pos.iloc[-1] > 0 else "buy",
+            "price": round(px, 8),
+            "qty": round(qty, 8),
+            "fee": round(fee, 6),
+            "notional": round(px * qty, 6),
+            "pnl": round(realized, 6),
+            "signal": round(_signal(len(pos) - 1), 6),
+            "position": 0.0,
+            "basis": round(avg_cost, 8),
+            "reason": "期末平仓",
         })
     return trades

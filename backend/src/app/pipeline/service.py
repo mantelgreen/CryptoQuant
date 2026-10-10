@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID
 
@@ -227,6 +227,104 @@ async def start_pipeline(db: AsyncSession, config: dict[str, Any]) -> dict[str, 
     return {"run_id": str(rid), "status": "pending"}
 
 
+async def rerun_pipeline(db: AsyncSession, run_id: UUID) -> dict[str, Any] | None:
+    """以原配置创建全新的流水线 run。"""
+    run = await PipelineRunRepository(db).get(run_id)
+    if not run:
+        return None
+    config = dict(run["config"] or {})
+    config["name"] = f"{str(run['name'])[:92]} · 重跑 {datetime.now():%m%d%H%M%S}"
+    return await start_pipeline(db, config)
+
+
+async def save_round_model(
+    db: AsyncSession, run_id: UUID, round_no: int
+) -> dict[str, Any] | None:
+    run = await PipelineRunRepository(db).get(run_id)
+    if not run:
+        return None
+    rounds = PipelineRoundRepository(db)
+    row = await rounds.get_by_no(run_id, round_no)
+    if not row:
+        return None
+    if row.get("model_id"):
+        return {"model_id": str(row["model_id"]), "already_saved": True}
+    train = dict(row.get("train_result") or {})
+    cfg = {**(run.get("config") or {}), **(train.get("config") or {})}
+    cfg.setdefault("research_symbols", train.get("symbols") or [])
+    cfg.setdefault("research_interval", train.get("interval"))
+    artifact = await _round_artifact(db, row, train, cfg)
+    train["artifact"] = artifact
+    saved = await _persist(db, cfg, train, round_no, run["name"])
+    await rounds.update(row["id"], model_id=UUID(saved["model_id"]))
+    return {"model_id": saved["model_id"], "already_saved": False, "name": saved["name"]}
+
+
+async def rerun_round_backtest(
+    db: AsyncSession,
+    run_id: UUID,
+    round_no: int,
+    *,
+    symbol: str,
+    start: datetime,
+    end: datetime,
+    window: int,
+    enter_q: float,
+    exit_q: float,
+) -> dict[str, Any] | None:
+    run = await PipelineRunRepository(db).get(run_id)
+    if not run:
+        return None
+    row = await PipelineRoundRepository(db).get_by_no(run_id, round_no)
+    if not row:
+        return None
+    train = row.get("train_result") or {}
+    cfg = run.get("config") or {}
+    interval = train.get("interval") or cfg.get("research_interval")
+    effective_cfg = {**cfg, **(train.get("config") or {})}
+    effective_cfg.setdefault("research_symbols", train.get("symbols") or [])
+    effective_cfg.setdefault("research_interval", interval)
+    artifact = await _round_artifact(db, row, train, effective_cfg)
+    from ..data.repository.kline_repo import KlineRepository
+    from .backtest import run_pipeline_backtest
+
+    result = await run_pipeline_backtest(
+        KlineRepository(db), symbol=symbol.strip().upper(), interval=interval,
+        start=start, end=end, artifact=artifact,
+        training_start=_parse_dt(cfg["research_start"]), window=window,
+        enter_q=enter_q, exit_q=exit_q,
+    )
+    return result
+
+
+async def _round_artifact(
+    db: AsyncSession,
+    row: dict[str, Any],
+    train: dict[str, Any],
+    cfg: dict[str, Any],
+) -> dict[str, Any]:
+    """读取候选模型；旧轮次没有候选文件时按已记录因子与参数重训。"""
+    artifact_ref = train.get("artifact_ref")
+    if artifact_ref:
+        from ..factor.ml import load_model_pickle
+
+        return load_model_pickle(str(artifact_ref))
+    from ..core.errors import BadRequest
+
+    if not train.get("found"):
+        raise BadRequest("本轮训练未产出模型，无法保存或重跑回测")
+    codes = [
+        str(item.get("code"))
+        for item in (row.get("factors_picked") or [])
+        if isinstance(item, dict) and item.get("code")
+    ]
+    retrained = await _train(db, cfg, codes)
+    artifact = retrained.get("artifact") if retrained.get("found") else None
+    if not isinstance(artifact, dict):
+        raise BadRequest(retrained.get("message") or "按本轮配置重训失败，无法生成模型")
+    return artifact
+
+
 async def stop_pipeline(db: AsyncSession, run_id: UUID) -> bool:
     rrun = PipelineRunRepository(db)
     run = await rrun.get(run_id)
@@ -402,6 +500,15 @@ async def run_round(
                 break
             diagnosis = await _diagnose(db, active_cfg, train_resp, None, name_map, "warn")
 
+    # 训练 artifact 是用户稍后保存模型/重跑回测的必要数据；只存磁盘引用，
+    # 不创建模型库记录，避免模型成绩门槛替用户做保存决定。
+    artifact_ref = None
+    if train_resp.get("found") and isinstance(train_resp.get("artifact"), dict):
+        from uuid import uuid4
+        from ..factor.ml import save_model_pickle
+
+        artifact_ref = save_model_pickle(uuid4(), train_resp["artifact"])
+
     # 5. backtest：真正的样本外持有窗，调参结束后只跑一次
     await mark("backtest", stage_idx=4, message="样本外回测")
     bt = await _backtest(db, active_cfg, train_resp)
@@ -490,7 +597,10 @@ async def run_round(
         status="done",
         factors_generated=[_factor_detail(c) for c in new_codes],
         factors_picked=[_factor_detail(c) for c in picked],
-        train_result=_trim_train(train_resp, active_cfg),
+        train_result={
+            **_trim_train(train_resp, active_cfg),
+            **({"artifact_ref": artifact_ref} if artifact_ref else {}),
+        },
         backtest_summary={
             "metrics": bt.get("metrics"),
             "summary": bt.get("summary"),
@@ -632,13 +742,39 @@ async def _research_pool(
         return []
     from ..factor.service import run_factor_research_batch
 
+    # Factor ranking is model selection too: cap research at the training boundary,
+    # leaving validation/test observations unseen by the AI factor picker.
+    start = _parse_dt(cfg["research_start"])
+    end = _parse_dt(cfg["research_end"])
+    bar_seconds = {
+        "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
+        "1h": 3600, "2h": 7200, "4h": 14400, "6h": 21600,
+        "8h": 28800, "12h": 43200, "1d": 86400, "3d": 259200,
+        "1w": 604800, "1M": 2592000,
+    }.get(cfg["research_interval"])
+    if bar_seconds:
+        n_bars = max(1, int((end - start).total_seconds() / bar_seconds))
+        test_ratio = float(cfg.get("test_ratio") or 0.0)
+        val_ratio = float(cfg.get("val_ratio") or 0.0)
+        n_test = max(30, int(n_bars * test_ratio)) if test_ratio > 0 else 0
+        n_val = max(30, int(n_bars * val_ratio)) if val_ratio > 0 else 0
+        if val_ratio > 0 and n_bars - n_test - n_val < 60:
+            n_val = 0
+        purge = max(1, int(cfg.get("horizon") or 1))
+        reserve = n_test + (2 * purge if n_val else (purge if n_test else 0)) + n_val
+        selection_end = end - timedelta(seconds=bar_seconds * reserve)
+        if selection_end <= start:
+            logger.warning("pipeline.factor_selection_window_too_short")
+            return []
+        end = selection_end
+
     return await run_factor_research_batch(
         db,
         codes=codes,
         symbols=cfg["research_symbols"],
         interval=cfg["research_interval"],
-        start=_parse_dt(cfg["research_start"]),
-        end=_parse_dt(cfg["research_end"]),
+        start=start,
+        end=end,
     )
 
 
@@ -733,6 +869,7 @@ async def _backtest(
         start=_parse_dt(cfg["backtest_start"]),
         end=_parse_dt(cfg["backtest_end"]),
         artifact=train_resp["artifact"],
+        training_start=_parse_dt(cfg["research_start"]),
         window=int(cfg.get("bt_window") or 60),
         enter_q=float(cfg.get("bt_enter_q") or 0.8),
         exit_q=float(cfg.get("bt_exit_q") or 0.2),

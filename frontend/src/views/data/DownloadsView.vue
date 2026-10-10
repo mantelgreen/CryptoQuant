@@ -16,7 +16,7 @@ const pageHelp: PageHelp = {
   terms: [
     { term: '全量 vs 增量', desc: '全量=按所选起止区间完整拉取；增量=从库里最后一根 K 线自动续到“现在”（无历史则回补近 30 天）。' },
     { term: 'interval 颗粒度', desc: '数据周期：1m/5m/15m/1h/1d…。建议先下 1m 底库，15m/1h/1d 可由平台按时间桶自动聚合。' },
-    { term: 'Bars', desc: '已入库的 K 线根数；1 根 = 一个周期的 OHLCV。' },
+    { term: '新增 / 覆盖', desc: '新增=本次任务真正插入的新行数（已存在的按主键去重跳过，故重复区间常显示 0）；覆盖=该起止区间本地已入库的总根数。1 根 = 一个周期的 OHLCV。' },
     { term: 'gaps 缺口', desc: '币安按每页最多 1000 根返回，若发现相邻两根时间不连续会记录缺口区间，便于重补。' },
     { term: '币安限速（权重）', desc: 'Binance 按“权重/分钟”计数（默认软上限 4500，单次 klines 记 2）。平台内置令牌桶 + 自适应退避，避免触发封 IP。' },
     { term: 'TimescaleDB', desc: '时序数据库。K 线按时间自动切成 7 天的 chunk（桶），写入/查询自动路由，另有 1m→5m/15m/1h/1d 的连续聚合(CA)物化视图。' },
@@ -109,6 +109,9 @@ async function submit() {
 
 function bars(j: DownloadJob): string {
   return j.downloaded_bars ? fmtCompact(j.downloaded_bars) : '0'
+}
+function covered(j: DownloadJob): string {
+  return j.covered_bars ? fmtCompact(j.covered_bars) : '0'
 }
 function errMsg(j: DownloadJob): string {
   return j.error ? (String(j.error).length > 60 ? String(j.error).slice(0, 60) + '…' : String(j.error)) : ''
@@ -209,7 +212,8 @@ onBeforeUnmount(stopPoll)
               <th>交易对</th>
               <th>粒度</th>
               <th class="text-right">状态</th>
-              <th class="text-right">Bars</th>
+              <th class="text-right" title="本次任务真正新插入的行数（已存在的会去重跳过）">新增</th>
+              <th class="text-right" title="该起止区间本地已入库的 K 线根数">覆盖</th>
               <th class="text-right">起止区间</th>
               <th class="text-right">创建</th>
             </tr>
@@ -225,7 +229,8 @@ onBeforeUnmount(stopPoll)
                   <span v-if="j.status === 'failed' && errMsg(j)" class="max-w-[180px] truncate text-xs text-down" :title="String(j.error)">{{ errMsg(j) }}</span>
                 </div>
               </td>
-              <td class="num tbl-num font-medium text-fg">{{ bars(j) }}</td>
+              <td class="num tbl-num text-subtle">{{ bars(j) }}</td>
+              <td class="num tbl-num font-medium text-fg">{{ covered(j) }}</td>
               <td class="tbl-num text-xs text-subtle">
                 {{ fmtStamp(j.start_time) }}<span class="mx-1 text-strong">→</span>{{ fmtStamp(j.end_time) }}
               </td>

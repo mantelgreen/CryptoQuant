@@ -20,6 +20,9 @@ from ...pipeline.service import (
     delete_pipeline,
     get_pipeline_detail,
     list_pipelines,
+    rerun_pipeline,
+    rerun_round_backtest,
+    save_round_model,
     start_pipeline,
     stop_pipeline,
 )
@@ -77,12 +80,61 @@ class PipelineStartReq(BaseModel):
     stop_on_excellent: bool = True
 
 
+class PipelineBacktestRerunReq(BaseModel):
+    symbol: str = Field(..., min_length=3, max_length=40)
+    start: datetime
+    end: datetime
+    window: int = Field(default=60, ge=20, le=240)
+    enter_q: float = Field(default=0.8, ge=0.5, le=0.95)
+    exit_q: float = Field(default=0.2, ge=0.05, le=0.5)
+
+
 @router.post("/start")
 async def pipeline_start(
     req: PipelineStartReq = Body(...),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     data = await start_pipeline(db, req.model_dump())
+    return {"code": "OK", "message": "ok", "data": data}
+
+
+@router.post("/{run_id}/rerun")
+async def pipeline_rerun(
+    run_id: UUID, db: AsyncSession = Depends(get_db)
+) -> dict[str, Any]:
+    data = await rerun_pipeline(db, run_id)
+    if data is None:
+        raise NotFound("pipeline_not_found")
+    return {"code": "OK", "message": "ok", "data": data}
+
+
+@router.post("/{run_id}/rounds/{round_no}/save-model")
+async def pipeline_save_round_model(
+    run_id: UUID, round_no: int, db: AsyncSession = Depends(get_db)
+) -> dict[str, Any]:
+    data = await save_round_model(db, run_id, round_no)
+    if data is None:
+        raise NotFound("pipeline_or_round_not_found")
+    return {"code": "OK", "message": "ok", "data": data}
+
+
+@router.post("/{run_id}/rounds/{round_no}/backtest")
+async def pipeline_rerun_round_backtest(
+    run_id: UUID,
+    round_no: int,
+    req: PipelineBacktestRerunReq,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    if req.end <= req.start:
+        from ...core.errors import BadRequest
+
+        raise BadRequest("backtest_end_must_be_after_start")
+    data = await rerun_round_backtest(
+        db, run_id, round_no, symbol=req.symbol, start=req.start, end=req.end,
+        window=req.window, enter_q=req.enter_q, exit_q=req.exit_q,
+    )
+    if data is None:
+        raise NotFound("pipeline_or_round_not_found")
     return {"code": "OK", "message": "ok", "data": data}
 
 

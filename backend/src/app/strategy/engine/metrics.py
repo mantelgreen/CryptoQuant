@@ -9,6 +9,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from ...core.json_sanitize import json_safe
+
 # 每年 bar 数（近似），按颗粒度换算年化
 BARS_PER_YEAR: dict[str, float] = {
     "1m": 365 * 24 * 60,
@@ -117,7 +119,7 @@ def win_rate(trades: list[dict[str, Any]]) -> float:
 
 
 def profit_factor(trades: list[dict[str, Any]]) -> float:
-    """盈亏比：总盈利 / 总亏损绝对值。无亏损返回 inf（前端渲染为 "∞"）。"""
+    """盈亏比：总盈利 / 总亏损绝对值。无亏损时原始比值为 inf。"""
     if not trades:
         return 0.0
     gross_profit = sum(float(t.get("pnl", 0) or 0) for t in trades if float(t.get("pnl", 0) or 0) > 0)
@@ -141,19 +143,32 @@ def compute_metrics(
     trades: list[dict[str, Any]] | None = None,
     trade_notional: float = 0.0,
     benchmark: pd.Series | None = None,
+    initial_equity: float | None = None,
 ) -> dict[str, Any]:
     """汇总指标卡所需全部指标。"""
     trades = trades or []
     rets = equity_to_returns(equity)
-    mdd = max_drawdown(equity)
+    if initial_equity is not None and len(equity):
+        first_ret = float(equity.iloc[0] / initial_equity - 1.0)
+        rets = pd.concat([pd.Series([first_ret]), rets], ignore_index=True)
+        running_peak = equity.cummax().clip(lower=float(initial_equity))
+        mdd = float((equity / running_peak - 1.0).min())
+        total = float(equity.iloc[-1] / initial_equity - 1.0)
+        periods = len(equity)
+        ratio = float(equity.iloc[-1] / initial_equity)
+        ann = float(ratio ** (_annual_factor(interval) / max(periods, 1)) - 1) if ratio > 0 else -1.0
+    else:
+        mdd = max_drawdown(equity)
+        total = total_return(equity)
+        ann = annual_return(equity, interval)
 
     m: dict[str, Any] = {
-        "total_return": round(total_return(equity), 6),
-        "annual_return": round(annual_return(equity, interval), 6),
+        "total_return": round(total, 6),
+        "annual_return": round(ann, 6),
         "volatility": round(volatility(rets, interval), 6),
         "sharpe": round(sharpe_ratio(rets, interval), 3),
         "sortino": round(sortino_ratio(rets, interval), 3),
-        "calmar": round(calmar_ratio(rets, equity, interval), 3),
+        "calmar": round(ann / abs(mdd), 3) if mdd < 0 else 0.0,
         "max_drawdown": round(mdd, 6),
         "win_rate": round(win_rate(trades), 4),
         "profit_factor": round(profit_factor(trades), 3) if trades else 0.0,
@@ -177,4 +192,4 @@ def compute_metrics(
                 r_rf = 0.0
                 m["alpha"] = round(float(joined.iloc[:, 0].mean() * _annual_factor(interval) - r_rf - beta * (joined.iloc[:, 1].mean() * _annual_factor(interval) - r_rf)), 4)
 
-    return m
+    return json_safe(m)

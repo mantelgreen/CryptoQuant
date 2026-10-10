@@ -357,13 +357,13 @@ const metricCards: Array<{ key: string; label: string; fmt: 'pct' | 'ratio' | 'c
 const primaryMetrics = metricCards.filter((c) => ['total_return', 'annual_return', 'max_drawdown'].includes(c.key))
 const readoutMetrics = metricCards.filter((c) => !['total_return', 'annual_return', 'max_drawdown'].includes(c.key))
 
-function metricValue(key: string): number | undefined {
-  return (detail.value?.backtest.summary?.metrics as Record<string, number> | undefined)?.[key]
+function metricValue(key: string): number | null | undefined {
+  return (detail.value?.backtest.summary?.metrics as Record<string, number | null> | undefined)?.[key]
 }
 
 function metricText(card: { key: string; fmt: string }): string {
   const v = metricValue(card.key)
-  if (v === undefined) return '—'
+  if (v == null) return '—'
   switch (card.fmt) {
     case 'pct':
       return fmtPct(v * 100, 1)
@@ -382,7 +382,7 @@ function metricText(card: { key: string; fmt: string }): string {
 
 function metricTone(card: { key: string }): string {
   const v = metricValue(card.key)
-  if (v === undefined) return 'text-muted'
+  if (v == null) return 'text-muted'
   if (card.key === 'max_drawdown') return 'text-down'
   if (card.key === 'volatility') return 'text-muted'
   if (card.key === 'win_rate' || card.key === 'num_trades') return 'text-fg'

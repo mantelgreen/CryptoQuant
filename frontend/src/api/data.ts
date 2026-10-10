@@ -10,6 +10,7 @@ export interface DownloadJob {
   status: 'pending' | 'running' | 'succeeded' | 'failed'
   downloaded_bars: number | null
   total_bars: number | null
+  covered_bars?: number | null
   gaps: unknown[] | null
   error: string | null
   created_at: string

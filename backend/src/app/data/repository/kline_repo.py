@@ -377,10 +377,46 @@ class DownloadJobRepository:
         return dict(row._mapping) if row else None
 
     async def list_recent(self, limit: int = 50) -> list[dict[str, Any]]:
-        result = await self.db.execute(
-            select(self._t).order_by(desc(self._t.c.created_at)).limit(limit)
+        """最近下载任务；附带 covered_bars = 该区间本地已入库根数（非本次新增）。
+
+        downloaded_bars 只统计本次真正插入的行（ON CONFLICT DO NOTHING），
+        重复下载已覆盖区间时会显示为 0/极小值，故额外给出区间覆盖根数。
+        """
+        sql = text(
+            """
+            SELECT j.*, COALESCE(c.cnt, 0) AS covered_bars
+            FROM download_jobs j
+            LEFT JOIN LATERAL (
+                SELECT count(*) AS cnt
+                FROM klines k
+                WHERE k.symbol = j.symbol
+                  AND k.interval = j.interval
+                  AND k.open_time >= j.start_time
+                  AND k.open_time <= j.end_time
+            ) c ON TRUE
+            ORDER BY j.created_at DESC
+            LIMIT :limit
+            """
         )
+        result = await self.db.execute(sql, {"limit": limit})
         return [dict(row._mapping) for row in result]
+
+    async def covered_bars(self, job_id: UUID) -> int:
+        """单个任务区间的本地已入库根数。"""
+        sql = text(
+            """
+            SELECT COALESCE(count(*), 0) AS cnt
+            FROM download_jobs j
+            JOIN klines k
+              ON k.symbol = j.symbol
+             AND k.interval = j.interval
+             AND k.open_time >= j.start_time
+             AND k.open_time <= j.end_time
+            WHERE j.id = :job_id
+            """
+        )
+        result = await self.db.execute(sql, {"job_id": job_id})
+        return int(result.scalar_one() or 0)
 
     async def update_status(
         self,

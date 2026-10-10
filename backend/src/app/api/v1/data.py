@@ -116,6 +116,7 @@ async def get_download(
     item = await repo.get(job_id)
     if not item:
         raise NotFound("download_job_not_found")
+    item["covered_bars"] = await repo.covered_bars(job_id)
     return {"code": "OK", "message": "ok", "data": item}
 
 

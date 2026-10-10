@@ -20,6 +20,8 @@ import {
 import PageHeader from '@/components/ui/PageHeader.vue'
 import Modal from '@/components/ui/Modal.vue'
 import StateView from '@/components/ui/StateView.vue'
+import Tip from '@/components/ui/Tip.vue'
+import EquityChart from '@/components/chart/EquityChart.vue'
 import TrainCharts from '@/views/train/TrainCharts.vue'
 import { useToastStore } from '@/stores/toast'
 import {
@@ -28,6 +30,10 @@ import {
   listPipelines,
   startPipeline,
   stopPipeline,
+  rerunPipeline,
+  savePipelineRoundModel,
+  rerunPipelineRoundBacktest,
+  type PipelineBacktestResult,
   type PipelineDiagnosis,
   type PipelineRound,
   type PipelineRun,
@@ -93,11 +99,12 @@ const form = reactive({
   backtestSymbol: 'BTCUSDT',
   backtestStart: daysAgo(180),
   backtestEnd: localDate(new Date()),
-  factorCount: 4,
-  maxPick: 6,
+  factorCount: 3,
+  maxPick: 4,
   model: 'ridge',
   horizon: 1,
   testRatio: 0.25,
+  valRatio: 0.15,
   alpha: 1,
   seedEnsemble: 3,
   btWindow: 60,
@@ -114,6 +121,7 @@ const history = ref<PipelineRun[]>([])
 const livePhase = ref('')
 const liveRound = ref(0)
 const starting = ref(false)
+const rerunning = ref(false)
 const loadingDetail = ref(false)
 let es: EventSource | null = null
 let sseRunId: string | null = null
@@ -239,6 +247,7 @@ async function confirmStart() {
       model: form.model as 'ridge' | 'gbdt',
       horizon,
       test_ratio: form.testRatio,
+      val_ratio: form.valRatio,
       alpha: form.alpha,
       seed_ensemble: clampInt(form.seedEnsemble, 1, 10, 3),
       bt_window: clampInt(form.btWindow, 20, 240, 60),
@@ -268,6 +277,33 @@ async function stop() {
     await loadDetail(activeRun.value.id)
   } catch (e: unknown) {
     toast.error('停止失败', errText(e))
+  }
+}
+
+async function rerun(run: PipelineRun) {
+  rerunning.value = true
+  try {
+    const { run_id } = await rerunPipeline(run.id)
+    toast.success('已创建重跑流水线', run_id.slice(0, 8))
+    await loadHistory()
+    selectedTab.value = 'active'
+    await loadDetail(run_id)
+    openSse(run_id)
+  } catch (e: unknown) {
+    toast.error('重跑失败', errText(e))
+  } finally {
+    rerunning.value = false
+  }
+}
+
+async function saveRoundModel(r: PipelineRound) {
+  if (!activeRun.value) return
+  try {
+    const saved = await savePipelineRoundModel(activeRun.value.id, r.round_no)
+    r.model_id = saved.model_id
+    toast.success(saved.already_saved ? '模型已保存' : '模型保存成功', saved.model_id.slice(0, 8))
+  } catch (e: unknown) {
+    toast.error('保存模型失败', errText(e))
   }
 }
 
@@ -495,12 +531,55 @@ function isCollapsed(id: string): boolean {
 
 // —— 训练详情弹窗 ——
 const detailRound = ref<PipelineRound | null>(null)
+const backtestRound = ref<PipelineRound | null>(null)
+const backtestRerun = ref<PipelineBacktestResult | null>(null)
+const backtestLoading = ref(false)
+const backtestForm = reactive({ symbol: '', start: '', end: '', window: 60, enterQ: 0.8, exitQ: 0.2 })
 function openDetail(r: PipelineRound) {
   detailRound.value = r
+}
+function openBacktest(r: PipelineRound) {
+  backtestRound.value = r
+  backtestRerun.value = null
+  const cfg = activeRun.value?.config
+  const summary = r.backtest_summary?.summary
+  backtestForm.symbol = summary?.symbol ?? cfg?.backtest_symbol ?? ''
+  backtestForm.start = String(cfg?.backtest_start ?? '').slice(0, 10)
+  backtestForm.end = String(cfg?.backtest_end ?? '').slice(0, 10)
+  backtestForm.window = summary?.params?.window ?? Number(cfg?.bt_window ?? 60)
+  backtestForm.enterQ = summary?.params?.enter_q ?? Number(cfg?.bt_enter_q ?? 0.8)
+  backtestForm.exitQ = summary?.params?.exit_q ?? Number(cfg?.bt_exit_q ?? 0.2)
+}
+async function runBacktestAgain() {
+  if (!activeRun.value || !backtestRound.value) return
+  backtestLoading.value = true
+  try {
+    backtestRerun.value = await rerunPipelineRoundBacktest(activeRun.value.id, backtestRound.value.round_no, {
+      symbol: backtestForm.symbol,
+      start: isoOf(backtestForm.start),
+      end: isoOf(backtestForm.end, true),
+      window: clampInt(backtestForm.window, 20, 240, 60),
+      enter_q: Number(backtestForm.enterQ),
+      exit_q: Number(backtestForm.exitQ),
+    })
+    if (!backtestRerun.value.found) toast.info('回测未完成', backtestRerun.value.message ?? '没有可用数据')
+  } catch (e: unknown) {
+    toast.error('重跑回测失败', errText(e))
+  } finally {
+    backtestLoading.value = false
+  }
 }
 function closeDetail() {
   detailRound.value = null
 }
+const backtestPoints = computed(() =>
+  (backtestRerun.value?.equity_points ?? backtestRound.value?.backtest_summary?.equity_points ?? []).map((p) => ({
+    ts: p.ts,
+    value: p.equity,
+  })),
+)
+const backtestMetrics = computed(() => backtestRerun.value?.metrics ?? backtestRound.value?.backtest_summary?.metrics)
+const backtestSummary = computed(() => backtestRerun.value?.summary ?? backtestRound.value?.backtest_summary?.summary)
 function hasTrainCharts(r: PipelineRound | null): boolean {
   const t = r?.train_result
   if (!t) return false
@@ -742,15 +821,24 @@ onBeforeUnmount(() => {
 
           <div class="grid grid-cols-2 gap-2.5">
             <div class="field">
-              <label class="label" for="pipeline-research-start">测试（研究）起点</label>
+              <label class="label" for="pipeline-research-start">研究数据起点</label>
               <input id="pipeline-research-start" v-model="form.researchStart" type="date" class="input font-mono" :max="form.researchEnd" />
             </div>
             <div class="field">
-              <label class="label" for="pipeline-research-end">测试（研究）结束</label>
+              <label class="label" for="pipeline-research-end">研究数据截止日</label>
               <input id="pipeline-research-end" v-model="form.researchEnd" type="date" class="input font-mono" :min="form.researchStart" />
             </div>
           </div>
+          <p class="-mt-2 text-[11px] leading-relaxed text-subtle">
+            研究窗口用于因子筛选和模型训练；窗口内会按时间拆分训练、验证与内部测试数据。避免使用过多相关因子，单币种默认每轮生成 3 个、最多选 4 个。
+          </p>
 
+          <div class="rounded-lg border border-primary/20 bg-primary/5 p-3">
+            <p class="text-xs font-semibold text-fg">后续样本外回测区间</p>
+            <p class="mt-1 text-[11px] leading-relaxed text-subtle">
+              下面的回测区间必须晚于研究截止日。它用于检查模型在未参与训练的数据上的表现；多轮运行会反复使用此区间，结果应作为诊断参考，不能视为独立的最终验证。
+            </p>
+          </div>
           <div class="grid grid-cols-2 gap-2.5">
             <div class="field">
               <label class="label" for="pipeline-backtest-symbol">回测标的</label>
@@ -767,7 +855,7 @@ onBeforeUnmount(() => {
 
           <div class="grid grid-cols-2 gap-2.5">
             <div class="field">
-              <label class="label" for="pipeline-backtest-start">回测起点（晚于结束）</label>
+              <label class="label" for="pipeline-backtest-start">回测起点（不早于研究截止日）</label>
               <input id="pipeline-backtest-start" v-model="form.backtestStart" type="date" class="input font-mono" :min="form.researchEnd" :max="form.backtestEnd" />
             </div>
             <div class="field">
@@ -776,6 +864,21 @@ onBeforeUnmount(() => {
             </div>
           </div>
 
+          <details class="rounded-lg border border-border bg-surface-2/30 p-3">
+            <summary class="cursor-pointer text-xs font-semibold text-muted">高级参数与运行选项</summary>
+            <div class="mt-3 space-y-3">
+          <div class="grid grid-cols-2 gap-2.5">
+            <div class="field">
+              <label class="label" for="pipeline-test-ratio">内部测试比例</label>
+              <input id="pipeline-test-ratio" v-model.number="form.testRatio" type="number" min="0" max="0.5" step="0.05" class="input font-mono" />
+              <p class="mt-1 text-[11px] text-subtle">只用于训练窗内的样本外检查。</p>
+            </div>
+            <div class="field">
+              <label class="label" for="pipeline-val-ratio">验证集比例</label>
+              <input id="pipeline-val-ratio" v-model.number="form.valRatio" type="number" min="0" max="0.4" step="0.05" class="input font-mono" />
+              <p class="mt-1 text-[11px] text-subtle">用于调参和候选模型比较。</p>
+            </div>
+          </div>
           <div class="grid grid-cols-2 gap-2.5">
             <div class="field">
               <label class="label" for="pipeline-factor-count">每轮因子数</label>
@@ -831,6 +934,8 @@ onBeforeUnmount(() => {
             <input v-model="form.saveQuality" type="checkbox" class="accent-[var(--color-primary)]" />
             优质因子入因子库（打「优质」标签）
           </label>
+            </div>
+          </details>
         </div>
 
         <button id="pipeline-start" class="btn btn-primary mt-5 w-full" :disabled="starting || running" @click="openStart">
@@ -892,9 +997,15 @@ onBeforeUnmount(() => {
               <button v-if="running" class="btn btn-ghost" @click="stop">
                 <Square :size="14" />停止
               </button>
-              <button v-else class="btn btn-ghost" @click="viewRun(activeRun)">
-                <RefreshCw :size="14" />刷新
-              </button>
+              <template v-else>
+                <button class="btn btn-ghost" @click="viewRun(activeRun)">
+                  <RefreshCw :size="14" />刷新
+                </button>
+                <button class="btn btn-soft" :disabled="rerunning" @click="rerun(activeRun)">
+                  <LoaderCircle v-if="rerunning" :size="14" class="animate-spin" />
+                  <RefreshCw v-else :size="14" />重跑流水线
+                </button>
+              </template>
             </div>
 
             <StateView v-if="loadingDetail && !rounds.length" icon="refresh" title="加载中…" busy />
@@ -995,6 +1106,14 @@ onBeforeUnmount(() => {
                     <span v-if="dataVol(r)" class="text-muted">数据量 <span class="num text-fg">{{ dataVol(r) }}</span></span>
                     <div class="ml-auto flex gap-1.5">
                       <button
+                        v-if="r.train_result?.found && !r.model_id"
+                        class="btn btn-soft !h-7 !px-2.5 text-[11px]"
+                        :title="r.train_result.artifact_ref ? '保存本轮训练产物' : '旧轮次将按记录的因子和参数重新训练后保存'"
+                        @click="saveRoundModel(r)"
+                      >
+                        <Boxes :size="12" />保存模型
+                      </button>
+                      <button
                         v-if="hasSamples(r)"
                         class="btn btn-soft !h-7 !px-2.5 text-[11px]"
                         @click="openSamples(r)"
@@ -1007,6 +1126,13 @@ onBeforeUnmount(() => {
                         @click="openDetail(r)"
                       >
                         <ChartLine :size="12" />训练详情
+                      </button>
+                      <button
+                        v-if="r.backtest_summary?.metrics || r.backtest_summary?.equity_points?.length"
+                        class="btn btn-soft !h-7 !px-2.5 text-[11px]"
+                        @click="openBacktest(r)"
+                      >
+                        <TrendingUp :size="12" />回测详情
                       </button>
                     </div>
                   </div>
@@ -1098,6 +1224,15 @@ onBeforeUnmount(() => {
                   </span>
                 </span>
                 <ChevronRight :size="16" class="text-subtle" />
+              </button>
+              <button
+                v-if="['succeeded', 'finished', 'failed', 'stopped'].includes(r.status)"
+                class="btn btn-soft !h-8 !px-2.5 text-[11px]"
+                :disabled="rerunning"
+                title="按本次配置创建新的流水线"
+                @click.stop.prevent="rerun(r)"
+              >
+                <RefreshCw :size="12" />重跑
               </button>
               <button
                 class="rounded-md p-1.5 text-subtle transition-colors hover:bg-danger/10 hover:text-danger"
@@ -1245,6 +1380,75 @@ onBeforeUnmount(() => {
         <TrainCharts v-if="detailCharts" :result="detailCharts" />
         <p v-else class="rounded-lg border border-border bg-surface-2/40 px-3 py-4 text-center text-xs text-subtle">
           本轮没有可用的诊断图表（可能训练未产出模型或样本不足）。
+        </p>
+      </div>
+    </Modal>
+
+    <!-- 单轮回测详情：指标与资金曲线 -->
+    <Modal
+      :open="!!backtestRound"
+      :title="`回测详情 · 第 ${backtestRound?.round_no ?? ''} 轮`"
+      :sub="[backtestSummary?.symbol, backtestSummary?.interval].filter(Boolean).join(' · ') || '策略资金曲线与基准对比指标'"
+      width="900px"
+      @close="backtestRound = null"
+    >
+      <div v-if="backtestRound" class="space-y-3">
+        <div class="rounded-lg border border-border bg-surface-2/40 p-3">
+          <div class="mb-2 flex flex-wrap items-center justify-between gap-2">
+            <p class="text-xs font-semibold text-fg">重跑回测</p>
+            <span class="text-[11px] text-subtle">使用本轮已训练模型；不会覆盖原始回测结果</span>
+          </div>
+          <div class="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">
+            <label class="text-[11px] text-muted">交易对 <Tip text="输入已下载 K 线数据的交易对，例如 ETHUSDT。回测粒度沿用本轮模型的训练粒度。" /><input v-model.trim="backtestForm.symbol" class="input mt-1 w-full" /></label>
+            <label class="text-[11px] text-muted">开始日期 <Tip text="回测区间起点。建议选择训练截止日之后的样本，作为真正的样本外检验。" /><input v-model="backtestForm.start" type="date" class="input mt-1 w-full" /></label>
+            <label class="text-[11px] text-muted">结束日期 <Tip text="回测区间终点（包含当天）。结束日期必须晚于开始日期，且该区间需要有已下载的 K 线。" /><input v-model="backtestForm.end" type="date" class="input mt-1 w-full" /></label>
+            <label class="text-[11px] text-muted">窗口 <Tip text="滚动计算模型分数分位阈值的 K 线根数，范围 20–240。调大信号更平滑、反应更慢；调小更灵敏、也更容易受噪声影响。" /><input v-model.number="backtestForm.window" type="number" min="20" max="240" class="input mt-1 w-full" /></label>
+            <label class="text-[11px] text-muted">入场分位 <Tip text="分数高于滚动分布该分位时开多仓，范围 0.50–0.95。调高会减少入场次数、提高信号门槛。" /><input v-model.number="backtestForm.enterQ" type="number" min="0.5" max="0.95" step="0.01" class="input mt-1 w-full" /></label>
+            <label class="text-[11px] text-muted">离场分位 <Tip text="已有多仓时，分数低于该分位就平仓，范围 0.05–0.50。调高通常会更早离场；应低于入场分位。" /><input v-model.number="backtestForm.exitQ" type="number" min="0.05" max="0.5" step="0.01" class="input mt-1 w-full" /></label>
+          </div>
+          <button class="btn btn-primary mt-2 !h-8 !px-3 text-xs" :disabled="backtestLoading || !backtestForm.symbol || !backtestForm.start || !backtestForm.end" @click="runBacktestAgain">
+            <LoaderCircle v-if="backtestLoading" :size="13" class="animate-spin" /><RefreshCw v-else :size="13" />{{ backtestLoading ? '回测中…' : '重跑回测' }}
+          </button>
+          <p v-if="backtestRerun?.found" class="mt-2 text-[11px] text-primary">当前显示：重跑结果 · {{ backtestSummary?.symbol }} · {{ backtestSummary?.bars }} 根 K 线</p>
+        </div>
+        <div class="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">
+          <div class="rounded-lg bg-surface-2 px-2.5 py-2">
+            <p class="text-[10px] uppercase tracking-wider text-subtle">累计收益</p>
+            <p class="num text-sm font-semibold" :class="tone(backtestMetrics?.total_return)">{{ pct(backtestMetrics?.total_return) }}</p>
+          </div>
+          <div class="rounded-lg bg-surface-2 px-2.5 py-2">
+            <p class="text-[10px] uppercase tracking-wider text-subtle">年化收益</p>
+            <p class="num text-sm font-semibold" :class="tone(backtestMetrics?.annual_return)">{{ pct(backtestMetrics?.annual_return) }}</p>
+          </div>
+          <div class="rounded-lg bg-surface-2 px-2.5 py-2">
+            <p class="text-[10px] uppercase tracking-wider text-subtle">基准收益</p>
+            <p class="num text-sm font-semibold" :class="tone(backtestMetrics?.benchmark_return)">{{ pct(backtestMetrics?.benchmark_return) }}</p>
+          </div>
+          <div class="rounded-lg bg-surface-2 px-2.5 py-2">
+            <p class="text-[10px] uppercase tracking-wider text-subtle">超额收益</p>
+            <p class="num text-sm font-semibold" :class="tone(backtestMetrics?.excess_return)">{{ pct(backtestMetrics?.excess_return) }}</p>
+          </div>
+          <div class="rounded-lg bg-surface-2 px-2.5 py-2">
+            <p class="text-[10px] uppercase tracking-wider text-subtle">夏普</p>
+            <p class="num text-sm font-semibold" :class="tone(backtestMetrics?.sharpe)">{{ num(backtestMetrics?.sharpe, 2) }}</p>
+          </div>
+          <div class="rounded-lg bg-surface-2 px-2.5 py-2">
+            <p class="text-[10px] uppercase tracking-wider text-subtle">最大回撤</p>
+            <p class="num text-sm font-semibold text-down">{{ pct(backtestMetrics?.max_drawdown) }}</p>
+          </div>
+        </div>
+        <div class="grid grid-cols-2 gap-2 text-xs text-muted sm:grid-cols-4">
+          <p>交易笔数：<span class="num text-fg">{{ backtestMetrics?.num_trades ?? '—' }}</span></p>
+          <p>胜率：<span class="num text-fg">{{ pct(backtestMetrics?.win_rate) }}</span></p>
+          <p>回测样本：<span class="num text-fg">{{ backtestSummary?.bars ?? '—' }}</span></p>
+          <p>期末资金：<span class="num text-fg">{{ backtestSummary?.final_equity != null ? num(backtestSummary.final_equity, 2) : '—' }}</span></p>
+        </div>
+        <div v-if="backtestPoints.length" class="panel p-3">
+          <p class="mb-1 text-[11px] font-semibold uppercase tracking-wider text-subtle">资金曲线</p>
+          <EquityChart :points="backtestPoints" :baseline="100000" :height="280" />
+        </div>
+        <p v-else class="rounded-lg border border-border bg-surface-2/40 px-3 py-6 text-center text-xs text-subtle">
+          本轮未生成可展示的资金曲线，可能是回测数据缺失或模型没有产生交易信号。
         </p>
       </div>
     </Modal>

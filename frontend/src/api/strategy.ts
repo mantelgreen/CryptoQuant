@@ -39,11 +39,11 @@ export interface BacktestMetrics {
   annual_return?: number
   volatility?: number
   sharpe?: number
-  sortino?: number
+  sortino?: number | null
   calmar?: number
   max_drawdown?: number
   win_rate?: number
-  profit_factor?: number
+  profit_factor?: number | null
   num_trades?: number
   turnover?: number
   benchmark_return?: number
