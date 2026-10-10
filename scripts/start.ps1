@@ -122,8 +122,8 @@ if (-not $OnlyFrontend) {
     Step "启动 gateway (uvicorn)"
 
     $venvPy = Join-Path $root ".venv\Scripts\python.exe"
-    $env:DATABASE_HOST = if ($env:DATABASE_HOST) { $env:DATABASE_HOST } else { "192.168.71.110" }
-    $env:REDIS_HOST    = if ($env:REDIS_HOST)    { $env:REDIS_HOST }    else { "192.168.71.110" }
+    $env:DATABASE_HOST = if ($env:DATABASE_HOST) { $env:DATABASE_HOST } else { "127.0.0.1" }
+    $env:REDIS_HOST    = if ($env:REDIS_HOST)    { $env:REDIS_HOST }    else { "127.0.0.1" }
     $env:REDIS_DB      = if ($env:REDIS_DB)      { $env:REDIS_DB }      else { "8" }
     $env:APP_ENV       = if ($env:APP_ENV)       { $env:APP_ENV }       else { "dev" }
     $env:APP_LOG_LEVEL = if ($env:APP_LOG_LEVEL) { $env:APP_LOG_LEVEL } else { "INFO" }

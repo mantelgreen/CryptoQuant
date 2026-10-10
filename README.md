@@ -34,7 +34,7 @@
 
 ## 快速开始（Docker 一键跑）
 
-> 前提：已安装 Docker Desktop（WSL2 后端 / Linux 原生均可），本地能访问 `192.168.71.110:5432 / 6379`。
+> 前提：已安装 Docker Desktop（WSL2 后端 / Linux 原生均可），本地能访问 `127.0.0.1:5432 / 6379`。
 > 如果是单机跑，把 `backend/.env` 中 `DATABASE_HOST` / `REDIS_HOST` 改为 `postgres` / `redis`（docker-compose 中已自动覆盖）。
 
 ```bash
@@ -61,7 +61,7 @@ npm run dev
 
 ## 本地开发与启动（含 worker / beat）
 
-> 前提：能访问 `192.168.71.110:5432 / 6379`（数据库与 Redis，见 `backend/.env` 或 `docker-compose.yml`），并能访问 `api.binance.com`。
+> 前提：能访问 `127.0.0.1:5432 / 6379`（数据库与 Redis，见 `backend/.env` 或 `docker-compose.yml`），并能访问 `api.binance.com`。
 > 后端进程全部通过 `backend/.env`（`DATABASE_HOST / REDIS_HOST ...`）取配置；不设环境变量时默认 `127.0.0.1`。
 
 ### 1. 安装与迁移
